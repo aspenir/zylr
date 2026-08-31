@@ -4,7 +4,7 @@
 # not come from a `zig build --fetch` archive — which is why we source the git
 # tree directly. `zig build --fetch` resolves the vendored zig-wlroots /
 # zig-wayland / zig-pixman / zig-xkbcommon deps into the build cache.
-pkgname=zylr
+pkgname=zylr-git
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="A minimalist Wayland compositor written in Zig"
