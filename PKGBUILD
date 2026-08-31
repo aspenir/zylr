@@ -11,10 +11,12 @@ pkgdesc="A minimalist Wayland compositor written in Zig"
 arch=('x86_64')
 url="https://github.com/aspenir/zylr"
 license=('GPL-3.0-or-later')
-# Runtime shared libraries the binary links against.
-depends=('wayland' 'libxcb' 'libxkbcommon' 'libinput' 'pixman' 'wlroots' 'scenefx' 'systemd-libs' 'xcb-util-wm')
-makedepends=('zig' 'wayland-protocols')
-source=("$pkgname::git+https://github.com/aspenir/zylr.git#commit=6b96a37729c790fec7a0f1e19752802186910e53")
+# Runtime shared libraries the binary links against. The build links
+# wlroots-0.20 / scenefx-0.5 (mango fork) headers and .so; on this distro the
+# packages are versioned: wlroots0.20 (extra) and scenefx0.5.
+depends=('wayland' 'libxcb' 'libxkbcommon' 'libinput' 'pixman' 'wlroots0.20' 'scenefx0.5' 'systemd-libs' 'xcb-util-wm')
+makedepends=('zig' 'wayland-protocols' 'wlroots0.20' 'scenefx0.5')
+source=("$pkgname::git+https://github.com/aspenir/zylr.git#branch=main")
 sha256sums=('SKIP')
 options=('!lto')
 

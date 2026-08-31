@@ -3,7 +3,12 @@ const wl = @import("wayland").server.wl;
 const ServerContext = @import("server.zig");
 const Spawner = @import("spawner.zig");
 
+// Modern glibc enables _FORTIFY_SOURCE under optimization (ReleaseSafe /
+// ReleaseFast), which pulls fortify wrappers (bits/fcntl*.h) with
+// __attribute__((error)) helpers that Zig's @cImport cannot translate. Disable
+// fortify for this import so the ReleaseSafe packaged build compiles.
 const c = @cImport({
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("systemd/sd-bus.h");
 });
 
