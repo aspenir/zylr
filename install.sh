@@ -22,6 +22,11 @@ missing="$(mktemp)"
     need xcb
     need libsystemd
     bin zig
+    for xml in \
+        /usr/share/wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml \
+        /usr/share/wlr-protocols/unstable/wlr-output-power-management-unstable-v1.xml; do
+        [ -f "$xml" ] || echo "  missing: $xml"
+    done
 } >"$missing" || true
 if [ -s "$missing" ]; then
     echo "error: missing dependencies:" >&2
