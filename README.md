@@ -7,8 +7,7 @@ A minimalist wayland compositor made in zig <3
 ## install
 
 ```sh
-zig build
-sudo install -Dm755 zig-out/bin/zylr /usr/local/bin/zylr
+curl -fsSL https://github.com/aspenir/zylr/releases/latest/download/install.sh | sudo sh
 ```
 
 depends on zig 0.16, wlroots 0.20, scenefx 0.5, libinput, xkbcommon, wayland,
