@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=zylr
+Comment=Minimalist Wayland compositor written in Zig
+Exec=zylr

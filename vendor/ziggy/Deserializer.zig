@@ -1,0 +1,1367 @@
+const Deserializer = @This();
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const root = @import("root.zig");
+const Tokenizer = @import("Tokenizer.zig");
+const Token = Tokenizer.Token;
+
+gpa: Allocator,
+src: [:0]const u8,
+meta: *Meta,
+opts: Options,
+tokenizer: *Tokenizer,
+
+pub const Options = struct {
+    /// If set to `to_unescape` you will need to ensure the lifetime of `src`
+    /// outlasts the result of calling `deserializeLeaky`.
+    copy_strings: CopyStrings = .to_unescape,
+    /// Allows you to parse a Ziggy Document embedded in another file, like
+    /// SuperMD for example.
+    ///
+    /// See the doc comment of `Tokenizer.Delimiter` for more info.
+    ///
+    /// When expecting a delimiter, on successful deserialization, `meta.doc`
+    /// will be populated with information about the length of the Ziggy
+    /// Document that can help you with subsequent parsing operations.
+    delimiter: Tokenizer.Delimiter = .none,
+    pub const CopyStrings = enum {
+        to_unescape,
+        always,
+    };
+};
+
+/// Metadata relative to a deserialization process.
+/// All the data in this type will be filled out by the deserialization
+/// function. Depending on the outcome and deserialization options provided,
+/// different sections will be defined, leaving others set to `undefined`.
+///
+/// Make sure to learn which section is populated under which conditions.
+pub const Meta = struct {
+    /// On deserialization ERROR contains the location where the error happened,
+    /// set to undefined otherwise.
+    error_loc: Token.Loc,
+    /// On deserialization ERROR, when the error is `MissingField`, contains the
+    /// name of the first missing field encountered (points at static memory),
+    /// set to undefined otherwise.
+    missing_field_name: []const u8,
+    /// On deserialization SUCCESS, when delimiter is not `.none`, set to
+    /// undefined otherwise
+    doc: Doc,
+
+    pub const init: Meta = undefined;
+
+    pub const Doc = struct {
+        /// Number of newlines encountered while deserializing the Ziggy
+        /// Document. This value is useful to compensate for the missing
+        /// lines if you then need to report parsing errors in the outer
+        /// document .
+        lines: u32,
+        /// Byte offset where the Ziggy Document ends.
+        /// Includes the end delimiter.
+        end: u32,
+    };
+
+
+    /// Same as reportErrors but as a formatter.
+    pub fn reportErrorsFmt(
+        meta: Meta,
+        gpa: Allocator,
+        opts: Options,
+        path: ?[]const u8,
+        src: [:0]const u8,
+        e: Error,
+    ) Fmt {
+        return .{
+            .gpa = gpa,
+            .meta = meta,
+            .opts = opts,
+            .path = path,
+            .src = src,
+            .e = e,
+        };
+    }
+
+    pub const Fmt = struct {
+        gpa: Allocator,
+        meta: Meta,
+        opts: Options,
+        path: ?[]const u8,
+        src: [:0]const u8,
+        e: Error,
+        pub fn format(fmt: *const Fmt, w: *Io.Writer) !void {
+            fmt.meta.reportErrors(
+                fmt.gpa,
+                fmt.opts,
+                fmt.path,
+                fmt.src,
+                fmt.e,
+                w,
+            ) catch return error.WriteFailed;
+        }
+    };
+};
+pub const Error = error{
+    OutOfMemory,
+    UnexpectedToken,
+    UnexpectedValue,
+
+    Overflow,
+    DuplicateField,
+    UnknownField,
+    MissingField,
+};
+
+/// Returns the next token, consuming it
+pub fn next(d: *const Deserializer) Token {
+    return d.tokenizer.next(d.src, true);
+}
+
+/// Returns the next token tag, without consuming it
+pub fn peek(d: *const Deserializer) Token.Tag {
+    var copy = d.tokenizer.*;
+    return copy.next(d.src, true).tag;
+}
+
+/// Sets the right meta field and returns error.UnexpectedToken, to be used when
+/// encountering an unexpected token in a custom deserialization function.
+pub fn unexpected(d: *const Deserializer, tok: Token) Error {
+    d.meta.error_loc = tok.loc;
+    return error.UnexpectedToken;
+}
+
+/// Sets the right meta field and returns one of:
+///
+/// - error.UnexpectedToken
+/// - error.UnexpectedValue
+///
+/// The return error depends whether the token found can represent (part
+/// of) a value or not. To be used when attempting to parse a *value* and
+/// encountering an unexpected token in a custom deserialization function.
+pub fn unexpectedValue(d: *const Deserializer, tok: Token) Error {
+    d.meta.error_loc = tok.loc;
+    return switch (tok.tag) {
+        // zig fmt: off
+        .bytes,      .bytes_line,
+        .dotlb,      .true,
+        .false,      .float,
+        .identifier, .nan,
+        .neg_inf,    .pos_inf,
+        .null,       .union_case,
+        .integer,    .lb,
+        // zig fmt: on
+        => error.UnexpectedValue,
+        else => error.UnexpectedToken,
+    };
+}
+
+/// Sets the right meta field and returns error.Overflow, to be used when
+/// encountering an integer overflow in a custom deserialization function.
+pub fn overflow(d: *const Deserializer, tok: Token) Error {
+    d.meta.error_loc = tok.loc;
+    return error.Overflow;
+}
+
+/// Sets the right meta field and returns error.LengthMismatch, to be used when
+/// deserializing a Zig array and encountering a Ziggy array of different length.
+pub fn lengthMismatch(d: *const Deserializer, tok: Token) Error {
+    d.meta.error_loc = tok.loc;
+    return error.LengthMismatch;
+}
+
+/// Sets the right meta field and returns error.DuplicateField, to be used when
+/// encountering a duplicate field in a custom deserialization function.
+pub fn duplicateField(d: *const Deserializer, tok: Token) Error {
+    d.meta.error_loc = tok.loc;
+    return error.DuplicateField;
+}
+
+/// Sets the right meta field and returns error.UnknownField, to be used when
+/// encountering an unkown field in a custom deserialization function.
+pub fn unknownField(d: *const Deserializer, tok: Token) Error {
+    d.meta.error_loc = tok.loc;
+    return error.UnknownField;
+}
+
+/// Sets the right meta field and returns error.MissingField, to be used when
+/// encountering a missing field in a custom deserialization function.
+/// It's expected for `tok` to be the final token of the container:
+///  - .rb for a struct or a dict
+///  - .eod, .eof for a braceless struct
+pub fn missingField(d: *const Deserializer, tok: Token, name: []const u8) Error {
+    d.meta.error_loc = tok.loc;
+    d.meta.missing_field_name = name;
+    return error.MissingField;
+}
+
+/// Turns a Ziggy Document string into Zig types without having to go through an
+/// AST first. This function can also be used to parse Ziggy Documents embedded
+/// in other files, like SuperMD or HTML, see `Options.delimiter` for more info.
+///
+/// Since we don't build an AST when deserializing the Ziggy Document, any error
+/// reported by this function (other than OutOfMemory) should not be immediately
+/// shown to the user, instead:
+///
+/// 1. Build an AST and report any parsing error found.
+/// 2. If the AST does not contain any parsing error, then show the error
+///    returned by this function.
+///
+/// This will guarantee the highest level of quality of error reporting.
+/// See `Meta.reportErrors` for a convenience function that implements this
+/// process.
+///
+/// Given that the type passed in might have default values, it might be not
+/// immediately obvious how to free an allocated value correctly, hence the
+/// 'Leaky' suffix. For long running programs you will want to pass in an arena
+/// allocator.
+///
+/// See `deserialize` for a convenient way of attaching an arena allocator to a
+/// deserialized value.
+pub fn deserializeLeaky(
+    T: type,
+    gpa: Allocator,
+    src: [:0]const u8,
+    meta: *Meta,
+    opts: Options,
+) Deserializer.Error!T {
+    var tokenizer: Tokenizer = .init(opts.delimiter);
+    var d: Deserializer = .{
+        .gpa = gpa,
+        .src = src,
+        .meta = meta,
+        .opts = opts,
+        .tokenizer = &tokenizer,
+    };
+
+    const result = try d.deserializeOne(T, tokenizer.next(src, true), true);
+    const end = tokenizer.next(src, true);
+    switch (end.tag) {
+        .eof => {},
+        .eod => meta.doc = .{ .lines = tokenizer.lines, .end = end.loc.end },
+        else => {
+            meta.error_loc = end.loc;
+            return error.UnexpectedToken;
+        },
+    }
+
+    return result;
+}
+
+/// Same as `deserializeLeaky` (make sure to read its description!) but it
+/// bundles the return value with an arena allocator. You can then call `deinit`
+/// on the returned value to free all allocated data.
+pub fn deserialize(
+    T: type,
+    gpa: Allocator,
+    src: [:0]const u8,
+    meta: *Meta,
+    opts: Options,
+) Deserializer.Error!Value(T) {
+    var result: Value(T) = undefined;
+    result.arena_state = .init(gpa);
+    errdefer result.deinit();
+
+    result.value = try deserializeLeaky(T, result.arena_state.allocator(), src, meta, opts);
+    return result;
+}
+
+pub fn Value(T: type) type {
+    return struct {
+        value: T,
+        arena_state: std.heap.ArenaAllocator,
+
+        pub fn deinit(v: @This()) void {
+            v.arena_state.deinit();
+        }
+    };
+}
+
+/// Deserializes one full value of type `T`.
+/// Does not check that the tokenizer has reached EOD/EOF.
+///
+/// If you're looking to deserialize an entire Ziggy Document, you probably
+/// don't want to use this function. Use `root.deserializeLeaky` instead.
+///
+/// If you're implementing a custom deserialization function in `ziggy_options`,
+/// you will probably want to call this function from the provided
+/// `Deserializer` parameter to deserialize basic types.
+pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bool) Error!T {
+    switch (@typeInfo(T)) {
+        .type,
+        .void,
+        .null,
+        .noreturn,
+        .undefined,
+        .error_union,
+        .error_set,
+        .@"fn",
+        .@"opaque",
+        .frame,
+        .@"anyframe",
+        .enum_literal,
+        => @compileError("cannot deserialize " ++ @tagName(@typeInfo(T))),
+
+        .bool => switch (first.tag) {
+            .true => return true,
+            .false => return false,
+            else => return d.unexpectedValue(first),
+        },
+        .comptime_float, .float => switch (first.tag) {
+            .integer => {
+                return @floatFromInt(std.fmt.parseInt(i64, first.loc.slice(d.src), 0) catch {
+                    // The token was already validated and parsing floats cannot overflow.
+                    unreachable;
+                });
+            },
+            .float => {
+                return std.fmt.parseFloat(T, first.loc.slice(d.src)) catch {
+                    // The token was already validated and parsing floats cannot overflow.
+                    unreachable;
+                };
+            },
+            .pos_inf => return std.math.inf(T),
+            .neg_inf => return -std.math.inf(T),
+            .nan => return std.math.nan(T),
+            else => return d.unexpectedValue(first),
+        },
+        .comptime_int, .int => switch (first.tag) {
+            .integer => {
+                return std.fmt.parseInt(T, first.loc.slice(d.src), 10) catch |err| {
+                    switch (err) {
+                        error.InvalidCharacter => unreachable,
+                        error.Overflow => return d.overflow(first),
+                    }
+                };
+            },
+            else => return d.unexpectedValue(first),
+        },
+        .optional => |info| switch (first.tag) {
+            .null => return null,
+            else => return try d.deserializeOne(info.child, first, top_lvl),
+        },
+        .@"enum" => {
+
+            switch (first.tag) {
+                .identifier => return std.meta.stringToEnum(T, first.loc.slice(d.src)[1..]) orelse
+                    d.unknownField(first),
+                else => return d.unexpectedValue(first),
+            }
+        },
+        .@"union" => |info| {
+
+            if (info.tag_type == null) @compileError("cannot deserialize untagged unions");
+            switch (first.tag) {
+                .identifier => {
+                    const tag = first.loc.slice(d.src)[1..]; // skip '.'
+                    inline for (info.fields) |fld| { const f_name = fld.name; const f_type = fld.type;
+                        if (std.mem.eql(u8, f_name, tag)) {
+                            if (f_type != void) return d.unexpectedValue(first);
+                            return @unionInit(T, f_name, {});
+                        }
+                    } else return d.unknownField(first);
+                },
+                .union_case => {
+                    const tag = blk: {
+                        const raw = first.loc.slice(d.src)[1..]; // skip '.'
+                        break :blk raw[0 .. raw.len - 1]; // skip '('
+                    };
+
+                    inline for (info.fields) |fld| { const f_name = fld.name; const f_type = fld.type;
+                        if (std.mem.eql(u8, f_name, tag)) {
+                            if (f_type == void) return d.unexpectedValue(first);
+                            const value = @unionInit(
+                                T,
+                                f_name,
+                                try d.deserializeOne(
+                                    f_type,
+                                    d.next(),
+                                    top_lvl,
+                                ),
+                            );
+
+                            const tok = d.next();
+                            if (tok.tag != .rp) return d.unexpected(tok);
+                            return value;
+                        }
+                    } else return d.unknownField(first);
+                },
+                else => return d.unexpectedValue(first),
+            }
+        },
+        .array, .vector => |info| {
+            var arr: T = undefined;
+
+            if (first.tag != .lsb) return d.unexpectedValue(first);
+            if (arr.len == 0) {
+                const maybe_rsb = d.next();
+                return if (maybe_rsb.tag == .rsb) arr else d.lengthMismatch(maybe_rsb);
+            }
+
+            for (&arr, 0..) |*elem, idx| {
+                const tok = d.next();
+                if (tok.tag == .rsb) {
+                    return if (idx == arr.len - 1) arr else d.lengthMismatch(tok);
+                }
+
+                elem.* = try d.deserializeOne(
+                    info.child,
+                    d.next(),
+                    false,
+                );
+
+                switch (d.peek()) {
+                    .comma => {
+                        _ = d.next();
+                        continue;
+                    },
+                    .rsb => return if (idx == arr.len - 1) arr else d.lengthMismatch(next),
+                    else => return d.unexpected(d.next()),
+                }
+            }
+            comptime unreachable;
+        },
+        .@"struct" => |info| {
+
+            var seen: std.StaticBitSet(info.fields.len) = .empty;
+            var result: T = undefined;
+
+            const skip_fields = if (root.getOptions(T)) |opts| opts.skip_fields else &.{};
+            const loc_field = if (root.getOptions(T)) |opts| opts.loc_field else null;
+            if (loc_field) |lf| {
+                @field(result, @tagName(lf)).start = first.loc.start;
+            }
+
+            var field_token = if (top_lvl and first.tag == .identifier)
+                first
+            else switch (first.tag) {
+                .eod, .eof => {
+                    d.meta.doc = .{ .lines = d.tokenizer.lines, .end = first.loc.end };
+                    if (top_lvl) {
+                        try d.finalizeStruct(&result, info, &seen, first);
+                        return result;
+                    } else return d.unexpected(first);
+                },
+                .lb => return try d.deserializeDict(T, &result, info, &seen, first),
+                .dotlb => blk: {
+                    const tok = d.next();
+                    if (tok.tag != .identifier) return d.unexpected(tok);
+                    break :blk tok;
+                },
+                else => return d.unexpectedValue(first),
+            };
+
+            assert(field_token.tag == .identifier);
+            outer: while (true) { // this is safe because we're filling `seen`
+                switch (field_token.tag) {
+                    .identifier => {},
+                    .rb, .eod, .eof => {
+                        if (first.tag == .identifier) switch (field_token.tag) {
+                            // braceless top lvl struct
+                            .eof => {},
+                            .eod => d.meta.doc = .{
+                                .lines = d.tokenizer.lines,
+                                .end = field_token.loc.end,
+                            },
+                            else => return d.unexpected(field_token),
+                        } else switch (field_token.tag) {
+                            .rb => {},
+                            else => return d.unexpected(field_token),
+                        }
+
+                        // done parsing the struct, see if we have any missing field
+                        try d.finalizeStruct(&result, info, &seen, field_token);
+                        return result;
+                    },
+                    else => return d.unexpected(field_token),
+                }
+                const name = field_token.loc.slice(d.src)[1..]; // skip '.'
+
+                inline for (
+                    info.fields,
+                    0..,
+                ) |fld, idx| {
+                const f_name = fld.name;
+                const f_type = fld.type;
+                const f_attrs = fld;
+                    // skip fields
+                    @setEvalBranchQuota(100000);
+                    if (comptime std.mem.indexOfScalar(
+                        std.meta.FieldEnum(T),
+                        skip_fields,
+                        std.meta.stringToEnum(std.meta.FieldEnum(T), f_name).?,
+                    ) != null) return d.unknownField(field_token);
+
+                    // We skip seen fields to optimize the happy path
+                    if (!seen.isSet(idx) and std.mem.eql(u8, f_name, name)) {
+                        const eql = d.next();
+                        if (eql.tag != .eql) return d.unexpected(eql);
+
+                        // Non-optional fields with a default value
+                        // can decode null as the default value.
+                        const first_value_tok = d.next();
+                        if (f_attrs.default_value_ptr != null and
+                            @typeInfo(f_type) != .optional and first_value_tok.tag == .null)
+                        {
+                            const dv_ptr: *const f_type = @ptrCast(@alignCast(f_attrs.default_value_ptr));
+                            @field(result, f_name) = dv_ptr.*;
+                        } else {
+                            @field(result, f_name) = try d.deserializeOne(
+                                f_type,
+                                first_value_tok,
+                                false,
+                            );
+                        }
+
+                        seen.set(idx);
+
+                        const has_comma = d.peek() == .comma;
+                        if (has_comma) _ = d.next();
+                        field_token = d.next();
+                        if (!has_comma and field_token.tag == .identifier) {
+                            return d.unexpected(field_token);
+                        }
+                        continue :outer;
+                    }
+                } else {
+                    // unhappy path, either an unknown field or a duplicate field
+                    inline for (info.fields, 0..) |fld, idx| { const f_name = fld.name;
+                        if (std.mem.eql(u8, f_name, name)) {
+                            // duplicate
+                            assert(seen.isSet(idx));
+                            return d.duplicateField(field_token);
+                        }
+                    } else return d.unknownField(field_token);
+                    comptime unreachable;
+                }
+            }
+            comptime unreachable;
+        },
+        .pointer => |info| switch (info.size) {
+            .c, .many => @compileError("cannot deserialize many or c-style pointers"),
+            .one => {
+                //`T` might be `*const Child`, so we use `*info.child`
+                const ptr: *info.child = try d.gpa.create(info.child);
+                errdefer d.gpa.destroy(ptr);
+
+                ptr.* = try d.deserializeOne(info.child, first, top_lvl);
+                return ptr;
+            },
+            .slice => switch (info.child) {
+                u8 => {
+                    switch (first.tag) {
+                        .bytes, .bytes_line => return d.parseBytes(T, first),
+                        else => return d.unexpectedValue(first),
+                    }
+                },
+                else => {
+                    if (first.tag != .lsb) return d.unexpected(first);
+
+                    var buf: std.ArrayList(info.child) = .empty;
+                    errdefer buf.deinit(d.gpa);
+
+                    while (true) {
+                        const tok = d.next();
+                        if (tok.tag == .rsb) break;
+
+                        try buf.append(d.gpa, try d.deserializeOne(
+                            info.child,
+                            tok,
+                            false,
+                        ));
+
+                        switch (d.peek()) {
+                            .comma => {
+                                _ = d.next();
+                                continue;
+                            },
+                            .rsb => continue,
+                            else => return d.unexpected(first),
+                        }
+
+                        comptime unreachable;
+                    }
+
+                    if (info.sentinel()) |s| {
+                        return buf.toOwnedSliceSentinel(d.gpa, s);
+                    } else {
+                        return buf.toOwnedSlice(d.gpa);
+                    }
+                },
+            },
+        },
+    }
+
+    comptime unreachable;
+}
+
+fn finalizeStruct(
+    d: *const Deserializer,
+    result: anytype,
+    info: std.builtin.Type.Struct,
+    seen: anytype,
+    last: Token,
+) Error!void {
+    const loc_field = if (root.getOptions(@TypeOf(result.*))) |opts| opts.loc_field else null;
+    if (loc_field) |lf| {
+        @field(result, @tagName(lf)).end = d.tokenizer.idx;
+    }
+
+    inline for (
+        info.fields,
+        0..,
+    ) |fld, idx| {
+    const f_name = fld.name;
+    const f_type = fld.type;
+    const f_attrs = fld;
+        if (loc_field) |lf| if (comptime std.mem.eql(u8, f_name, @tagName(lf))) continue;
+        if (!seen.isSet(idx)) {
+            if (f_attrs.default_value_ptr != null) {
+                const dv_ptr: *const f_type = @ptrCast(@alignCast(f_attrs.default_value_ptr));
+                @field(result, f_name) = dv_ptr.*;
+                // @field(result, f_name) = f_attrs.defaultValue(f_type).?;
+            } else {
+                return d.missingField(last, f_name);
+            }
+        }
+    }
+}
+
+inline fn deserializeDict(
+    d: *const Deserializer,
+    T: type,
+    result: *T,
+    info: std.builtin.Type.Struct,
+    seen: anytype,
+    first: Token,
+) Error!T {
+    assert(first.tag == .lb);
+    const skip_fields = if (root.getOptions(T)) |opts| opts.skip_fields else &.{};
+
+    var field_token = d.next();
+    outer: while (true) {
+        switch (field_token.tag) {
+            .bytes => {},
+            .rb => {
+                try d.finalizeStruct(result, info, seen, field_token);
+                return result.*;
+            },
+            else => return d.unexpected(field_token),
+        }
+
+        const name = blk: {
+            const raw = field_token.loc.slice(d.src);
+            break :blk raw[1 .. raw.len - 1];
+        };
+
+        inline for (info.fields, 0..) |fld, idx| { const f_name = fld.name; const f_type = fld.type;
+            // skip fields
+            @setEvalBranchQuota(100000);
+            if (comptime std.mem.indexOfScalar(
+                std.meta.FieldEnum(T),
+                skip_fields,
+                std.meta.stringToEnum(std.meta.FieldEnum(T), f_name).?,
+            ) != null) return d.unknownField(field_token);
+
+            // We skip seen fields to optimize the happy path
+            if (!seen.isSet(idx) and std.mem.eql(u8, f_name, name)) {
+                const colon = d.next();
+                if (colon.tag != .colon) return d.unexpected(colon);
+
+                @field(result, f_name) = try d.deserializeOne(
+                    f_type,
+                    d.next(),
+                    false,
+                );
+                seen.set(idx);
+
+                const has_comma = d.peek() == .comma;
+                if (has_comma) _ = d.next();
+                field_token = d.next();
+                if (!has_comma and field_token.tag == .identifier) {
+                    return d.unexpected(field_token);
+                }
+                continue :outer;
+            }
+        } else {
+            // unhappy path, either an unknown field or a duplicate field
+            inline for (info.fields, 0..) |fld, idx| { const f_name = fld.name;
+                if (std.mem.eql(u8, f_name, name)) {
+                    // duplicate
+                    assert(seen.isSet(idx));
+                    return d.duplicateField(field_token);
+                }
+            } else return d.unknownField(field_token);
+            comptime unreachable;
+        }
+    }
+}
+
+fn parseBytes(
+    d: *const Deserializer,
+    T: type,
+    first_token: Token,
+) Error!T {
+    // TODO: unescape support!
+    const info = @typeInfo(T).pointer;
+    assert(info.child == u8);
+    assert(info.size == .slice);
+    switch (first_token.tag) {
+        .bytes => {
+            // TODO: avoid unnecessary copies
+            const str = first_token.loc.slice(d.src);
+            const bytes = std.zig.string_literal.parseAlloc(
+                d.gpa,
+                str,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidLiteral => unreachable,
+            };
+            if (info.sentinel()) |s| {
+                defer d.gpa.free(bytes);
+                const new_buf = try d.gpa.allocSentinel(info.child, bytes.len, s);
+                @memcpy(new_buf, bytes);
+                return new_buf;
+            } else switch (d.opts.copy_strings) {
+                .always => return bytes,
+                .to_unescape => return bytes,
+            }
+        },
+        .bytes_line => {
+            var result: std.ArrayList(u8) = .empty;
+            errdefer result.deinit(d.gpa);
+
+            var current = first_token;
+            while (current.tag == .bytes_line) {
+                try result.appendSlice(d.gpa, current.loc.slice(d.src)[2..]);
+                if (d.peek() != .bytes_line) break;
+                try result.append(d.gpa, '\n');
+                current = d.next();
+            }
+
+            if (info.sentinel()) |s| {
+                return result.toOwnedSliceSentinel(d.gpa, s);
+            } else {
+                return result.toOwnedSlice(d.gpa);
+            }
+        },
+        else => return d.unexpectedValue(first_token),
+    }
+}
+
+pub const LinePreview = struct {
+    code: []const u8,
+    spaces: u32,
+    carets: u32,
+
+    pub fn format(lp: LinePreview, w: *Io.Writer) Io.Writer.Error!void {
+        try w.print("|   {s}\n", .{lp.code});
+        try w.writeAll("|   ");
+        try w.splatByteAll(' ', lp.spaces);
+        try w.splatByteAll('^', lp.carets);
+        try w.writeAll("\n");
+    }
+};
+
+pub fn linePreview(src: [:0]const u8, loc: Tokenizer.Token.Loc) LinePreview {
+    const line_off = loc.line(src);
+    const line_trim_left = std.mem.trimStart(u8, line_off.line, &std.ascii.whitespace);
+    const start_trim_left = line_off.start + line_off.line.len - line_trim_left.len;
+
+    const caret_len = loc.end - loc.start;
+    const caret_spaces_len = loc.start -| start_trim_left;
+
+    const line_trim = std.mem.trimEnd(u8, line_trim_left, &std.ascii.whitespace);
+
+    return .{
+        .code = line_trim,
+        .spaces = @intCast(caret_spaces_len),
+        .carets = @intCast(caret_len),
+    };
+}
+
+test "struct - basics" {
+    const case =
+        \\.foo = "bar",
+        \\.bar = false,
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const c = try deserializeLeaky(Case, arena, case, &meta, .{});
+
+    try std.testing.expectEqualStrings("bar", c.foo);
+    try std.testing.expectEqual(false, c.bar);
+}
+
+test "struct - top level curlies" {
+    const case =
+        \\.{
+        \\   .foo = "bar",
+        \\   .bar = false,
+        \\}
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const c = try deserializeLeaky(Case, arena, case, &meta, .{});
+
+    try std.testing.expectEqualStrings("bar", c.foo);
+    try std.testing.expectEqual(false, c.bar);
+}
+
+test "struct - optional comma" {
+    const case =
+        \\.foo = "bar",
+        \\.bar = false
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const c = try deserializeLeaky(Case, arena, case, &meta, .{});
+
+    try std.testing.expectEqualStrings("bar", c.foo);
+    try std.testing.expectEqual(false, c.bar);
+}
+
+test "string" {
+    const case =
+        \\
+        \\ "foo"
+        \\
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const result = try deserializeLeaky([]const u8, arena, case, &meta, .{});
+
+    try std.testing.expectEqualStrings("foo", result);
+}
+
+test "union" {
+    const case =
+        \\
+        \\ .date("2020-07-06T00:00:00")
+        \\
+    ;
+
+    const Case = union(enum) {
+        date: [:0]const u8,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const result = try deserializeLeaky(Case, arena, case, &meta, .{});
+
+    try std.testing.expectEqualStrings("2020-07-06T00:00:00", result.date);
+}
+
+test "int basics" {
+    const case =
+        \\
+        \\ 1042
+        \\
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const result = try deserializeLeaky(usize, arena, case, &meta, .{});
+
+    try std.testing.expectEqual(1042, result);
+}
+
+test "float basics" {
+    const case =
+        \\
+        \\ 10.42
+        \\
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const result = try deserializeLeaky(f64, arena, case, &meta, .{});
+
+    try std.testing.expectEqual(10.42, result);
+}
+
+test "float special values" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta: Meta = undefined;
+
+    const case_pos_inf =
+        \\
+        \\ inf
+        \\
+    ;
+    const result_pos_inf = try deserializeLeaky(f64, arena, case_pos_inf, &meta, .{});
+    try std.testing.expect(std.math.isPositiveInf(result_pos_inf));
+
+    const case_neg_inf =
+        \\
+        \\ -inf
+        \\
+    ;
+    const result_neg_inf = try deserializeLeaky(f64, arena, case_neg_inf, &meta, .{});
+    try std.testing.expect(std.math.isNegativeInf(result_neg_inf));
+
+    const case_nan =
+        \\
+        \\ nan
+        \\
+    ;
+    const result_nan = try deserializeLeaky(f64, arena, case_nan, &meta, .{});
+    try std.testing.expect(std.math.isNan(result_nan));
+}
+
+test "array basics" {
+    const case =
+        \\
+        \\ [1, 2, 3]
+        \\
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta: Meta = undefined;
+    const result = try deserializeLeaky([]usize, arena, case, &meta, .{});
+
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, result);
+}
+
+test "array trailing comma" {
+    const case =
+        \\
+        \\ [1, 2, 3, ]
+        \\
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const result = try deserializeLeaky([]usize, arena, case, &meta, .{});
+
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, result);
+}
+
+test "comments are ignored" {
+    const case =
+        \\.foo = "bar",
+        \\// This is false because I say so
+        \\.bar = false,
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const c = try deserializeLeaky(Case, arena, case, &meta, .{});
+    try std.testing.expectEqualStrings("bar", c.foo);
+    try std.testing.expectEqual(false, c.bar);
+}
+
+test "optional - string" {
+    const case =
+        \\
+        \\ "foo"
+        \\
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const result = try deserializeLeaky(?[]const u8, arena, case, &meta, .{});
+    try std.testing.expectEqualStrings("foo", result.?);
+}
+
+test "optional - null" {
+    const case =
+        \\
+        \\ null
+        \\
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const result = try deserializeLeaky(?[]const u8, arena, case, &meta, .{});
+    try std.testing.expect(result == null);
+}
+
+test "unions" {
+    const case =
+        \\.dep1 = .remote(.{
+        \\    .url = "https://github.com",
+        \\    .hash = "123...",
+        \\}),
+        \\.dep2 =  .local(.{
+        \\    .path = "../super"
+        \\}),
+    ;
+
+    const Project = struct {
+        dep1: Dependency,
+        dep2: Dependency,
+        pub const Dependency = union(enum) {
+            remote: struct {
+                url: []const u8,
+                hash: []const u8,
+            },
+            local: struct {
+                path: []const u8,
+            },
+        };
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const c = try deserializeLeaky(Project, arena, case, &meta, .{});
+    try std.testing.expect(c.dep1 == .remote);
+    try std.testing.expectEqualStrings("https://github.com", c.dep1.remote.url);
+    try std.testing.expectEqualStrings("123...", c.dep1.remote.hash);
+    try std.testing.expect(c.dep2 == .local);
+    try std.testing.expectEqualStrings("../super", c.dep2.local.path);
+}
+
+test "multiline string" {
+    const case =
+        \\.outer = .{
+        \\  .str =
+        \\    \\fst
+        \\    \\snd
+        \\  ,
+        \\}
+    ;
+
+    const Case = struct {
+        outer: struct {
+            str: []const u8,
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const c = try deserializeLeaky(Case, arena, case, &meta, .{});
+    try std.testing.expectEqualStrings("fst\nsnd", c.outer.str);
+}
+
+test "braceless struct - frontmatter" {
+    const case =
+        \\---
+        \\.foo = "bar",
+        \\.bar = false,
+        \\---
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const opts: Options = .{ .delimiter = .{ .dashes = 3 } };
+    _ = try deserializeLeaky(Case, arena, case, &meta, opts);
+
+    const lines: u32 = @intCast(std.mem.count(u8, case, "\n"));
+    try std.testing.expectEqual(lines, meta.doc.lines);
+    try std.testing.expectEqual(case.len, meta.doc.end);
+}
+
+test "braceless struct no trailing comma - frontmatter" {
+    const case =
+        \\---
+        \\.foo = "bar",
+        \\.bar = false
+        \\---
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const opts: Options = .{ .delimiter = .{ .dashes = 3 } };
+    _ = try deserializeLeaky(Case, arena, case, &meta, opts);
+
+    const lines: u32 = @intCast(std.mem.count(u8, case, "\n"));
+    try std.testing.expectEqual(lines, meta.doc.lines);
+    try std.testing.expectEqual(case.len, meta.doc.end);
+}
+
+test "struct - frontmatter" {
+    const case =
+        \\---
+        \\.{
+        \\    .foo = "Zig's New Relationship with LLVM",
+        \\    .bar = false,
+        \\}
+        \\---
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const opts: Options = .{ .delimiter = .{ .dashes = 3 } };
+    _ = try deserializeLeaky(Case, arena, case, &meta, opts);
+
+    const lines: u32 = @intCast(std.mem.count(u8, case, "\n"));
+    try std.testing.expectEqual(lines, meta.doc.lines);
+    try std.testing.expectEqual(case.len, meta.doc.end);
+}
+
+test "struct - frontmatter plus markdown" {
+    const case =
+        \\---
+        \\.{
+        \\    .foo = "Zig's New Relationship with LLVM",
+        \\    .bar = false,
+        \\}
+        \\---
+        \\
+        \\ bla bla bla
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const opts: Options = .{ .delimiter = .{ .dashes = 3 } };
+    _ = try deserializeLeaky(Case, arena, case, &meta, opts);
+
+    try std.testing.expectEqual(5, meta.doc.lines);
+    try std.testing.expectEqual(77, meta.doc.end);
+}
+
+test "braceless struct no trailing comma - frontmatter + markdown" {
+    const case =
+        \\---
+        \\.foo = "bar",
+        \\.bar = false
+        \\---
+        \\
+        \\aarst arst arst
+        \\
+        \\ arstarst
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const opts: Options = .{ .delimiter = .{ .dashes = 3 } };
+    _ = try deserializeLeaky(Case, arena, case, &meta, opts);
+
+    try std.testing.expectEqual(3, meta.doc.lines);
+    try std.testing.expectEqual(34, meta.doc.end);
+}
+
+test "missing delimiter in markdown" {
+    const case =
+        \\---
+        \\.foo = "bar",
+        \\.bar = false
+        \\
+        \\aarst arst arst
+        \\
+        \\ arstarst
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const opts: Options = .{ .delimiter = .{ .dashes = 3 } };
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        deserializeLeaky(Case, arena, case, &meta, opts),
+    );
+
+    try std.testing.expectFmt(
+        \\<stdin>:5:1 unexpected token
+        \\|   aarst arst arst
+        \\|   ^^^^^
+        \\
+        \\
+    , "{f}", .{meta.reportErrorsFmt(arena, opts, null, case, error.UnexpectedToken)});
+}
+
+test "duplicate field + syntax error" {
+    const case =
+        \\---
+        \\.foo = "bar",
+        \\.foo = false
+        \\
+        \\aarst arst arst
+        \\
+        \\ arstarst
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const opts: Options = .{ .delimiter = .{ .dashes = 3 } };
+    try std.testing.expectError(
+        error.DuplicateField,
+        deserializeLeaky(Case, arena, case, &meta, opts),
+    );
+
+    try std.testing.expectFmt(
+        \\<stdin>:5:1 unexpected token
+        \\|   aarst arst arst
+        \\|   ^^^^^
+        \\
+        \\
+    , "{f}", .{meta.reportErrorsFmt(arena, opts, null, case, error.DuplicateField)});
+}
+
+test "duplicate field in markdown" {
+    const case =
+        \\---
+        \\.foo = "bar",
+        \\.foo = false
+        \\---
+        \\aarst arst arst
+        \\
+        \\ arstarst
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta: Meta = undefined;
+    const opts: Options = .{ .delimiter = .{ .dashes = 3 } };
+    try std.testing.expectError(
+        error.DuplicateField,
+        deserializeLeaky(Case, arena, case, &meta, opts),
+    );
+
+    try std.testing.expectFmt(
+        \\<stdin>:3:1 duplicate field 'foo'
+        \\|   .foo = false
+        \\|   ^^^^
+        \\
+    , "{f}", .{meta.reportErrorsFmt(arena, opts, null, case, error.DuplicateField)});
+}
+
+test "simple deserialization + deserialize" {
+    const case =
+        \\.foo = "bar",
+        \\.bar = true,
+    ;
+
+    const Case = struct {
+        foo: []const u8,
+        bar: bool,
+    };
+
+    var meta: Meta = undefined;
+    const opts: Options = .{};
+    const result = try deserialize(Case, std.testing.allocator, case, &meta, opts);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("bar", result.value.foo);
+    try std.testing.expectEqual(true, result.value.bar);
+}
