@@ -143,6 +143,7 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
 
             context.focused_surface = null;
             context.previous_focused_view = context.focused_view;
+            if (context.focused_view) |prev| prev.setActivated(false);
             context.focused_view = null;
             context.focused_layer = null;
             BorderManager.updateBorders(context);
@@ -190,8 +191,10 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
                 view,
             ) catch {};
 
-            // Deactivate the previously focused view's handle.
+            // Deactivate the previously focused view (X11 WM_STATE +
+            // foreign-toplevel handle).
             if (context.previous_focused_view) |prev| {
+                prev.setActivated(false);
                 if (prev.toplevel_handle) |handle| {
                     handle.setActivated(false);
                 }
@@ -207,6 +210,7 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
                 );
             }
 
+            view.setActivated(true);
             if (view.toplevel_handle) |handle| {
                 handle.setActivated(true);
             }
@@ -245,6 +249,7 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             }
 
             if (context.focused_view) |view| {
+                view.setActivated(false);
                 context.previous_focused_view = view;
             }
 

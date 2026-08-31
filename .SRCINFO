@@ -1,0 +1,25 @@
+pkgbase = zylr-git
+	pkgdesc = A minimalist Wayland compositor written in Zig
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/aspenir/zylr
+	arch = x86_64
+	license = GPL-3.0-or-later
+	makedepends = zig
+	makedepends = wayland-protocols
+	makedepends = wlroots0.20
+	makedepends = scenefx0.5
+	depends = wayland
+	depends = libxcb
+	depends = libxkbcommon
+	depends = libinput
+	depends = pixman
+	depends = wlroots0.20
+	depends = scenefx0.5
+	depends = systemd-libs
+	depends = xcb-util-wm
+	options = !lto
+	source = zylr-git::git+https://github.com/aspenir/zylr.git#branch=main
+	sha256sums = SKIP
+
+pkgname = zylr-git
