@@ -21,6 +21,27 @@ fn logToFile(msg: []const u8) void {
     _ = std.c.fclose(f);
 }
 
+/// Throttled counter for the commitSurface diagnostic (first 30 calls,
+/// then every 300th) so a high-rate client does not flood the log.
+var xw_cfg_diag: u32 = 0;
+
+extern fn wlr_xwayland_get_xwm_connection(xwayland: *wlroots.Xwayland) ?*xcb.xcb_connection_t;
+
+/// wlroots 0.20 maps an X window only when the CLIENT sends a
+/// MapRequest (xwm_handle_map_request). Some rootless clients (Steam)
+/// never do, so their X windows stay unmapped in the X server and
+/// Xwayland can deliver NO pointer events to them — the X server only
+/// dispatches core events to viewable (mapped) windows. Map the window
+/// ourselves through the XWM connection (the SubstructureRedirect
+/// owner, so the map is not deferred) exactly when the wl_surface maps.
+pub fn mapXwindow(view: *View, xw: *wlroots.XwaylandSurface) void {
+    const context = view.context;
+    const xwayland = context.xwayland orelse return;
+    const conn = wlr_xwayland_get_xwm_connection(xwayland) orelse return;
+    _ = xcb.xcb_map_window(conn, xw.window_id);
+    _ = xcb.xcb_flush(conn);
+}
+
 pub fn onNewXwaylandSurface(
     listener: *wl.Listener(*wlroots.XwaylandSurface),
     xw_surface: *wlroots.XwaylandSurface,
@@ -28,7 +49,15 @@ pub fn onNewXwaylandSurface(
     const context: *ServerContext =
         @fieldParentPtr("new_xwayland_surface_listener", listener);
 
-    std.log.info("NEW XWAYLAND SURFACE", .{});
+    std.log.info("NEW XWAYLAND SURFACE win=0x{x} ored={} geo=({d},{d},{d},{d}) parent={?*}", .{
+        xw_surface.window_id,
+        xw_surface.override_redirect,
+        xw_surface.x,
+        xw_surface.y,
+        xw_surface.width,
+        xw_surface.height,
+        xw_surface.parent,
+    });
     {
         const line = std.fmt.allocPrint(
             std.heap.c_allocator,
@@ -75,30 +104,41 @@ pub fn onNewXwaylandSurface(
         wl.Listener(void).init(onMapRequest);
     view.set_decorations_listener =
         wl.Listener(void).init(onSetDecorations);
+    view.request_configure_listener =
+        wl.Listener(*wlroots.XwaylandSurface.event.Configure).init(onRequestConfigure);
+    view.set_geometry_listener =
+        wl.Listener(void).init(onSetGeometry);
     view.destroy_listener =
         wl.Listener(void).init(View.onSurfaceDestroy);
 
     xw_surface.events.associate.add(&view.associate_listener);
     xw_surface.events.map_request.add(&view.map_request_listener);
     xw_surface.events.set_decorations.add(&view.set_decorations_listener);
+    xw_surface.events.request_configure.add(&view.request_configure_listener);
+    xw_surface.events.set_geometry.add(&view.set_geometry_listener);
     xw_surface.events.destroy.add(&view.destroy_listener);
 
-    // Foreign-toplevel handle (portal window pickers, bars).
-    const handle = wlroots.ForeignToplevelHandleV1.create(
-        context.toplevel_manager,
-    ) catch |err| {
-        std.log.err("failed to create toplevel handle: {}", .{err});
-        return;
-    };
-    view.toplevel_handle = handle;
+    // Foreign-toplevel handle (portal window pickers, bars). Override-
+    // redirect windows are popups/self-managed content, NOT toplevels,
+    // so they get no handle — otherwise Steam menus show up as their
+    // own taskbar entries.
+    if (!xw_surface.override_redirect) {
+        const handle = wlroots.ForeignToplevelHandleV1.create(
+            context.toplevel_manager,
+        ) catch |err| {
+            std.log.err("failed to create toplevel handle: {}", .{err});
+            return;
+        };
+        view.toplevel_handle = handle;
 
-    view.request_close_listener =
-        wl.Listener(*wlroots.ForeignToplevelHandleV1).init(View.onRequestClose);
-    handle.events.request_close.add(&view.request_close_listener);
-    view.request_activate_listener =
-        wl.Listener(*wlroots.ForeignToplevelHandleV1.event.Activated).init(View.onRequestActivate);
-    view.request_activate_active = true;
-    handle.events.request_activate.add(&view.request_activate_listener);
+        view.request_close_listener =
+            wl.Listener(*wlroots.ForeignToplevelHandleV1).init(View.onRequestClose);
+        handle.events.request_close.add(&view.request_close_listener);
+        view.request_activate_listener =
+            wl.Listener(*wlroots.ForeignToplevelHandleV1.event.Activated).init(View.onRequestActivate);
+        view.request_activate_active = true;
+        handle.events.request_activate.add(&view.request_activate_listener);
+    }
 
     xw_surface.data = view;
 }
@@ -185,6 +225,10 @@ fn onAssociate(listener: *wl.Listener(void)) void {
 fn onSetDecorations(listener: *wl.Listener(void)) void {
     const view: *View =
         @fieldParentPtr("set_decorations_listener", listener);
+    // Decoration signals can arrive from a window that is being torn
+    // down (Steam's loading→main transition destroys its game windows):
+    // the surface tree is then gone and touching it aborts in scenefx.
+    if (!view.isMapped()) return;
     const xw_surface = view.backend.xwayland;
     if (view.surfaceOrNull()) |surface| {
         commitSurface(view, xw_surface, surface);
@@ -199,11 +243,83 @@ fn onMapRequest(listener: *wl.Listener(void)) void {
     view.backend.xwayland.setWithdrawn(false);
 }
 
+/// The client asked to move/resize its own window. Honor it for
+/// self-managed windows (floating or override-redirect); for tiled
+/// windows the layout owns the geometry, so re-assert it. Without a
+/// response, a client that moves its window leaves the real X window
+/// somewhere xsurface->x does not track, and Xwayland's pointer
+/// coordinate mapping goes wrong (Steam's offset misses).
+fn onRequestConfigure(
+    listener: *wl.Listener(*wlroots.XwaylandSurface.event.Configure),
+    ev: *wlroots.XwaylandSurface.event.Configure,
+) void {
+    const view: *View =
+        @fieldParentPtr("request_configure_listener", listener);
+    const xw = view.backend.xwayland;
+
+    // A dying window's geometry may arrive after its surface tree is
+    // gone; honoring it would reparent live nodes in a dead tree.
+    if (!view.isMapped()) return;
+
+    if (view.floating or view.fullscreen or xw.override_redirect) {
+        _ = xw.configure(ev.x, ev.y, ev.width, ev.height);
+        const bw: i32 = @intCast(view.context.border_width);
+        view.slot_w = @max(1, @as(i32, ev.width) + 2 * bw);
+        view.slot_h = @max(1, @as(i32, ev.height) + 2 * bw);
+        return;
+    }
+
+    if (view.surfaceOrNull()) |surface| {
+        commitSurface(view, xw, surface);
+    }
+}
+
+/// The X window's geometry actually changed in the X server — an
+/// override-redirect window (Steam's content windows are OR) moved
+/// itself. Follow the client instead of fighting it: float the view and
+/// pin the scene to the window's position so Xwayland's surface-local →
+/// X-root mapping stays aligned and the window cannot drift away.
+fn onSetGeometry(listener: *wl.Listener(void)) void {
+    const view: *View =
+        @fieldParentPtr("set_geometry_listener", listener);
+    if (view.backend != .xwayland) return;
+    if (!view.isMapped()) return;
+    const xw = view.backend.xwayland;
+    if (!xw.override_redirect) return;
+    std.log.warn("SETGEO win=0x{x} geo=({d},{d},{d},{d})", .{
+        xw.window_id, xw.x, xw.y, xw.width, xw.height,
+    });
+
+    view.floating = true;
+    view.x = xw.x;
+    view.y = xw.y;
+    view.scene_tree.node.setPosition(xw.x, xw.y);
+    Border.updateViewBorder(view, @floatFromInt(xw.x), null);
+}
+
 pub fn commitSurface(
     view: *View,
     xw_surface: *wlroots.XwaylandSurface,
     surface: *wlroots.Surface,
 ) void {
+    // Override-redirect windows manage themselves (Steam popups and its
+    // content windows are OR): Xwayland has already resolved their
+    // position to scene coordinates, so render them exactly where the X
+    // server says instead of tiling them into a layout slot (Steam menus
+    // flashed off to the right and vanished). Configuring them would
+    // fight the client, so position-only.
+    if (xw_surface.override_redirect) {
+        view.floating = true;
+        view.x = xw_surface.x;
+        view.y = xw_surface.y;
+        view.scene_tree.node.setPosition(xw_surface.x, xw_surface.y);
+        std.log.warn("ORPOS win=0x{x} geo=({d},{d},{d},{d})", .{
+            xw_surface.window_id, xw_surface.x, xw_surface.y,
+            xw_surface.width, xw_surface.height,
+        });
+        return;
+    }
+
     const context = view.context;
     const output = context.output orelse {
         std.log.err("No output for xwayland configure", .{});
@@ -269,17 +385,43 @@ pub fn commitSurface(
         wrap.node.subsurfaceTreeSetClip(&crop);
     }
 
+    // Tiled views render at view.x - viewport (layoutViews):
+    // the configured X position must match the rendered spot or Xwayland
+    // maps surface-local pointer coords to the wrong X root position.
+    // Floating/fullscreen views are placed at absolute view.x (same rule
+    // as edgeHit).
+    const vp_x: c_int = if (view.floating or view.fullscreen) 0 else @intCast(context.viewport_x);
+    const vp_y: c_int = if (view.floating or view.fullscreen) 0 else @intCast(context.viewport_y);
+    const target_x: i16 = @intCast(view.x + bw - vp_x);
+    const target_y: i16 = @intCast(view.y + bw - vp_y);
+
+    // Keep Xwayland's idea of the window's geometry in lockstep with the
+    // scene position. If they diverge, Xwayland maps surface-local pointer
+    // coords to the wrong X root position and clicks land off-target
+    // (Steam was unresponsive). Configure whenever the position OR size
+    // differs from what Xwayland currently knows.
+    const moved = target_x != xw_surface.x or target_y != xw_surface.y;
     const wrong_size = surface.current.width != target_w or
         surface.current.height != target_h;
 
-    if (wrong_size) {
-        _ = xw_surface.configure(
-            @intCast(view.x + bw),
-            @intCast(view.y + bw),
-            @intCast(target_w),
-            @intCast(target_h),
-        );
+    if (moved or wrong_size) {
+        _ = xw_surface.configure(target_x, target_y, @intCast(target_w), @intCast(target_h));
         xw_surface.activate(context.focused_view == view);
     }
 
+    {
+        xw_cfg_diag += 1;
+        if (xw_cfg_diag <= 30 or xw_cfg_diag % 300 == 0) {
+            std.log.warn("XW cfg vx={d} vy={d} vp=({d},{d}) bw={d} tgt=({d},{d},{d},{d}) old=({d},{d}) cur=({d},{d}) moved={d} wrong={d}", .{
+                view.x,              view.y,
+                context.viewport_x,  context.viewport_y,
+                bw,                  target_x,
+                target_y,            target_w,
+                target_h,            xw_surface.x,
+                xw_surface.y,        surface.current.width,
+                surface.current.height,
+                @intFromBool(moved), @intFromBool(wrong_size),
+            });
+        }
+    }
 }

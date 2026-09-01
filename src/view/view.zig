@@ -71,6 +71,16 @@ map_request_listener: wl.Listener(void) = undefined,
 /// (XWayland only). Firefox maps and commits BEFORE setting them, so
 /// the ring must be re-evaluated when the hint finally arrives.
 set_decorations_listener: wl.Listener(void) = undefined,
+/// Client asked to move/resize its own window (ConfigureRequest).
+/// XWayland only. Tiled views re-assert layout geometry; floating and
+/// override-redirect views get the client's geometry honored, so an X
+/// window can never drift from the scene (which misaligns Xwayland's
+/// pointer coordinate mapping).
+request_configure_listener: wl.Listener(*wlroots.XwaylandSurface.event.Configure) = undefined,
+/// The X window's geometry really changed in the X server (a client
+/// self-managed an override-redirect window). XWayland only: follow the
+/// client by floating + repositioning the view instead of fighting it.
+set_geometry_listener: wl.Listener(void) = undefined,
 /// True once onAssociate wired commit/map/unmap listeners (XWayland
 /// only; destroys before associate fire with those links unregistered).
 associated: bool = false,
@@ -90,6 +100,19 @@ backend: Backend,
 pub fn isMapped(view: *View) bool {
     const s = view.surfaceOrNull() orelse return false;
     return s.mapped;
+}
+
+/// Override-redirect XWayland window (Steam menus/popups). These are
+/// self-managed: no tiling, no taskbar entry, no keyboard focus, no
+/// activation churn. Steam keeps a menu open only while its toplevel is
+/// left alone; yanking X input focus across its windows mid-menu closes
+/// it. Treat them as unmanaged: pointer events still flow to the popup
+/// surface (scene hit-testing handles that), everything else is skipped.
+pub fn isOrWindow(view: *View) bool {
+    return switch (view.backend) {
+        .xdg => false,
+        .xwayland => |x| x.override_redirect,
+    };
 }
 
 pub fn surface(self: *View) *wlroots.Surface {
@@ -156,6 +179,7 @@ pub fn onRequestActivate(
     FocusManager.setFocus(view.context, .{
         .view = .{
             .view = view,
+            .surface = view.surface(),
             .sx = 0,
             .sy = 0,
         },
@@ -192,15 +216,46 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
 
     view.scene_tree.node.setEnabled(true);
 
-    FocusManager.setFocus(context, .{
-        .view = .{
-            .view = view,
-            .sx = context.cursor.x - view.x,
-            .sy = context.cursor.y - view.y,
-        },
-    });
+    // Override-redirect windows are unmanaged: no keyboard focus, no
+    // layout slot, no scroll. Steam's menus open exactly where the X
+    // server placed them and close if we re-activate the parent while
+    // they are up, so we must not run them through setFocus.
+    if (!view.isOrWindow()) {
+        FocusManager.setFocus(context, .{
+            .view = .{
+                .view = view,
+                .surface = view.surface(),
+                .sx = context.cursor.x - view.x,
+                .sy = context.cursor.y - view.y,
+            },
+        });
+    }
 
-    ViewManager.scrollToView(context, view);
+    // The new window must take its tiling slot first, or the position
+    // checks and the XWayland configure targets below would use stale
+    // coordinates (scrollToView used to recompute internally).
+    ViewManager.updateViewPositions(context);
+
+    // Bring the mapped window into view WITHOUT re-centering the
+    // viewport. scrollToView on every map (loading window, then main
+    // window) chases the newest toplevel and can shove the viewport past
+    // the whole workspace — the "viewport scrolled away from Steam" bug.
+    if (!view.isOrWindow()) ViewManager.scrollIntoView(context, view);
+
+    // Sync Xwayland's idea of the window geometry the moment it maps
+    // (scrollToView already ran updateViewPositions so view.x/y are the
+    // post-layout slot). Waiting for the next client commit to configure
+    // leaves the X window with stale geometry when a client stops
+    // committing after map, and Xwayland hit-tests on the X window.
+    switch (view.backend) {
+        .xwayland => |xw| {
+            if (view.surfaceOrNull()) |surf| {
+                xw_mod.commitSurface(view, xw, surf);
+                xw_mod.mapXwindow(view, xw);
+            }
+        },
+        .xdg => {},
+    }
 }
 
 pub fn onSurfaceUnmap(listener: *wl.Listener(void)) void {
@@ -225,7 +280,14 @@ pub fn onSurfaceUnmap(listener: *wl.Listener(void)) void {
     }
 
     if (view.context.focused_view == view) {
-        FocusManager.restoreFocus(view.context);
+        // Unmanaged popups never entered the focus history; just clear
+        // the pointer focus without restoring (restoreFocus would
+        // re-activate the parent and could dismiss a sibling menu).
+        if (view.isOrWindow()) {
+            view.context.focused_view = null;
+        } else {
+            FocusManager.restoreFocus(view.context);
+        }
     }
 }
 
@@ -298,6 +360,8 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
         view.associate_listener.link.remove();
         view.map_request_listener.link.remove();
         view.set_decorations_listener.link.remove();
+        view.request_configure_listener.link.remove();
+        view.set_geometry_listener.link.remove();
     }
 
     if (view.toplevel_handle) |handle| {

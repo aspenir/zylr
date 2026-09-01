@@ -1,7 +1,8 @@
 const wlroots = @import("wlroots");
 const std = @import("std");
 
-const NodeData = @import("utils/node_data.zig").NodeData;
+const node_data = @import("utils/node_data.zig");
+const NodeData = node_data.NodeData;
 const View = @import("view.zig");
 const LayerView = @import("layer.zig");
 const ServerContext = @import("../server.zig");
@@ -12,6 +13,9 @@ const FocusTarget = union(enum) {
     none,
     view: struct {
         view: *View,
+        /// Surface under the cursor (may be an XWayland subsurface). Null
+        /// falls back to the view's top-level surface in setFocus.
+        surface: ?*wlroots.Surface,
         sx: f64,
         sy: f64,
     },
@@ -52,12 +56,16 @@ pub fn focusAtCursor(context: *ServerContext) void {
                     setFocus(context, .{
                         .view = .{
                             .view = view_ptr,
+                            .surface = node_data.hitSurface(node),
                             .sx = sx,
                             .sy = sy,
                         },
                     });
                     // Clicking a window hanging off-screen brings it in.
-                    ViewManager.scrollIntoView(context, view_ptr);
+                    // Popups are unmanaged; never scroll for them.
+                    if (!view_ptr.isOrWindow()) {
+                        ViewManager.scrollIntoView(context, view_ptr);
+                    }
                     return;
                 },
 
@@ -125,6 +133,7 @@ pub fn restoreFocus(context: *ServerContext) void {
         setFocus(context, .{
             .view = .{
                 .view = candidate,
+                .surface = candidate.surface(),
                 .sx = 0,
                 .sy = 0,
             },
@@ -157,8 +166,7 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             // never mapped or withdrew again) must not take focus.
             if (!view.isMapped()) return;
 
-            const surface = view.surface();
-
+            const surface = target_view.surface orelse view.surface();
             if (context.focused_surface != surface) {
                 context.seat.pointerNotifyEnter(
                     surface,
@@ -168,11 +176,11 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
                 context.focused_surface = surface;
             }
 
-            if (context.focused_view == view and
-                context.focused_layer == null)
-            {
-                return;
-            }
+            // Override-redirect windows (Steam menus) are unmanaged: the
+            // pointer reaches their surface, but they never take keyboard
+            // focus, enter the MRU history, or change activation — yanking
+            // X input focus across Steam's window stack mid-menu closes it.
+            if (view.isOrWindow()) return;
 
             context.previous_focused_view = context.focused_view;
             context.focused_view = view;
@@ -213,6 +221,13 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             view.setActivated(true);
             if (view.toplevel_handle) |handle| {
                 handle.setActivated(true);
+            }
+
+            // Offer focus (WM_TAKE_FOCUS) to XWayland clients using the
+            // Globally Active ICCCM input model (Steam, Java apps). These
+            // only accept keyboard input after receiving the offer.
+            if (view.backend == .xwayland) {
+                view.backend.xwayland.offerFocus();
             }
 
             // Only floating views need raised z-order; tiled views
@@ -281,7 +296,7 @@ fn focusFirst(context: *ServerContext) void {
         if (!view.isMapped()) continue;
 
         setFocus(context, .{
-            .view = .{ .view = view, .sx = 0, .sy = 0 },
+            .view = .{ .view = view, .surface = view.surface(), .sx = 0, .sy = 0 },
         });
         ViewManager.scrollToView(context, view);
         return;
@@ -317,7 +332,7 @@ pub fn focusColumnLeft(context: *ServerContext) void {
         if (!target.isMapped()) continue;
 
         setFocus(context, .{
-            .view = .{ .view = target, .sx = 0, .sy = 0 },
+            .view = .{ .view = target, .surface = target.surface(), .sx = 0, .sy = 0 },
         });
         ViewManager.scrollToView(context, target);
         return;
@@ -349,7 +364,7 @@ pub fn focusColumnRight(context: *ServerContext) void {
         if (!target.isMapped()) continue;
 
         setFocus(context, .{
-            .view = .{ .view = target, .sx = 0, .sy = 0 },
+            .view = .{ .view = target, .surface = target.surface(), .sx = 0, .sy = 0 },
         });
         ViewManager.scrollToView(context, target);
         return;

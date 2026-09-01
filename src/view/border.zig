@@ -129,9 +129,25 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
         return;
     }
 
+    // Override-redirect windows (Steam menus) get no border ring.
+    if (view.isOrWindow()) {
+        border.rect.node.setEnabled(false);
+        return;
+    }
+
     // A view can be mid-animation before its surface is mapped (XWayland
     // views in particular), in which case there's no size to draw around.
     const surface = view.surfaceOrNull() orelse return;
+
+    // An unmapped window (or one with no buffer yet) must not touch the
+    // scene: its surface tree may be gone — Steam destroys and recreates
+    // its content window during the loading→main transition and MOTIF
+    // decoration signals can fire while it is dying — and scenefx asserts
+    // on re-parenting in that state (node != sibling).
+    if (!view.isMapped() or surface.current.width <= 0 or surface.current.height <= 0) {
+        border.rect.node.setEnabled(false);
+        return;
+    }
 
     const width = surface.current.width;
     const height = surface.current.height;

@@ -83,23 +83,40 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
     switch (hit.data.*) {
         .view => |view| {
             const view_ptr: *View = @ptrCast(@alignCast(view));
-            const surface = view_ptr.surface();
+            if (view_ptr.backend == .xwayland) {
+                const xw = view_ptr.backend.xwayland;
+                std.log.warn("PTR xwl win=0x{x} ored={} cl={?s} in={?s} tt={?s} hit={?*} sx={d:.0} sy={d:.0} cur=({d:.0},{d:.0})", .{ xw.window_id, xw.override_redirect, xw.class, xw.instance, xw.title, hit.surface, hit.sx, hit.sy, context.cursor.x, context.cursor.y });
+            }
+            const surface = hit.surface orelse view_ptr.surface();
 
-            if (context.focused_surface != surface) {
+            const first_enter = context.focused_surface != surface;
+            if (first_enter) {
                 context.seat.pointerNotifyEnter(surface, hit.sx, hit.sy);
                 context.focused_surface = surface;
             }
 
             // Focus-follows-mouse: keyboard focus tracks the hovered view
             // instead of only clicking. setFocus also updates borders, the
-            // MRU history and the toplevel handles.
-            if (context.cfg.focus_follows_mouse and context.focused_view != view_ptr) {
+            // MRU history and the toplevel handles. Never for popups
+            // (unmanaged); stealing activation from Steam mid-menu closes
+            // the menu. Pointer focus was already set above.
+            if (context.cfg.focus_follows_mouse and
+                context.focused_view != view_ptr and
+                !view_ptr.isOrWindow())
+            {
                 FocusManager.setFocus(context, .{
-                    .view = .{ .view = view_ptr, .sx = hit.sx, .sy = hit.sy },
+                    .view = .{ .view = view_ptr, .surface = hit.surface orelse view_ptr.surface(), .sx = hit.sx, .sy = hit.sy },
                 });
             }
 
             context.seat.pointerNotifyMotion(time_msec, hit.sx, hit.sy);
+            // Xwayland only dispatches pointer motion on a wl_pointer.frame
+            // (wl_pointer v5+). Sending one right after the motion over an
+            // X window removes any cadence gap between the cursor's frame
+            // event and the motion, so the X pointer cannot freeze mid-window.
+            if (!first_enter) {
+                context.seat.pointerNotifyFrame();
+            }
         },
         .layer => |layer| {
             const layer_ptr: *LayerView = @ptrCast(@alignCast(layer));
@@ -359,5 +376,15 @@ pub fn onCursorFrame(
     const context: *ServerContext =
         @fieldParentPtr("cursor_frame_listener", listener);
 
+    cursor_frame_diag += 1;
+    const n = cursor_frame_diag;
+    if (n <= 20 or (n % 500 == 0 and n > 0)) {
+        const over_xw = context.focused_view != null and
+            context.focused_view.?.backend == .xwayland;
+        std.log.warn("PTRF total={d} over_xw={}", .{ n, over_xw });
+    }
+
     context.seat.pointerNotifyFrame();
 }
+
+var cursor_frame_diag: u64 = 0;

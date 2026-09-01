@@ -239,7 +239,7 @@ fn surfaceAt(
         .view => |view| {
             const view_ptr: *View = @ptrCast(@alignCast(view));
             return .{
-                .surface = view_ptr.surface(),
+                .surface = hit.surface orelse view_ptr.surface(),
                 .sx = hit.sx,
                 .sy = hit.sy,
                 .view = view_ptr,
@@ -290,6 +290,7 @@ pub fn onDown(
         FocusManager.setFocus(self.context, .{
             .view = .{
                 .view = view,
+                .surface = hit.surface,
                 .sx = hit.sx,
                 .sy = hit.sy,
             },

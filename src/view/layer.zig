@@ -128,6 +128,7 @@ pub fn onLayerSurfaceDestroy(
                 FocusManager.setFocus(context, .{
                     .view = .{
                         .view = view,
+                        .surface = view.surface(),
                         .sx = context.cursor.x - view.x,
                         .sy = context.cursor.y - view.y,
                     },
