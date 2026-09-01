@@ -221,13 +221,13 @@ pub fn runAction(
                     if (f.view.isMapped()) {
                         f.view.fullscreen = f.prev_fullscreen;
                         ViewManager.applyFullscreen(context, f.view);
-                        FocusManager.setFocus(context, .{ .view = .{ .view = f.view, .sx = 0, .sy = 0 } });
+                        FocusManager.setFocus(context, .{ .view = .{ .view = f.view, .surface = f.view.surface(), .sx = 0, .sy = 0 } });
                     }
                 },
                 .focus => |f| {
                     if (f.restore) |view| {
                         if (view.isMapped()) {
-                            FocusManager.setFocus(context, .{ .view = .{ .view = view, .sx = 0, .sy = 0 } });
+                            FocusManager.setFocus(context, .{ .view = .{ .view = view, .surface = view.surface(), .sx = 0, .sy = 0 } });
                             ViewManager.scrollToView(context, view);
                         }
                     }
