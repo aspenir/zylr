@@ -102,6 +102,19 @@ pub fn isMapped(view: *View) bool {
     return s.mapped;
 }
 
+/// Override-redirect XWayland window (Steam menus/popups). These are
+/// self-managed: no tiling, no taskbar entry, no keyboard focus, no
+/// activation churn. Steam keeps a menu open only while its toplevel is
+/// left alone; yanking X input focus across its windows mid-menu closes
+/// it. Treat them as unmanaged: pointer events still flow to the popup
+/// surface (scene hit-testing handles that), everything else is skipped.
+pub fn isOrWindow(view: *View) bool {
+    return switch (view.backend) {
+        .xdg => false,
+        .xwayland => |x| x.override_redirect,
+    };
+}
+
 pub fn surface(self: *View) *wlroots.Surface {
     return self.surfaceOrNull() orelse unreachable;
 }
@@ -203,14 +216,20 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
 
     view.scene_tree.node.setEnabled(true);
 
-    FocusManager.setFocus(context, .{
-        .view = .{
-            .view = view,
-            .surface = view.surface(),
-            .sx = context.cursor.x - view.x,
-            .sy = context.cursor.y - view.y,
-        },
-    });
+    // Override-redirect windows are unmanaged: no keyboard focus, no
+    // layout slot, no scroll. Steam's menus open exactly where the X
+    // server placed them and close if we re-activate the parent while
+    // they are up, so we must not run them through setFocus.
+    if (!view.isOrWindow()) {
+        FocusManager.setFocus(context, .{
+            .view = .{
+                .view = view,
+                .surface = view.surface(),
+                .sx = context.cursor.x - view.x,
+                .sy = context.cursor.y - view.y,
+            },
+        });
+    }
 
     // The new window must take its tiling slot first, or the position
     // checks and the XWayland configure targets below would use stale
@@ -221,7 +240,7 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
     // viewport. scrollToView on every map (loading window, then main
     // window) chases the newest toplevel and can shove the viewport past
     // the whole workspace — the "viewport scrolled away from Steam" bug.
-    ViewManager.scrollIntoView(context, view);
+    if (!view.isOrWindow()) ViewManager.scrollIntoView(context, view);
 
     // Sync Xwayland's idea of the window geometry the moment it maps
     // (scrollToView already ran updateViewPositions so view.x/y are the
@@ -261,7 +280,14 @@ pub fn onSurfaceUnmap(listener: *wl.Listener(void)) void {
     }
 
     if (view.context.focused_view == view) {
-        FocusManager.restoreFocus(view.context);
+        // Unmanaged popups never entered the focus history; just clear
+        // the pointer focus without restoring (restoreFocus would
+        // re-activate the parent and could dismiss a sibling menu).
+        if (view.isOrWindow()) {
+            view.context.focused_view = null;
+        } else {
+            FocusManager.restoreFocus(view.context);
+        }
     }
 }
 

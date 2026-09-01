@@ -62,7 +62,10 @@ pub fn focusAtCursor(context: *ServerContext) void {
                         },
                     });
                     // Clicking a window hanging off-screen brings it in.
-                    ViewManager.scrollIntoView(context, view_ptr);
+                    // Popups are unmanaged; never scroll for them.
+                    if (!view_ptr.isOrWindow()) {
+                        ViewManager.scrollIntoView(context, view_ptr);
+                    }
                     return;
                 },
 
@@ -172,6 +175,12 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
                 );
                 context.focused_surface = surface;
             }
+
+            // Override-redirect windows (Steam menus) are unmanaged: the
+            // pointer reaches their surface, but they never take keyboard
+            // focus, enter the MRU history, or change activation — yanking
+            // X input focus across Steam's window stack mid-menu closes it.
+            if (view.isOrWindow()) return;
 
             context.previous_focused_view = context.focused_view;
             context.focused_view = view;

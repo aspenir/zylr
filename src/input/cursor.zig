@@ -97,8 +97,13 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
 
             // Focus-follows-mouse: keyboard focus tracks the hovered view
             // instead of only clicking. setFocus also updates borders, the
-            // MRU history and the toplevel handles.
-            if (context.cfg.focus_follows_mouse and context.focused_view != view_ptr) {
+            // MRU history and the toplevel handles. Never for popups
+            // (unmanaged); stealing activation from Steam mid-menu closes
+            // the menu. Pointer focus was already set above.
+            if (context.cfg.focus_follows_mouse and
+                context.focused_view != view_ptr and
+                !view_ptr.isOrWindow())
+            {
                 FocusManager.setFocus(context, .{
                     .view = .{ .view = view_ptr, .surface = hit.surface orelse view_ptr.surface(), .sx = hit.sx, .sy = hit.sy },
                 });

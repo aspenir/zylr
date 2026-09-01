@@ -129,6 +129,12 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
         return;
     }
 
+    // Override-redirect windows (Steam menus) get no border ring.
+    if (view.isOrWindow()) {
+        border.rect.node.setEnabled(false);
+        return;
+    }
+
     // A view can be mid-animation before its surface is mapped (XWayland
     // views in particular), in which case there's no size to draw around.
     const surface = view.surfaceOrNull() orelse return;

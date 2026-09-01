@@ -49,7 +49,15 @@ pub fn onNewXwaylandSurface(
     const context: *ServerContext =
         @fieldParentPtr("new_xwayland_surface_listener", listener);
 
-    std.log.info("NEW XWAYLAND SURFACE", .{});
+    std.log.info("NEW XWAYLAND SURFACE win=0x{x} ored={} geo=({d},{d},{d},{d}) parent={?*}", .{
+        xw_surface.window_id,
+        xw_surface.override_redirect,
+        xw_surface.x,
+        xw_surface.y,
+        xw_surface.width,
+        xw_surface.height,
+        xw_surface.parent,
+    });
     {
         const line = std.fmt.allocPrint(
             std.heap.c_allocator,
@@ -110,22 +118,27 @@ pub fn onNewXwaylandSurface(
     xw_surface.events.set_geometry.add(&view.set_geometry_listener);
     xw_surface.events.destroy.add(&view.destroy_listener);
 
-    // Foreign-toplevel handle (portal window pickers, bars).
-    const handle = wlroots.ForeignToplevelHandleV1.create(
-        context.toplevel_manager,
-    ) catch |err| {
-        std.log.err("failed to create toplevel handle: {}", .{err});
-        return;
-    };
-    view.toplevel_handle = handle;
+    // Foreign-toplevel handle (portal window pickers, bars). Override-
+    // redirect windows are popups/self-managed content, NOT toplevels,
+    // so they get no handle — otherwise Steam menus show up as their
+    // own taskbar entries.
+    if (!xw_surface.override_redirect) {
+        const handle = wlroots.ForeignToplevelHandleV1.create(
+            context.toplevel_manager,
+        ) catch |err| {
+            std.log.err("failed to create toplevel handle: {}", .{err});
+            return;
+        };
+        view.toplevel_handle = handle;
 
-    view.request_close_listener =
-        wl.Listener(*wlroots.ForeignToplevelHandleV1).init(View.onRequestClose);
-    handle.events.request_close.add(&view.request_close_listener);
-    view.request_activate_listener =
-        wl.Listener(*wlroots.ForeignToplevelHandleV1.event.Activated).init(View.onRequestActivate);
-    view.request_activate_active = true;
-    handle.events.request_activate.add(&view.request_activate_listener);
+        view.request_close_listener =
+            wl.Listener(*wlroots.ForeignToplevelHandleV1).init(View.onRequestClose);
+        handle.events.request_close.add(&view.request_close_listener);
+        view.request_activate_listener =
+            wl.Listener(*wlroots.ForeignToplevelHandleV1.event.Activated).init(View.onRequestActivate);
+        view.request_activate_active = true;
+        handle.events.request_activate.add(&view.request_activate_listener);
+    }
 
     xw_surface.data = view;
 }
@@ -273,6 +286,9 @@ fn onSetGeometry(listener: *wl.Listener(void)) void {
     if (!view.isMapped()) return;
     const xw = view.backend.xwayland;
     if (!xw.override_redirect) return;
+    std.log.warn("SETGEO win=0x{x} geo=({d},{d},{d},{d})", .{
+        xw.window_id, xw.x, xw.y, xw.width, xw.height,
+    });
 
     view.floating = true;
     view.x = xw.x;
@@ -297,6 +313,10 @@ pub fn commitSurface(
         view.x = xw_surface.x;
         view.y = xw_surface.y;
         view.scene_tree.node.setPosition(xw_surface.x, xw_surface.y);
+        std.log.warn("ORPOS win=0x{x} geo=({d},{d},{d},{d})", .{
+            xw_surface.window_id, xw_surface.x, xw_surface.y,
+            xw_surface.width, xw_surface.height,
+        });
         return;
     }
 
