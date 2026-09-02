@@ -167,6 +167,10 @@ pub fn main(init: std.process.Init) !void {
     // (supersedes the deprecated zwp_linux_explicit_synchronization_v1).
     // Needs the DRM node to allocate syncobj timelines.
     _ = wlroots.LinuxDrmSyncobjManagerV1.create(server, 1, drm_fd);
+    // wp_tearing_control_v1: surfaces (games/video) can request async
+    // presentation to skip vsync and cut latency. Honored at output commit
+    // by setting tearing_page_flip when the focused surface requests async.
+    const tearing_manager = try wlroots.TearingControlManagerV1.create(server, 1);
     const compositor = try wlroots.Compositor.create(server, 6, r_renderer);
     _ = try wlroots.Subcompositor.create(server);
     _ = try wlroots.DataDeviceManager.create(server);
@@ -272,6 +276,7 @@ pub fn main(init: std.process.Init) !void {
         .allocator = r_allocator,
         .renderer = r_renderer,
         .xdg_shell = xdg_shell,
+        .tearing = tearing_manager,
         .layer_shell = layer_shell,
         .seat = seat,
         .xkb_context = xkb_context,

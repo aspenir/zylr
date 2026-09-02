@@ -51,6 +51,8 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwlr_output_power_manager_v1", 1);
     scanner.generate("zwp_virtual_keyboard_manager_v1", 1);
 
+    scanner.addSystemProtocol("staging/tearing-control/tearing-control-v1.xml");
+    scanner.generate("wp_tearing_control_manager_v1", 1);
     scanner.addSystemProtocol("staging/ext-session-lock/ext-session-lock-v1.xml");
     scanner.generate("ext_session_lock_manager_v1", 1);
     scanner.addSystemProtocol("staging/ext-idle-notify/ext-idle-notify-v1.xml");
