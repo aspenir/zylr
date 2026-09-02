@@ -156,6 +156,11 @@ pub fn main(init: std.process.Init) !void {
     try r_renderer.initServer(server);
 
     _ = try wlroots.Shm.createWithRenderer(server, 1, r_renderer);
+    _ = try wlroots.LinuxDmabufV1.createWithRenderer(server, 4, r_renderer);
+    // linux-drm-syncobj-v1: DRM syncobj-based explicit synchronization
+    // (supersedes the deprecated zwp_linux_explicit_synchronization_v1).
+    // Needs the DRM node to allocate syncobj timelines.
+    _ = wlroots.LinuxDrmSyncobjManagerV1.create(server, 1, drm_fd);
     const compositor = try wlroots.Compositor.create(server, 6, r_renderer);
     _ = try wlroots.Subcompositor.create(server);
     _ = try wlroots.DataDeviceManager.create(server);

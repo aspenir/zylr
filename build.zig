@@ -15,6 +15,12 @@ pub fn build(b: *std.Build) void {
 
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.generate("xdg_wm_base", 3);
+    // Zero-copy DMA-BUF buffers (hw buffers for GL/VK clients) + modern
+    // buffer feedback. Exposed on the wlroots LinuxDmabufV1 global.
+    scanner.addCustomProtocol(.{
+        .cwd_relative = "/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml",
+    });
+    scanner.generate("zwp_linux_dmabuf_v1", 4);
     scanner.addSystemProtocol("unstable/tablet/tablet-unstable-v2.xml");
     scanner.generate("zwp_tablet_manager_v2", 1);
     scanner.addSystemProtocol("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml");
