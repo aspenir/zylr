@@ -13,6 +13,8 @@ pub const NodeData = union(enum) {
 };
 
 const Hit = struct {
+    /// Scene node that was hit, for surface-origin lookups (constraints).
+    node: *wlroots.SceneNode,
     data: *NodeData,
     /// Surface actually under the cursor. For XWayland/Steam this is
     /// usually a *subsurface*, not the view's top-level surface, so
@@ -49,7 +51,7 @@ pub fn resolveAt(tree: *wlroots.SceneTree, x: f64, y: f64) ?Hit {
     var current: ?*wlroots.SceneNode = node;
     while (current) |n| {
         if (n.data) |data_ptr| {
-            return .{ .data = @ptrCast(@alignCast(data_ptr)), .surface = hitSurface(node), .sx = sx, .sy = sy };
+            return .{ .node = node, .data = @ptrCast(@alignCast(data_ptr)), .surface = hitSurface(node), .sx = sx, .sy = sy };
         }
         current = if (n.parent) |parent| &parent.node else null;
     }

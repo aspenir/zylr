@@ -22,6 +22,7 @@ const View = @import("view/view.zig");
 const XCursorManager = @import("view/xcursor.zig");
 const OutputContext = @import("output/output.zig");
 const KeyboardContext = @import("input/keyboard.zig");
+const GestureContext = @import("input/gesture.zig");
 pub const ResizeEdge = enum { left, right };
 
 pub const UndoEntry = union(enum) {
@@ -164,6 +165,10 @@ last_gesture_fire_ms: u64 = 0,
 seat: *wlroots.Seat,
 
 keyboards: std.ArrayListUnmanaged(*KeyboardContext) = .{
+    .items = &.{},
+    .capacity = 0,
+},
+gesture_contexts: std.ArrayListUnmanaged(*GestureContext) = .{
     .items = &.{},
     .capacity = 0,
 },

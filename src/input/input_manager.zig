@@ -37,8 +37,12 @@ pub fn onNewInput(
 
             context.cursor.attachInputDevice(device);
 
-            _ = GestureContext.init(context, device) catch |err| {
+            const gc = GestureContext.init(context, device) catch |err| {
                 std.log.err("Failed to init gestures: {}", .{err});
+                return;
+            };
+            context.gesture_contexts.append(std.heap.c_allocator, gc) catch {
+                gc.deinit();
             };
         },
 
@@ -195,5 +199,7 @@ pub fn onNewVirtualPointer(
 
     std.log.info("NEW VIRTUAL POINTER", .{});
 
-    context.cursor.attachInputDevice(&new_pointer.new_pointer.pointer.base);
+    context.cursor.attachInputDevice(
+        &new_pointer.new_pointer.pointer.base,
+    );
 }
