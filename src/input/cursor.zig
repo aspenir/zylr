@@ -10,6 +10,7 @@ const ViewManager = @import("../view/view_manager.zig");
 const LayerView = @import("../view/layer.zig");
 const View = @import("../view/view.zig");
 const ResizeEdge = @import("../server.zig").ResizeEdge;
+const PointerConstraints = @import("pointer_constraints.zig");
 pub fn onCursorMotion(
     listener: *wl.Listener(*wlroots.Pointer.event.Motion),
     event: *wlroots.Pointer.event.Motion,
@@ -17,11 +18,16 @@ pub fn onCursorMotion(
     const context: *ServerContext =
         @fieldParentPtr("cursor_motion_listener", listener);
 
-    context.cursor.move(
-        event.device,
-        event.delta_x,
-        event.delta_y,
-    );
+    switch (PointerConstraints.relativeMotion(context, event.delta_x, event.delta_y)) {
+        .locked => {
+            PointerConstraints.sendLockedMotion(context, event.time_msec, event.delta_x, event.delta_y);
+            if (context.idle) |idle| idle.notifyActivity();
+            return;
+        },
+        .move => |m| {
+            context.cursor.move(event.device, m.dx, m.dy);
+        },
+    }
 
     if (context.idle) |idle| idle.notifyActivity();
 
@@ -52,11 +58,11 @@ pub fn onCursorMotionAbsolute(
     const context: *ServerContext =
         @fieldParentPtr("cursor_motion_absolute_listener", listener);
 
-    context.cursor.warpAbsolute(
-        event.device,
-        event.x,
-        event.y,
-    );
+    var target_x = event.x;
+    var target_y = event.y;
+    if (PointerConstraints.absoluteMotion(context, &target_x, &target_y)) {
+        context.cursor.warpAbsolute(event.device, target_x, target_y);
+    }
 
     if (context.idle) |idle| idle.notifyActivity();
 
@@ -77,6 +83,7 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
     const hit = nd.resolveAt(&context.scene.tree, context.cursor.x, context.cursor.y) orelse {
         context.seat.pointerClearFocus();
         context.focused_surface = null;
+        PointerConstraints.onPointerFocus(context, null);
         return;
     };
 
@@ -146,6 +153,10 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
             context.seat.pointerNotifyMotion(time_msec, hit.sx, hit.sy);
         },
     }
+
+    // Constraint activation after focus is established, so clients never see
+    // an 'confined'/'locked' event before the matching pointer enter.
+    PointerConstraints.onPointerFocus(context, hit.node);
 }
 fn superHeld(context: *ServerContext) bool {
     if (context.keyboards.items.len == 0) return false;

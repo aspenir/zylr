@@ -38,6 +38,12 @@ dx: f64 = 0,
 dy: f64 = 0,
 scale: f64 = 1,
 
+/// Set once deinit() runs. onDeviceDestroy and the shutdown loop both call
+/// into teardown; without this guard a context freed at runtime could be
+/// freed again at shutdown (double free -> the freed wl.Listener that
+/// wlr_pointer_finish catches as a non-empty hold_end list).
+freed: bool = false,
+
 /// Touchscreen vs touchpad, from libinput caps. Touchscreens carry no
 /// GESTURE cap (libinput doesn't interpret their gestures), so TOUCH is
 /// checked first. Devices we can't classify match every bind.
@@ -91,6 +97,28 @@ fn onDeviceDestroy(
 ) void {
     const self: *GestureContext =
         @fieldParentPtr("device_destroy_listener", listener);
+    if (self.freed) return;
+
+    // Drop from the tracked list before freeing so shutdown cleanup
+    // never re-visits (and re-frees) a context whose device already died.
+    for (self.context.gesture_contexts.items, 0..) |gc, i| {
+        if (gc == self) {
+            _ = self.context.gesture_contexts.orderedRemove(i);
+            break;
+        }
+    }
+
+    self.deinit();
+}
+
+/// Detach every pointer signal listener and free the context. Called from
+/// device teardown (onDeviceDestroy) or the shutdown path. Idempotent: the
+/// second caller is a no-op, so a context freed at runtime is never freed
+/// again at shutdown (which would corrupt the heap and leave a freed
+/// wl.Listener linked into the pointer -> wlr_pointer_finish hold_end assert).
+pub fn deinit(self: *GestureContext) void {
+    if (self.freed) return;
+    self.freed = true;
 
     // wlroots asserts the pointer event listener lists are empty at
     // finish time, so remove our listeners before the device dies.

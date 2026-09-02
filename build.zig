@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwp_tablet_manager_v2", 1);
     scanner.addSystemProtocol("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml");
     scanner.generate("zwp_pointer_gestures_v1", 3);
+    scanner.addSystemProtocol("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml");
+    scanner.generate("zwp_pointer_constraints_v1", 1);
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.generate("zxdg_decoration_manager_v1", 1);
     scanner.addSystemProtocol("staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml");
@@ -125,6 +127,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("libsystemd", .{});
     exe.root_module.addCMacro("_GNU_SOURCE", "1");
     exe.root_module.link_libc = true;
+
 
     b.installArtifact(exe);
 

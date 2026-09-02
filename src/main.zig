@@ -20,6 +20,7 @@ const InputManager = @import("input/input_manager.zig");
 const InputRelay = @import("input/input_relay.zig");
 const Spawner = @import("spawner.zig");
 const Config = @import("config.zig");
+const PointerConstraints = @import("input/pointer_constraints.zig");
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
@@ -293,6 +294,10 @@ pub fn main(init: std.process.Init) !void {
     // connect so the globals exist; relay_ptr is module-global.
     _ = try InputRelay.init(server, seat, &context);
 
+    // Pointer constraints (zwp_pointer_constraints_v1): lets games confine
+    // or lock the cursor. Enforced in cursor.zig's motion paths.
+    _ = try PointerConstraints.init(server, seat, &context);
+
     context.animation_timer = try wl.EventLoop.addTimer(
         loop,
         *ServerContext,
@@ -465,9 +470,20 @@ pub fn main(init: std.process.Init) !void {
         keyboard_context.key_listener.link.remove();
         keyboard_context.modifiers_listener.link.remove();
     }
+    // Detach gesture listeners that survived to shutdown: wlroots asserts
+    // the pointer signal lists are empty at finish time, and the device
+    // destroy signal may not fire for every pointer before the display is
+    // torn down.
+    for (context.gesture_contexts.items) |gc| {
+        if (!gc.freed) gc.deinit();
+    }
+    context.gesture_contexts.clearRetainingCapacity();
     // wlroots asserts on manager destruction with this listener attached.
     context.new_virtual_keyboard_listener.link.remove();
     context.new_virtual_pointer_listener.link.remove();
+    // wlroots asserts on seat destroy with this listener attached.
+    context.request_set_selection_listener.link.remove();
+    context.request_set_primary_selection_listener.link.remove();
 
     // Hand the activation environments back to the parent session
     // before zylr's socket disappears.
@@ -493,6 +509,7 @@ pub fn main(init: std.process.Init) !void {
     }
     context.keyboards.clearRetainingCapacity();
     context.keyboards.deinit(std.heap.c_allocator);
+    context.gesture_contexts.deinit(std.heap.c_allocator);
 }
 
 fn onSignal(signal: c_int, display: *wl.Server) c_int {
