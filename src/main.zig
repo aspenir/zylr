@@ -156,6 +156,12 @@ pub fn main(init: std.process.Init) !void {
     try r_renderer.initServer(server);
 
     _ = try wlroots.Shm.createWithRenderer(server, 1, r_renderer);
+    // Buffer content-type hints (photo/video/game): lets wlroots pick optimal
+    // scanout/damage treatment per buffer.
+    _ = try wlroots.ContentTypeManagerV1.create(server, 1);
+    // Frame timing feedback: clients get precise commit/present timestamps for
+    // better pacing and reduced latency.
+    _ = try wlroots.Presentation.create(server, backend, 1);
     _ = try wlroots.LinuxDmabufV1.createWithRenderer(server, 4, r_renderer);
     // linux-drm-syncobj-v1: DRM syncobj-based explicit synchronization
     // (supersedes the deprecated zwp_linux_explicit_synchronization_v1).
