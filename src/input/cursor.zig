@@ -4,7 +4,7 @@ const wlroots = @import("wlroots");
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const nd = @import("../view/utils/node_data.zig");
+const NodeData = @import("../view/utils/node_data.zig");
 const FocusManager = @import("../view/focus.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const LayerView = @import("../view/layer.zig");
@@ -79,8 +79,16 @@ pub fn onCursorMotionAbsolute(
 /// surface under the cursor, enter/move the pointer, and optionally move
 /// keyboard focus (focus-follows-mouse). Keyboard focus is deliberately
 /// kept while the cursor is over a gap — only pointer focus clears.
+/// Diag helper: printable node type name.
+fn _nodeTypeName(t: anytype) []const u8 {
+    return switch (t) {
+        .tree => "tree",
+        .buffer => "buffer",
+        .rect => "rect",
+    };
+}
 fn onPointerHit(context: *ServerContext, time_msec: u32) void {
-    const hit = nd.resolveAt(&context.scene.tree, context.cursor.x, context.cursor.y) orelse {
+    const hit = NodeData.resolveAt(&context.scene.tree, context.cursor.x, context.cursor.y) orelse {
         context.seat.pointerClearFocus();
         context.focused_surface = null;
         PointerConstraints.onPointerFocus(context, null);
@@ -90,11 +98,27 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
     switch (hit.data.*) {
         .view => |view| {
             const view_ptr: *View = @ptrCast(@alignCast(view));
+            // Pointer focus is position-explicit: drop any keyboard-cycle
+            // anchor(s) so the ring follows the pointed tile again and the
+            // next cycle re-anchors on the focused view's home.
+            context.kbd_anchor_slot_x = -1;
+            context.kbd_cycle_view = null;
+            context.kbd_cycle_slot = -1;
             if (view_ptr.backend == .xwayland) {
                 const xw = view_ptr.backend.xwayland;
                 std.log.warn("PTR xwl win=0x{x} ored={} cl={?s} in={?s} tt={?s} hit={?*} sx={d:.0} sy={d:.0} cur=({d:.0},{d:.0})", .{ xw.window_id, xw.override_redirect, xw.class, xw.instance, xw.title, hit.surface, hit.sx, hit.sy, context.cursor.x, context.cursor.y });
             }
             const surface = hit.surface orelse view_ptr.surface();
+
+            // Diag: mirrored sources are represented by mirrors; log what is
+            // actually under the cursor so we can see whether a click on a
+            // copy mirror hits the mirror or shadows to the window below.
+            if (!view_ptr.scene_tree.node.enabled) {
+                var lx: c_int = 0;
+                var ly: c_int = 0;
+                _ = hit.node.coords(&lx, &ly);
+                std.log.warn("PTR PIN view={*} surf={?} cursor=({d:.0},{d:.0}) surf_at=({d:.0},{d:.0}) node_type={s} node_x={} node_y={} coords=({},{}) enabled={}", .{ view_ptr, hit.surface, context.cursor.x, context.cursor.y, hit.sx, hit.sy, _nodeTypeName(hit.node.type), hit.node.x, hit.node.y, lx, ly, hit.node.enabled });
+            }
 
             const first_enter = context.focused_surface != surface;
             if (first_enter) {

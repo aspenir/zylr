@@ -4,9 +4,9 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const config = @import("../config.zig");
+const Config = @import("../config.zig");
 const GestureContext = @import("gesture.zig");
-const nd = @import("../view/utils/node_data.zig");
+const NodeData = @import("../view/utils/node_data.zig");
 const FocusManager = @import("../view/focus.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const LayerView = @import("../view/layer.zig");
@@ -34,7 +34,7 @@ down_time: u32 = 0,
 // Multi-touch gesture detection. libinput refuses to interpret
 // touchscreen gestures, so pinch/hold/swipe binds are matched here from
 // raw touch points and dispatched through the same gesture table.
-device_kind: config.GestureDevice = .both,
+device_kind: Config.GestureDevice = .both,
 points: [max_points]Point = @splat(.{}),
 baselines: [max_points]Point = @splat(.{}),
 pinch_active: bool = false,
@@ -233,7 +233,7 @@ fn surfaceAt(
     x: f64,
     y: f64,
 ) ?struct { surface: *wlroots.Surface, sx: f64, sy: f64, view: ?*View } {
-    const hit = nd.resolveAt(&context.scene.tree, x, y) orelse return null;
+    const hit = NodeData.resolveAt(&context.scene.tree, x, y) orelse return null;
 
     switch (hit.data.*) {
         .view => |view| {
@@ -376,7 +376,7 @@ pub fn onUp(
             // a slower drag already moved the window live in onMotion.
             const elapsed = event.time_msec - self.down_time;
             if (elapsed < touch_cfg.flick_max_ms and move_px > threshold) {
-                const dir: ?config.GestureDir = blk: {
+                const dir: ?Config.GestureDir = blk: {
                     if (@abs(self.swipe_dx) > @abs(self.swipe_dy)) {
                         break :blk if (self.swipe_dx < 0) .left else .right;
                     }
@@ -392,7 +392,7 @@ pub fn onUp(
                 GestureContext.fire(self.context, self.device_kind, fingers, .pinch, if (ratio > 1) .out else .in, null);
             } else if (move_px > threshold and move_px > span_px) {
                 // Multi-finger swipe that never became a pinch.
-                const dir: ?config.GestureDir = blk: {
+                const dir: ?Config.GestureDir = blk: {
                     if (@abs(self.swipe_dx) > @abs(self.swipe_dy)) {
                         break :blk if (self.swipe_dx < 0) .left else .right;
                     }

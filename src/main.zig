@@ -23,6 +23,19 @@ const Config = @import("config.zig");
 const PointerConstraints = @import("input/pointer_constraints.zig");
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn vsnprintf(dest: [*]u8, size: usize, fmt: [*:0]const u8, args: *std.builtin.VaList) c_int;
+
+/// Forward wlroots' own log (EGL/dmabuf import failures, buffer upload
+/// errors) into the zylr log - the default handler writes to stderr which
+/// is invisible in the session log. libc vsnprintf handles the C va_list.
+fn wlrLogHandler(importance: wlroots.log.Importance, fmt: [*:0]const u8, args: *std.builtin.VaList) callconv(.c) void {
+    _ = importance;
+    var buf: [4096]u8 = undefined;
+    const n = vsnprintf(&buf, buf.len, fmt, args);
+    if (n <= 0) return;
+    const used = @min(@as(usize, @intCast(n)), buf.len - 1);
+    std.log.err("[wlr] {s}", .{buf[0..used]});
+}
 
 /// scenefx's gles2 fork; renders the scene graph's rounded corners.
 extern fn fx_renderer_create(backend: *wlroots.Backend) ?*wlroots.Renderer;
@@ -95,6 +108,16 @@ fn zylrPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 pub fn main(init: std.process.Init) !void {
+    {
+        const gf = std.c.fopen("/tmp/zylr_genesis.log", "a") orelse return;
+        const boot_marker = [_]u8{ 'B', 'O', 'O', 'T' };
+        const nl = [1]u8{10};
+        _ = std.c.fwrite(&boot_marker, 1, boot_marker.len, gf);
+        _ = std.c.fwrite(&nl, 1, 1, gf);
+        _ = std.c.fclose(gf);
+    }
+    wlroots.log.init(.debug, wlrLogHandler);
+
     const version = build_options.version;
     const args: []const [*:0]const u8 = init.minimal.args.vector;
     for (args[1..]) |arg| {
@@ -184,6 +207,9 @@ pub fn main(init: std.process.Init) !void {
     // scales and viewport-scale their buffers instead of overflowing.
     _ = try wlroots.Viewporter.create(server);
     _ = try wlroots.FractionalScaleManagerV1.create(server, 1);
+    // wp_single_pixel_buffer_v1: solid-color surfaces use a single-pixel
+    // buffer instead of a real one, cutting buffer upload/fill work.
+    _ = try wlroots.SinglePixelBufferManagerV1.create(server);
 
     // xdg-decoration-v1: serve server-side decorations so GTK/Qt don't
     // draw client-side titlebars on top of zylr's own tiling borders.
@@ -248,8 +274,8 @@ pub fn main(init: std.process.Init) !void {
         .{socket_name},
     );
 
-    // Remember the parent session's values: when zylr exits (typically
-    // nested inside mango) the activation environments must be restored,
+    // Remember the parent session's values: when zylr exits,
+    // the activation environments must be restored,
     // or D-Bus/systemd-launched apps keep aiming at zylr's dead socket.
     var saved_vars: [Spawner.session_vars.len]?[:0]const u8 = @splat(null);
     for (Spawner.session_vars, 0..) |name, i| {
@@ -430,6 +456,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     @import("suspend.zig").SuspendContext.init(&context);
+    @import("drm_lease.zig").DrmLease.init(&context);
 
     try backend.start();
 
@@ -518,6 +545,19 @@ pub fn main(init: std.process.Init) !void {
     context.animation_x.deinit(std.heap.c_allocator);
     context.animation_w.deinit(std.heap.c_allocator);
     context.views.deinit(std.heap.c_allocator);
+    for (&context.rows) |*maybe_row| {
+        if (maybe_row.*) |*r| {
+            r.views.deinit(std.heap.c_allocator);
+            r.animation_x.deinit(std.heap.c_allocator);
+            r.animation_w.deinit(std.heap.c_allocator);
+            maybe_row.* = null;
+        }
+    }
+    for (&context.row_mirrors) |*rm| {
+        for (rm.items) |m| m.tree.node.destroy();
+        rm.deinit(std.heap.c_allocator);
+    }
+    for (&context.row_sources) |*rp| rp.deinit(std.heap.c_allocator);
     context.focus_history.deinit(std.heap.c_allocator);
     context.layers.deinit(std.heap.c_allocator);
     for (context.keyboards.items) |keyboard_context| {

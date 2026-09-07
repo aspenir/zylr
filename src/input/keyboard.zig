@@ -5,10 +5,11 @@ const xkb = @import("xkbcommon");
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const config = @import("../config.zig");
 const Spawner = @import("../spawner.zig");
 const FocusManager = @import("../view/focus.zig");
 const ViewManager = @import("../view/view_manager.zig");
+const Row = @import("../row.zig");
+const Mirror = @import("../mirror.zig");
 const View = @import("../view/view.zig");
 const Blur = @import("../view/blur.zig");
 const Border = @import("../view/border.zig");
@@ -43,6 +44,103 @@ fn pushUndoEntry(context: *ServerContext, entry: ServerContext.UndoEntry) void {
     context.undo_count +|= 1;
 }
 
+/// Swap the focused tile with its row neighbour in the given direction.
+/// Tiles are windows and mirrorred-copy mirrors alike: window<->window keeps
+/// the existing views-array swap (undoable); window<->copy re-docks the
+/// copy to the window's cluster (or to the row lead); copy<->copy exchanges
+/// docks exactly.
+fn swapTiles(context: *ServerContext, dir: i32) void {
+    const view = context.focused_view orelse return;
+    var tiles: [128]FocusManager.FocusTile = undefined;
+    const n = FocusManager.buildRowTiles(context, &tiles);
+    if (n < 2) return;
+
+    // Anchor on the exact tile the keyboard ring is on: the anchored copy
+    // mirror, else the focused window's home tile.
+    var cur: usize = 0;
+    var found = false;
+    if (context.kbd_anchor_row == context.active_row and context.kbd_anchor_slot_x >= 0) {
+        for (tiles[0..n], 0..) |t, i| {
+            if (t.mirror_slot_x >= 0 and @as(i32, @intFromFloat(t.mirror_slot_x)) == context.kbd_anchor_slot_x) {
+                cur = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        for (tiles[0..n], 0..) |t, i| {
+            if (t.view == view and t.mirror_slot_x < 0) {
+                cur = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) return;
+
+    const j: i64 = @as(i64, @intCast(cur)) + dir;
+    if (j < 0 or j >= n) return;
+
+    // The pair being exchanged is (left, right) in row order regardless of
+    // which of the two is focused, so both directions give the same swap.
+    const l = @min(cur, @as(usize, @intCast(j)));
+    const r = @max(cur, @as(usize, @intCast(j)));
+    const left = tiles[l];
+    const right = tiles[r];
+    const left_copy = left.mirror;
+    const right_copy = right.mirror;
+    const focused_copy = tiles[cur].mirror;
+
+    if (left_copy == null and right_copy == null) {
+        // window <-> window: existing views-array swap.
+        const ia = std.mem.indexOfScalar(*View, context.views.items, left.view) orelse return;
+        const ib = std.mem.indexOfScalar(*View, context.views.items, right.view) orelse return;
+        if (ia == ib) return;
+        pushUndoEntry(context, .{ .swap = .{ .a = ia, .b = ib } });
+        std.mem.swap(*View, &context.views.items[ia], &context.views.items[ib]);
+        ViewManager.updateViewPositionsFrom(context, @min(ia, ib));
+        ViewManager.scrollToViewNoLayout(context, view);
+        return;
+    }
+    if (left_copy == null and right_copy != null) {
+        // [window, copy]: the copy takes the window's place, i.e. moves to
+        // the tail of the cluster ending right before the window (or to the
+        // row lead when the window is the first tile), however the pair was
+        // reached.
+        var dock: ?*View = null;
+        if (l > 0) {
+            const before = tiles[l - 1];
+            dock = if (before.mirror) |bm| bm.dock_view else before.view;
+        }
+        Mirror.dockCopyAsTail(context, context.active_row, right_copy orelse unreachable, dock);
+    } else if (left_copy != null and right_copy == null) {
+        // [copy, window]: the copy takes the window's place, i.e. becomes
+        // the head of the window's cluster.
+        Mirror.dockCopyAsHead(context, context.active_row, left_copy orelse unreachable, right.view);
+    } else {
+        // copy <-> copy: exact dock exchange.
+        Mirror.swapCopyDocks(left_copy orelse unreachable, right_copy orelse unreachable);
+    }
+
+    ViewManager.updateViewPositionsFrom(context, 0);
+    Mirror.refreshMirrorFocus(context);
+
+    // Keep the keyboard ring anchored on the focused tile (copy anchors by
+    // slot, window anchors to its home and keeps the viewport put).
+    if (focused_copy) |c| {
+        context.kbd_cycle_view = c.view;
+        context.kbd_cycle_slot = c.slot_x;
+        context.kbd_anchor_row = context.active_row;
+        context.kbd_anchor_slot_x = c.slot_x;
+    } else {
+        context.kbd_cycle_slot = -1;
+        context.kbd_anchor_slot_x = -1;
+        ViewManager.scrollToViewNoLayout(context, view);
+    }
+    std.log.warn("SWAP dir={} l={} r={} lcopy={} rcopy={} anchor_slot={} focused_copy_slot={}", .{ dir, l, r, left_copy != null, right_copy != null, context.kbd_anchor_slot_x, if (focused_copy) |c| c.slot_x else @as(i32, -1) });
+}
+
 /// Center a floating view on screen and raise it above tiled views.
 fn centerFloating(context: *ServerContext, view: *View) void {
     const vw: f32 = @floatFromInt(@max(1, context.usable_area.width));
@@ -51,6 +149,9 @@ fn centerFloating(context: *ServerContext, view: *View) void {
     view.y = context.usable_area.y + @as(i32, @intFromFloat((vh - @as(f32, @floatFromInt(view.slot_h))) / 2));
     view.scene_tree.node.setPosition(view.x, view.y);
     view.scene_tree.node.raiseToTop();
+    // Keep the row's mirrors above the newly-raised window so they cannot
+    // paint over the mirrors.
+    Mirror.raiseActiveRow(context);
 }
 
 /// Relayout views from `start_idx` onward, sync the client size,
@@ -79,6 +180,32 @@ pub fn runAction(
             pushUndoEntry(context, .{ .viewport = .{ .prev_target = context.viewport_y } });
             context.viewport_y += 100;
             ViewManager.updateViewPositions(context);
+        },
+        .row_up, .row_down => {
+            const dir: i32 = if (action == .row_up) -1 else 1;
+            const target: usize = @intCast(@as(i32, @intCast(context.active_row)) + dir);
+            if (target >= ServerContext.max_rows) return;
+            pushUndoEntry(context, .{ .row_switch = .{ .prev_row = context.active_row } });
+            Row.switchTo(context, target);
+            ViewManager.updateViewPositions(context);
+            FocusManager.focusActiveRow(context);
+        },
+        .mirror => {
+            const view = context.focused_view orelse return;
+            const row_idx: usize = blk: {
+                if (args) |a| {
+                    if (a.len > 0) {
+                        break :blk std.fmt.parseInt(usize, a[0], 10) catch return;
+                    }
+                }
+                break :blk context.active_row;
+            };
+            if (row_idx >= ServerContext.max_rows) return;
+            Mirror.mirrorToRow(context, view, row_idx);
+        },
+        .demirror => {
+            const view = context.focused_view orelse return;
+            Mirror.deleteMirrorFromRow(context, view, context.active_row);
         },
         .grow, .shrink => {
             const view = context.focused_view orelse return;
@@ -161,38 +288,8 @@ pub fn runAction(
                 ViewManager.scrollToViewNoLayout(context, view);
             }
         },
-        .swap_left => {
-            const view = context.focused_view orelse return;
-            var cur_idx: ?usize = null;
-            for (context.views.items, 0..) |v, idx| {
-                if (v == view) { cur_idx = idx; break; }
-            }
-            const cur = cur_idx orelse return;
-            if (cur == 0) return;
-            var j = cur - 1;
-            while (j > 0 and !context.views.items[j].isMapped()) : (j -= 1) {}
-            if (!context.views.items[j].isMapped()) return;
-            pushUndoEntry(context, .{ .swap = .{ .a = cur, .b = j } });
-            std.mem.swap(*View, &context.views.items[cur], &context.views.items[j]);
-            ViewManager.updateViewPositionsFrom(context, @min(cur, j));
-            ViewManager.scrollToViewNoLayout(context, view);
-        },
-        .swap_right => {
-            const view = context.focused_view orelse return;
-            var cur_idx: ?usize = null;
-            for (context.views.items, 0..) |v, idx| {
-                if (v == view) { cur_idx = idx; break; }
-            }
-            const cur = cur_idx orelse return;
-            if (cur + 1 >= context.views.items.len) return;
-            var j = cur + 1;
-            while (j < context.views.items.len and !context.views.items[j].isMapped()) : (j += 1) {}
-            if (j >= context.views.items.len or !context.views.items[j].isMapped()) return;
-            pushUndoEntry(context, .{ .swap = .{ .a = cur, .b = j } });
-            std.mem.swap(*View, &context.views.items[cur], &context.views.items[j]);
-            ViewManager.updateViewPositionsFrom(context, @min(cur, j));
-            ViewManager.scrollToViewNoLayout(context, view);
-        },
+        .swap_left => swapTiles(context, -1),
+        .swap_right => swapTiles(context, 1),
         .undo => {
             if (context.undo_count == 0) return;
             context.undo_count -|= 1;
@@ -231,6 +328,9 @@ pub fn runAction(
                             ViewManager.scrollToView(context, view);
                         }
                     }
+                },
+                .row_switch => |r| {
+                    Row.switchTo(context, r.prev_row);
                 },
             }
         },

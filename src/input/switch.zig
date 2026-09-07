@@ -4,7 +4,7 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const config = @import("../config.zig");
+const Config = @import("../config.zig");
 const KeyboardContext = @import("keyboard.zig");
 
 const SwitchContext = @This();
@@ -42,25 +42,25 @@ fn onDestroy(listener: *wl.Listener(*wlroots.InputDevice), _: *wlroots.InputDevi
 
 fn onToggle(listener: *wl.Listener(*wlroots.Switch.event.Toggle), event: *wlroots.Switch.event.Toggle) void {
     const self: *SwitchContext = @fieldParentPtr("toggle_listener", listener);
-    const st: config.SwitchType = switch (event.switch_type) {
+    const st: Config.SwitchType = switch (event.switch_type) {
         .lid => .lid,
         .tablet_mode => .tablet_mode,
     };
-    const state: config.SwitchState = switch (event.switch_state) {
+    const state: Config.SwitchState = switch (event.switch_state) {
         .on => .on,
         .off => .off,
     };
     fire(self.context, st, state);
 }
 
-fn matchSwitch(switches: []const config.CompiledSwitch, switch_type: config.SwitchType, state: config.SwitchState) ?config.CompiledSwitch {
+fn matchSwitch(switches: []const Config.CompiledSwitch, switch_type: Config.SwitchType, state: Config.SwitchState) ?Config.CompiledSwitch {
     for (switches) |s| {
         if (s.switch_type == switch_type and s.state == state) return s;
     }
     return null;
 }
 
-pub fn fire(context: *ServerContext, switch_type: config.SwitchType, state: config.SwitchState) void {
+pub fn fire(context: *ServerContext, switch_type: Config.SwitchType, state: Config.SwitchState) void {
     const s = matchSwitch(context.switches, switch_type, state) orelse {
         std.log.debug("switch: {s} {s} no bind", .{ @tagName(switch_type), @tagName(state) });
         return;
@@ -70,13 +70,13 @@ pub fn fire(context: *ServerContext, switch_type: config.SwitchType, state: conf
 }
 
 test "matchSwitch lid/tablet_mode on/off" {
-    const switches = [_]config.CompiledSwitch{
+    const switches = [_]Config.CompiledSwitch{
         .{ .switch_type = .lid, .state = .off, .action = .spawn, .args = &.{"lock"} },
         .{ .switch_type = .lid, .state = .on, .action = .spawn, .args = &.{"lock --off"} },
         .{ .switch_type = .tablet_mode, .state = .on, .action = .spawn, .args = &.{"notify"} },
     };
-    try std.testing.expectEqual(config.Action.spawn, matchSwitch(&switches, .lid, .off).?.action);
+    try std.testing.expectEqual(Config.Action.spawn, matchSwitch(&switches, .lid, .off).?.action);
     try std.testing.expectEqualStrings("lock", matchSwitch(&switches, .lid, .off).?.args[0]);
-    try std.testing.expectEqual(config.Action.spawn, matchSwitch(&switches, .tablet_mode, .on).?.action);
+    try std.testing.expectEqual(Config.Action.spawn, matchSwitch(&switches, .tablet_mode, .on).?.action);
     try std.testing.expectEqual(null, matchSwitch(&switches, .tablet_mode, .off));
 }

@@ -400,6 +400,9 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
     // Remove it from the WM's live view list BEFORE freeing it.
     ViewManager.removeView(context, view);
 
+    // Destroy all mirror SceneBuffer nodes that reference this view.
+    mirror_mod.destroyAllMirrors(context, view);
+
     // Re-pack the remaining windows.
     ViewManager.updateViewPositions(context);
 
@@ -461,6 +464,8 @@ pub fn onViewCommit(
         .xwayland => |x| xw_mod.commitSurface(view, x, wlr_surface),
     }
 
+    mirror_mod.updateMirrors(view);
+
     // Re-sync the border/rounding now that surface.current.width/height
     // have caught up with the client's buffer, so the ring matches the
     // window immediately on resize instead of on the next animation tick.
@@ -470,3 +475,4 @@ pub fn onViewCommit(
 
 const xdg_mod = @import("xdg.zig");
 const xw_mod = @import("xwayland.zig");
+const mirror_mod = @import("../mirror.zig");

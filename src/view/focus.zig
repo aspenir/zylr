@@ -1,14 +1,14 @@
 const wlroots = @import("wlroots");
 const std = @import("std");
 
-const node_data = @import("utils/node_data.zig");
-const NodeData = node_data.NodeData;
+const NodeData = @import("utils/node_data.zig");
 const View = @import("view.zig");
 const LayerView = @import("layer.zig");
 const ServerContext = @import("../server.zig");
 const BorderManager = @import("border.zig");
 const InputRelay = @import("../input/input_relay.zig");
 const ViewManager = @import("view_manager.zig");
+const Mirror = @import("../mirror.zig");
 const FocusTarget = union(enum) {
     none,
     view: struct {
@@ -47,7 +47,7 @@ pub fn focusAtCursor(context: *ServerContext) void {
 
     while (current) |n| {
         if (n.data) |data_ptr| {
-            const data: *NodeData =
+            const data: *NodeData.NodeData =
                 @ptrCast(@alignCast(data_ptr));
 
             switch (data.*) {
@@ -56,7 +56,7 @@ pub fn focusAtCursor(context: *ServerContext) void {
                     setFocus(context, .{
                         .view = .{
                             .view = view_ptr,
-                            .surface = node_data.hitSurface(node),
+                            .surface = NodeData.hitSurface(node),
                             .sx = sx,
                             .sy = sy,
                         },
@@ -144,6 +144,33 @@ pub fn restoreFocus(context: *ServerContext) void {
 
     setFocus(context, .none);
 }
+
+/// After a row switch: focus the most-recent window on the now-active row
+/// without popping other rows' history. Mirrors restoreFocus but only
+/// considers views in the active row's working set.
+pub fn focusActiveRow(context: *ServerContext) void {
+    var i = context.focus_history.items.len;
+    while (i > 0) {
+        i -= 1;
+        const candidate = context.focus_history.items[i];
+        if (!candidate.isMapped()) continue;
+        var on_row = false;
+        for (context.views.items) |view| {
+            if (view == candidate) {
+                on_row = true;
+                break;
+            }
+        }
+        if (on_row) {
+            setFocus(context, .{
+                .view = .{ .view = candidate, .surface = candidate.surface(), .sx = 0, .sy = 0 },
+            });
+            ViewManager.scrollToView(context, candidate);
+            return;
+        }
+    }
+    setFocus(context, .none);
+}
 pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
     switch (target) {
         .none => {
@@ -156,6 +183,8 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             context.focused_view = null;
             context.focused_layer = null;
             BorderManager.updateBorders(context);
+            Mirror.layoutMirrorsAll(context);
+            Mirror.refreshMirrorFocus(context);
             InputRelay.notifyFocus(null);
         },
 
@@ -235,9 +264,11 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             if (view.floating) view.scene_tree.node.raiseToTop();
 
             BorderManager.updateBorders(context);
+            Mirror.layoutMirrorsAll(context);
+            Mirror.refreshMirrorFocus(context);
             InputRelay.notifyFocus(context.focused_surface);
 
-            std.log.info("FOCUS VIEW", .{});
+            std.log.info("FOCUS VIEW view={*} surf={*}", .{ view, surface });
         },
 
         .layer => |target_layer| {
@@ -282,15 +313,102 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             }
 
             BorderManager.updateBorders(context);
+            Mirror.layoutMirrorsAll(context);
+            Mirror.refreshMirrorFocus(context);
             InputRelay.notifyFocus(surface);
 
-            std.log.info("FOCUS LAYER", .{});
+            std.log.info("FOCUS LAYER layer={*}", .{layer});
         },
     }
 }
 
-/// Focus the leftmost mapped view (the items[0] fallback must skip
-/// zombies, else Mod+H focuses the invisible phantom window).
+/// A focusable tile on the active row: a window at its own slot, or a
+/// mirror copy rendered as a tile. Cycling steps through tiles in
+/// column order, so a mirror copy is reachable by keyboard exactly like a
+/// window. Selecting a tile focuses its source window (the mirror's memory).
+pub const FocusTile = struct {
+    x: f64,
+    w: f64,
+    view: *View,
+    /// When true this tile is a mirror copy; its slot_x is the copy's
+    /// own column (scroll there instead of the source's home slot).
+    mirror_slot_x: f64,
+    /// The mirror-copy Mirror object, null for window home tiles. Lets swap
+    /// re-dock the copy instead of just swapping view pointers.
+    mirror: ?*ServerContext.Mirror = null,
+};
+
+/// The active row as an x-sorted tile list: every tiled window's home slot
+/// plus every placed mirror-copy tile. Shared by focus cycling and swap so
+/// they agree on what a "tile" is.
+pub fn buildRowTiles(context: *ServerContext, tiles: *[128]FocusTile) usize {
+    var n: usize = 0;
+
+    // Windows of the active row (their home slots).
+    for (context.views.items) |v| {
+        if (!v.isMapped() or v.floating or v.fullscreen) continue;
+        if (n < 128) {
+            tiles[n] = .{ .x = @floatFromInt(v.x), .w = @floatFromInt(ViewManager.getViewWidth(v)), .view = v, .mirror_slot_x = -1 };
+            n += 1;
+        }
+    }
+    // Mirror-created copies laid out as tiles on the active row.
+    for (context.row_mirrors[context.active_row].items) |*m| {
+        if (!m.active or m.is_self or m.slot_x == std.math.minInt(i32)) continue;
+        if (n < 128) {
+            tiles[n] = .{ .x = @floatFromInt(m.slot_x), .w = @floatFromInt(m.slot_w), .view = m.view, .mirror_slot_x = @floatFromInt(m.slot_x), .mirror = m };
+            n += 1;
+        }
+    }
+
+    std.mem.sort(FocusTile, tiles[0..n], {}, struct {
+        fn lt(_: void, a: FocusTile, b: FocusTile) bool {
+            if (a.x == b.x) return a.mirror_slot_x > b.mirror_slot_x; // window first on ties
+            return a.x < b.x;
+        }
+    }.lt);
+    return n;
+}
+
+fn tileCycle(context: *ServerContext, dir: i2) ?FocusTile {
+    var tiles: [128]FocusTile = undefined;
+    const n = buildRowTiles(context, &tiles);
+    if (n == 0) return null;
+
+    // Anchor on the EXACT tile the last cycle press landed on (which may be
+    // a copy mirror, not the view's home), falling back to the focused
+    // view's home slot. This lets cycling step past copies: from A's copy,
+    // the next step is B, not A's copy again.
+    const current = context.kbd_cycle_view orelse context.focused_view;
+    var idx: usize = 0;
+    if (current) |cv| {
+        var found = false;
+        for (tiles[0..n], 0..) |t, i| {
+            if (t.view == cv and @as(i32, @intFromFloat(t.mirror_slot_x)) == context.kbd_cycle_slot) {
+                idx = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            for (tiles[0..n], 0..) |t, i| {
+                if (t.view == cv) {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+    }
+    // One keypress = exactly one tile, NO wrapping: at the row edges the
+    // press keeps the current tile (stays put) instead of jumping to the far
+    // side. A window's copy sits right after its home slot, so Step+L from a
+    // window lands on its own copy tile first, then the next window.
+    const step: i64 = if (dir > 0) 1 else -1;
+    const next: i64 = @as(i64, @intCast(idx)) + step;
+    if (next < 0 or next >= n) return tiles[idx];
+    return tiles[@intCast(next)];
+}
+
 fn focusFirst(context: *ServerContext) void {
     for (context.views.items) |view| {
         if (!view.isMapped()) continue;
@@ -303,70 +421,44 @@ fn focusFirst(context: *ServerContext) void {
     }
 }
 
-pub fn focusColumnLeft(context: *ServerContext) void {
-    const current = context.focused_view orelse {
-        focusFirst(context);
-        return;
-    };
-
-    var i: ?usize = null;
-    for (context.views.items, 0..) |view, idx| {
-        if (view == current) {
-            i = idx;
-            break;
-        }
+fn focusTile(context: *ServerContext, t: FocusTile) void {
+    // Anchor the ring plus the next cycle step on exactly the chosen tile,
+    // so keyboard focus visibly lands everywhere and can keep moving.
+    context.kbd_cycle_view = t.view;
+    context.kbd_cycle_slot = @intFromFloat(t.mirror_slot_x);
+    if (t.mirror_slot_x >= 0) {
+        context.kbd_anchor_row = context.active_row;
+        context.kbd_anchor_slot_x = @intFromFloat(t.mirror_slot_x);
+    } else {
+        context.kbd_anchor_slot_x = -1;
     }
-
-    const idx = i orelse {
-        // focused_view is stale (not in views list) — reset and focus first.
-        context.focused_view = null;
-        focusFirst(context);
-        return;
-    };
-
-    // Walk left past any unmapped zombies.
-    var j = idx;
-    while (j > 0) {
-        j -= 1;
-        const target = context.views.items[j];
-        if (!target.isMapped()) continue;
-
-        setFocus(context, .{
-            .view = .{ .view = target, .surface = target.surface(), .sx = 0, .sy = 0 },
-        });
-        ViewManager.scrollToView(context, target);
-        return;
+    setFocus(context, .{
+        .view = .{ .view = t.view, .surface = t.view.surface(), .sx = 0, .sy = 0 },
+    });
+    if (t.mirror_slot_x >= 0) {
+        ViewManager.scrollToX(context, @intFromFloat(t.mirror_slot_x), @intFromFloat(t.w));
+    } else {
+        ViewManager.scrollToView(context, t.view);
     }
 }
+
+fn cycleStep(context: *ServerContext, dir: i2) void {
+    if (context.focused_view == null) {
+        focusFirst(context);
+        return;
+    }
+    const t = tileCycle(context, dir) orelse {
+        focusFirst(context);
+        return;
+    };
+    std.log.warn("CYCLE dir={} n=2 tile_x={d:.0} mirror={} view={*}", .{ dir, t.x, t.mirror_slot_x >= 0, t.view });
+    focusTile(context, t);
+}
+
+pub fn focusColumnLeft(context: *ServerContext) void {
+    cycleStep(context, -1);
+}
+
 pub fn focusColumnRight(context: *ServerContext) void {
-    const current = context.focused_view orelse {
-        focusFirst(context);
-        return;
-    };
-
-    var i: ?usize = null;
-    for (context.views.items, 0..) |view, idx| {
-        if (view == current) {
-            i = idx;
-            break;
-        }
-    }
-
-    const idx = i orelse {
-        context.focused_view = null;
-        focusFirst(context);
-        return;
-    };
-
-    var j = idx + 1;
-    while (j < context.views.items.len) : (j += 1) {
-        const target = context.views.items[j];
-        if (!target.isMapped()) continue;
-
-        setFocus(context, .{
-            .view = .{ .view = target, .surface = target.surface(), .sx = 0, .sy = 0 },
-        });
-        ViewManager.scrollToView(context, target);
-        return;
-    }
+    cycleStep(context, @as(i2, 1));
 }

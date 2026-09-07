@@ -4,7 +4,7 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const nd = @import("../view/utils/node_data.zig");
+const NodeData = @import("../view/utils/node_data.zig");
 
 const View = @import("../view/view.zig");
 const Layer = @import("../view/layer.zig");
@@ -90,7 +90,7 @@ fn surfaceAt(
     x: f64,
     y: f64,
 ) ?*wlroots.Surface {
-    const hit = nd.resolveAt(&context.scene.tree, x, y) orelse return null;
+    const hit = NodeData.resolveAt(&context.scene.tree, x, y) orelse return null;
 
     return switch (hit.data.*) {
         .view => |view| @as(*View, @ptrCast(@alignCast(view))).surface(),

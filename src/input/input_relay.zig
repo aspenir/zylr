@@ -4,7 +4,7 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const nd = @import("../view/utils/node_data.zig");
+const NodeData = @import("../view/utils/node_data.zig");
 
 const Relay = @This();
 
@@ -222,7 +222,7 @@ fn onNewPopup(listener: *wl.Listener(*wlroots.InputPopupSurfaceV2), popup: *wlro
     };
     // Tag the OSK subtree so pointer/touch resolution routes taps to its
     // surface; without this the on-screen keyboard never receives input.
-    const node_data = std.heap.c_allocator.create(nd.NodeData) catch return;
+    const node_data = std.heap.c_allocator.create(NodeData.NodeData) catch return;
     node_data.* = .{ .im_popup = popup };
     node.node.data = node_data;
     popup.data = node_data;
@@ -242,7 +242,7 @@ fn onPopupDestroy(listener: *wl.Listener(void)) void {
     // The scene subsurface tree was auto-destroyed by wlroots when the
     // wl_surface was torn down; we only need to free our metadata tag.
     if (pc.popup.data) |data_ptr| {
-        const nd_data: *nd.NodeData = @ptrCast(@alignCast(data_ptr));
+        const nd_data: *NodeData.NodeData = @ptrCast(@alignCast(data_ptr));
         std.heap.c_allocator.destroy(nd_data);
         pc.popup.data = null;
     }

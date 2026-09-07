@@ -1,0 +1,463 @@
+const std = @import("std");
+const wlroots = @import("wlroots");
+const pixman = @import("pixman");
+
+const ServerContext = @import("server.zig");
+const View = @import("view/view.zig");
+const view_manager_mod = @import("view/view_manager.zig");
+const rounding_mod = @import("view/rounding.zig");
+const border_mod = @import("view/border.zig");
+
+const allocator = std.heap.c_allocator;
+
+const log = std.log.scoped(.mirror);
+
+/// Pin `view` to `target_row`. For the active row we immediately create
+/// the scene trees; for inactive rows we only record the intent in
+/// `row_pinned` (trees are built on row activation).
+///
+/// Under the "all pins" model the source's real surface is hidden once it
+/// has any pin: every representation (home row included) is a mirror, and
+/// all input routes to the one memory window.
+pub fn pinToRow(context: *ServerContext, view: *View, target_row: usize) void {
+    if (target_row >= ServerContext.max_rows) return;
+    if (findPinned(context, view, target_row) != null) return;
+
+    // Record the pinned copy on the target row.
+    context.row_pinned[target_row].append(allocator, view) catch return;
+
+    // Hide the source and rebuild mirrors: a self-mirror appears on the
+    // source's home row (derived), and a copy on `target_row` (from
+    // row_pinned). Same row -> two side-by-side tiles.
+    refreshSourceVisibility(context, view);
+}
+
+/// Unpin `view` from `target_row`.
+pub fn unpinFromRow(context: *ServerContext, view: *View, target_row: usize) void {
+    if (target_row >= ServerContext.max_rows) return;
+    if (findPinned(context, view, target_row)) |idx| {
+        _ = context.row_pinned[target_row].orderedRemove(idx);
+    }
+    refreshSourceVisibility(context, view);
+}
+
+/// Remove all pins + mirrors for `view` (called on view destroy).
+pub fn unpinAll(context: *ServerContext, view: *View) void {
+    for (0..ServerContext.max_rows) |r| {
+        // Pinned list.
+        var pi: usize = context.row_pinned[r].items.len;
+        while (pi > 0) {
+            pi -= 1;
+            if (context.row_pinned[r].items[pi] == view)
+                _ = context.row_pinned[r].orderedRemove(pi);
+        }
+        // Mirror trees.
+        var mi: usize = context.row_mirrors[r].items.len;
+        while (mi > 0) {
+            mi -= 1;
+            if (context.row_mirrors[r].items[mi].view == view) {
+                context.row_mirrors[r].items[mi].tree.node.destroy();
+                _ = context.row_mirrors[r].orderedRemove(mi);
+            }
+        }
+    }
+    view.scene_tree.node.setEnabled(true);
+}
+
+/// Hide the source's real surface whenever it has a pin anywhere, and make
+/// sure its home row carries a self-mirror so it stays visible as a pin.
+/// Re-shows the real surface and drops the self-mirror once it has no pins.
+fn refreshSourceVisibility(context: *ServerContext, view: *View) void {
+    // Self-mirrors are NOT stored in `row_pinned`; they are derived at build
+    // time from "is this window of the row pinned anywhere?". So here we only
+    // hide/show the real surface and rebuild the mirrors of any row this
+    // window both lives on and renders right now.
+    if (hasAnyPin(context, view)) {
+        view.scene_tree.node.setEnabled(false);
+    } else {
+        view.scene_tree.node.setEnabled(true);
+    }
+    // Rebuild the visible row's mirrors: a pin change can add/remove a copy
+    // on the active row and/or the source's self-mirror, no matter which row
+    // the source lives on.
+    activateMirrors(context, context.active_row);
+}
+
+/// True when `view`'s real surface is hidden because it is a pinned source
+/// (its representations are all mirrors).
+pub fn isHiddenSource(context: *ServerContext, view: *View) bool {
+    return hasAnyPin(context, view);
+}
+
+fn hasAnyPin(context: *ServerContext, view: *View) bool {
+    for (0..ServerContext.max_rows) |r| {
+        if (findPinned(context, view, r) != null) return true;
+    }
+    return false;
+}
+
+/// The row this window lives on (active working set or a parked row).
+fn homeRowOf(context: *ServerContext, view: *View) ?usize {
+    if (std.mem.indexOfScalar(*View, context.views.items, view) != null) return context.active_row;
+    for (context.rows, 0..) |maybe_row, i| {
+        if (maybe_row) |r| {
+            if (std.mem.indexOfScalar(*View, r.views.items, view) != null) return i;
+        }
+    }
+    return null;
+}
+
+/// Called on every commit of `view`. Push the latest surface buffer to every
+/// active mirror and scale it to the mirror's slot content box, so mirrors
+/// track live updates AND stay exactly the size of their tile (never swelling
+/// to the source's natural size like real windows do only because the
+/// compositor resizes them to the slot).
+pub fn updateMirrors(view: *View) void {
+    const context = view.context;
+    const surf = view.surfaceOrNull() orelse return;
+    const buf: ?*wlroots.Buffer = if (surf.buffer) |cb| @as(?*wlroots.Buffer, &cb.base) else null;
+    const bw: i32 = context.border_width;
+    // Damage regions passed to setBufferWithDamage are in BUFFER coordinates.
+    // The source buffer is scaled (2x on hidpi), so a surface-sized region
+    // misses most of the buffer and the output never repaints - stale mirrors.
+    // A full-buffer region always touches the whole node: mirrors repaint on
+    // every commit, which is exactly what a tiled mirror should do.
+    var damage: pixman.Region32 = undefined;
+    damage.initRect(0, 0, std.math.maxInt(c_int), std.math.maxInt(c_int));
+    defer damage.deinit();
+    for (0..ServerContext.max_rows) |r| {
+        for (context.row_mirrors[r].items) |*m| {
+            if (m.view != view) continue;
+            const cw = m.slot_w - 2 * bw;
+            const ch = m.slot_h - 2 * bw;
+            if (buf) |b| {
+                if (m.buf_node) |bn| {
+                    bn.setBufferWithDamage(b, &damage);
+                    if (m.pushed % 8 == 0) {
+                        var bx: c_int = 0;
+                        var by: c_int = 0;
+                        _ = m.tree.node.coords(&bx, &by);
+                        std.log.warn("MIRROR PUSH view={*} is_self={} slotx={} slotw={} pos=({},{})", .{ view, m.is_self, m.slot_x, m.slot_w, bx, by });
+                    }
+                    m.pushed +|= 1;
+                }
+            } else {
+                if (m.buf_node) |bn| bn.setBuffer(null);
+                continue;
+            }
+            if (m.buf_node) |bn| {
+                // Scale the source to the tile's content box. Fall back to the
+                // surface's natural size only before the tile has a slot.
+                if (cw > 0 and ch > 0) {
+                    bn.setDestSize(cw, ch);
+                } else {
+                    bn.setDestSize(@intCast(surf.current.width), @intCast(surf.current.height));
+                }
+                bn.node.setPosition(bw, bw);
+            }
+            // Keep the border ring framed on the tile.
+            if (m.border_rect) |br| {
+                const br_enabled = m.view == context.focused_view;
+                border_mod.updateBorderRect(context, br, @max(1, cw), @max(1, ch), m.slot_w, m.slot_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)));
+            }
+        }
+    }
+}
+/// Position every mirror of `view` on the ACTIVE row as part of the tiled
+/// flow, called every animation frame. The self-mirror rides the window's
+/// own animated tile; any same-row copies flow as adjacent tiles right after
+/// it. All positions are in row coordinates and get the viewport offset, so
+/// mirrors scroll with the row exactly like windows - genuinely tiled, never
+/// floating.
+pub fn syncActiveTile(view: *View, cur_x_row: f32, cur_w: f32) void {
+    const context = view.context;
+    const vp: f32 = @floatFromInt(context.viewport_x);
+    const scene_y: i32 = view.y - context.viewport_y;
+    const mirrors = &context.row_mirrors[context.active_row];
+    var cy: f32 = cur_x_row + cur_w + @as(f32, @floatFromInt(context.gaps_in));
+    for (mirrors.items) |*m| {
+        if (m.view != view) continue;
+        if (m.is_self) {
+            // self-mirror rides with the window
+            m.tree.node.setPosition(@intFromFloat(cur_x_row - vp), scene_y);
+        } else {
+            // same-row copy: a real tile immediately after the window
+            m.tree.node.setPosition(@intFromFloat(cy - vp), scene_y);
+            cy += @as(f32, @floatFromInt(mirrorWidth(context, view) + context.gaps_in));
+        }
+    }
+}
+
+/// Destroy all mirror trees for `row_idx`, then recreate them from
+/// `row_pinned` (the pinned copies) plus derived self-mirrors (windows of
+/// this row that are pinned anywhere). Called by `row.switchTo` after the
+/// row becomes active, and by `refreshSourceVisibility` on pin changes.
+pub fn activateMirrors(context: *ServerContext, row_idx: usize) void {
+    destroyMirrorTrees(context, row_idx);
+    // Self-mirrors: a window of this row that is pinned anywhere renders as
+    // a mirror at its own slot (the source's real surface is hidden).
+    for (rowViews(context, row_idx)) |view| {
+        if (!isTiledCandidate(view)) continue;
+        if (hasAnyPin(context, view)) activateMirror(context, view, row_idx, true);
+    }
+    // Pinned copies: explicit pins on this row (from row_pinned).
+    for (context.row_pinned[row_idx].items) |view| activateMirror(context, view, row_idx, false);
+    layoutMirrors(context, row_idx);
+}
+
+/// The window list of `row_idx` (active views, or a parked row's views).
+fn rowViews(context: *ServerContext, row_idx: usize) []const *View {
+    if (row_idx == context.active_row) return context.views.items;
+    if (context.rows[row_idx]) |parked| return parked.views.items;
+    return &.{};
+}
+
+/// True if `view` takes a tiled slot (mapped, non-floating, non-fullscreen).
+fn isTiledCandidate(view: *View) bool {
+    return view.isMapped() and !view.floating and !view.fullscreen;
+}
+
+/// Destroy all mirror trees for `row_idx` (called before deactivation).
+pub fn deactivateMirrors(context: *ServerContext, row_idx: usize) void {
+    destroyMirrorTrees(context, row_idx);
+}
+
+/// Position mirrors in a single row.
+///   * Self-mirrors (a window of this row that is pinned anywhere) sit at the
+///     source's own slot; any extra copy of that same window (a same-row pin)
+///     is placed as an adjacent tile right after it - two side-by-side tiles.
+///   * Cross-row mirrors (source lives on another row) are appended after the
+///     row's windows.
+fn layoutRow(context: *ServerContext, target_row: usize) void {
+    if (target_row >= ServerContext.max_rows) return;
+    const mirrors = &context.row_mirrors[target_row];
+    if (mirrors.items.len == 0) return;
+
+    const y: i32 = context.usable_area.y + context.gaps_out;
+    const views = rowViews(context, target_row);
+    var x: i32 = context.usable_area.x + context.gaps_out;
+
+    // Pass 1: place each window's self-mirror at its slot, then any extra
+    // mirror of that same window (same-row pin copy) as an adjacent tile.
+    for (views) |view| {
+        if (!isTiledCandidate(view)) continue;
+        placeAllMirrorsAt(context, mirrors, view);
+        x += view_manager_mod.getViewWidth(view) + context.gaps_in;
+    }
+
+    // Pass 2: append any mirror not placed yet (cross-row pins) after the
+    // row's windows. The tiler already moved row windows right of the copies
+    // of their own row members, so a locally-accumulated x would overlap the
+    // last window. Append from the true row end instead: the rightmost
+    // window's right edge, which the tiler placed.
+    var row_end: i32 = context.usable_area.x + context.gaps_out;
+    for (views) |view| {
+        if (!isTiledCandidate(view)) continue;
+        row_end = @max(row_end, view.x + view_manager_mod.getViewWidth(view));
+    }
+    x = row_end + @as(i32, @intCast(context.gaps_in));
+    for (mirrors.items) |*m| {
+        if (m.slot_x == std.math.minInt(i32)) {
+            const src = m.view;
+            const w = mirrorWidth(context, src);
+            const h: i32 = if (src.slot_h > 0) src.slot_h else context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+            placeMirror(context, m, x, y, w, h);
+            x += w + context.gaps_in;
+        }
+    }
+}
+
+/// Place the self-mirror of `view` at `start_x` (the window's slot), and any
+/// additional mirror of the same view (same-row pin copies) as adjacent
+/// tiles right after it. Mirrors already placed (slot_x set) are untouched.
+fn placeAllMirrorsAt(context: *ServerContext, mirrors: *std.ArrayListUnmanaged(ServerContext.Mirror), view: *View) void {
+    const slot_h = view.slot_h;
+    var x: i32 = undefined;
+    for (mirrors.items) |*m| {
+        if (m.view != view) continue;
+        if (m.slot_x != std.math.minInt(i32)) continue; // already placed
+        if (m.is_self) {
+            // self-mirror: reuse the source's exact tiled slot box.
+            placeMirror(context, m, view.x, view.y, view.slot_w, view.slot_h);
+            x = view.x + view_manager_mod.getViewWidth(view);
+        } else {
+            const w = mirrorWidth(context, view);
+            placeMirror(context, m, x, context.usable_area.y + context.gaps_out, w, slot_h);
+            x += w + context.gaps_in;
+        }
+    }
+}
+
+fn mirrorWidth(context: *ServerContext, src: *View) i32 {
+    const vw = view_manager_mod.getViewWidth(src);
+    if (vw > 0) return vw;
+    return @as(i32, @intFromFloat(@as(f32, @floatFromInt(@max(1, context.usable_area.width))) * context.view_width_ratio)) + 2 * @as(i32, @intCast(context.border_width));
+}
+
+/// True if `view` is one of the windows of `row`.
+fn isViewOfRow(context: *ServerContext, view: *View, row: usize) bool {
+    if (row == context.active_row) {
+        return std.mem.indexOfScalar(*View, context.views.items, view) != null;
+    }
+    if (context.rows[row]) |parked| {
+        return std.mem.indexOfScalar(*View, parked.views.items, view) != null;
+    }
+    return false;
+}
+
+/// Place a mirror with an EXACTLY view-identical tile footprint: the slot
+/// box is the source's own slot (`slot_w` x `slot_h`), content inset by the
+/// border, scaled to the live buffer. This is the same box a real window at
+/// that slot would occupy, so a mirror never overlaps or leaves a gap
+/// relative to its neighbours.
+fn placeMirror(context: *ServerContext, m: *ServerContext.Mirror, x: i32, y: i32, slot_w: i32, slot_h: i32) void {
+    const src = m.view;
+    const bw: i32 = context.border_width;
+    // The mirror must occupy the SAME footprint the source window actually
+    // renders, so it never bloats over its neighbours. Size content from the
+    // source's live surface size, matching what a real window shows; fall
+    // back to the view's slot box only before the surface has committed.
+    const sw = if (src.surfaceOrNull()) |ss| @as(i32, @intCast(ss.current.width)) else 0;
+    const sh = if (src.surfaceOrNull()) |ss| @as(i32, @intCast(ss.current.height)) else 0;
+    const content_w = if (sw > 0) sw else @max(1, slot_w - 2 * bw);
+    const content_h = if (sh > 0) sh else @max(1, slot_h - 2 * bw);
+    const cw_box = content_w + 2 * bw;
+    const ch_box = content_h + 2 * bw;
+    m.slot_x = x;
+    m.slot_y = y;
+    m.slot_w = cw_box;
+    m.slot_h = ch_box;
+    // Offset by the row's scroll viewport exactly like real windows.
+    m.tree.node.setPosition(x - context.viewport_x, y - context.viewport_y);
+    m.tree.node.setEnabled(true);
+    // Scale the source to the tile's content box (a plain scene buffer lets
+    // us own the dest size, unlike a scene surface) and inset it by the
+    // border, exactly like a real window's surface.
+    if (m.buf_node) |bn| {
+        bn.setDestSize(content_w, content_h);
+        bn.node.setPosition(bw, bw);
+    }
+    // Border ring via the shared view-border renderer, framed on the tile.
+    if (m.border_rect) |br| {
+        const br_enabled = m.view == context.focused_view;
+        border_mod.updateBorderRect(context, br, content_w, content_h, cw_box, ch_box, br_enabled, @intCast(@max(0, context.corner_radius - 1)));
+    }
+}
+
+/// Re-paint every mirror's border ring to match the current focus without
+/// repositioning anything. Mirror rings otherwise only update when a mirror is
+/// (re)placed or its source commits, so the focused ring would never appear on
+/// a focus switch. Called from focus changes alongside layoutMirrorsAll.
+pub fn refreshMirrorFocus(context: *ServerContext) void {
+    const bw: i32 = context.border_width;
+    for (0..ServerContext.max_rows) |r| {
+        for (context.row_mirrors[r].items) |*m| {
+            const br = m.border_rect orelse continue;
+            const enabled = m.view == context.focused_view;
+            border_mod.updateBorderRect(context, br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, enabled, @intCast(@max(0, context.corner_radius - 1)));
+        }
+    }
+}
+
+/// Public per-row entry: layout just `target_row`'s pins.
+pub fn layoutMirrors(context: *ServerContext, target_row: usize) void {
+    layoutRow(context, target_row);
+}
+
+/// Layout every row that has pins, so pins track source-window resizes and
+/// layout changes no matter which row is active.
+pub fn layoutMirrorsAll(context: *ServerContext) void {
+    for (0..ServerContext.max_rows) |row| layoutRow(context, row);
+}
+
+// ── internal helpers ─────────────────────────────────────────────
+
+fn activateMirror(context: *ServerContext, view: *View, row_idx: usize, is_self: bool) void {
+    // A mirror is a plain scene buffer fed from the source's surface on every
+    // commit. Its dest size is OUR call, so a mirror can be scaled to exactly
+    // its slot content box - the same box a real window is resized to - and
+    // never bloat over its neighbours (scene surfaces would force the
+    // source's natural size, which is wrong once the source is tiled).
+    // Pointers, clicks and focus route through the NodeData{.view} the tree
+    // carries, exactly like a real window.
+    const tree = context.views_tree.?.createSceneTree() catch {
+        return;
+    };
+    const buf_node = tree.createSceneBuffer(null) catch {
+        tree.node.destroy();
+        return;
+    };
+    if (view.surfaceOrNull()) |surf| {
+        if (surf.buffer) |cb| buf_node.setBuffer(&cb.base);
+    }
+    // Window-style border rect below the buffer, rendered by the same
+    // shared `updateBorderRect` that views use.
+    const border_rect = tree.createSceneRect(0, 0, &context.focused_border_color) catch null;
+    if (border_rect) |br| br.node.placeBelow(&buf_node.node);
+    // Route input like the source window: the mirror tree carries the
+    // source's NodeData{.view}, so clicks anywhere on it focus the source
+    // (memory) view and the pointer falls back to the source's wlr_surface.
+    tree.node.data = &view.node_data;
+    if (border_rect) |br| br.node.data = &view.node_data;
+
+    context.row_mirrors[row_idx].append(allocator, .{
+        .view = view,
+        .tree = tree,
+        .buf_node = buf_node,
+        .border_rect = border_rect,
+        .active = true,
+        .is_self = is_self,
+        .slot_x = std.math.minInt(i32),
+    }) catch {
+        tree.node.destroy();
+        return;
+    };
+    // Round the mirrored buffer's corners to match the window.
+    if (context.corner_radius > 0) {
+        rounding_mod.setBufferCorners(buf_node, @intCast(@max(0, context.corner_radius - 1)));
+    }
+}
+
+/// The total extra width a window's same-row pin COPY tiles add to the row
+/// flow, so the tiler shifts following windows right to make room (the
+/// self-mirror rides the window's own slot, so it adds nothing).
+pub fn extraTilesWidth(context: *ServerContext, view: *View) i32 {
+    var w: i32 = 0;
+    if (context.active_row >= ServerContext.max_rows) return w;
+    for (context.row_mirrors[context.active_row].items) |*m| {
+        if (m.view != view) continue;
+        if (m.is_self) continue; // self-mirror rides the slot
+        w += mirrorWidth(context, view) + context.gaps_in;
+    }
+    return w;
+}
+
+/// Raise every mirror on the ACTIVE row to the top of the views tree, so
+/// windows (which get re-raised on focus) can't paint over the mirrors.
+pub fn raiseActiveRow(context: *ServerContext) void {
+    const mirrors = &context.row_mirrors[context.active_row];
+    for (mirrors.items) |*m| {
+        if (m.active) m.tree.node.raiseToTop();
+    }
+}
+
+fn destroyMirrorTrees(context: *ServerContext, row_idx: usize) void {
+    for (context.row_mirrors[row_idx].items) |m| m.tree.node.destroy();
+    context.row_mirrors[row_idx].clearRetainingCapacity();
+}
+
+fn findPinned(context: *ServerContext, view: *View, row: usize) ?usize {
+    if (row >= ServerContext.max_rows) return null;
+    for (context.row_pinned[row].items, 0..) |v, i| {
+        if (v == view) return i;
+    }
+    return null;
+}
+
+fn findMirror(context: *ServerContext, view: *View, row: usize) ?usize {
+    if (row >= ServerContext.max_rows) return null;
+    for (context.row_mirrors[row].items, 0..) |m, i| {
+        if (m.view == view) return i;
+    }
+    return null;
+}

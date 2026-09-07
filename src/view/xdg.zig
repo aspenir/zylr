@@ -4,11 +4,12 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
+const Mirror = @import("../mirror.zig");
 const Border = @import("border.zig");
 const Blur = @import("blur.zig");
 const ViewManager = @import("view_manager.zig");
 const View = @import("view.zig");
-const nd = @import("utils/node_data.zig");
+const NodeData = @import("utils/node_data.zig");
 
 fn wlrClientPid(client: *wl.Client) i32 {
     return client.getCredentials().pid;
@@ -258,7 +259,7 @@ pub const PopupNode = struct {
     new_popup_active: bool = false,
     /// Attached to the popup's scene tree node so pointer hit-tests
     /// resolve the popup surface instead of the toplevel beneath it.
-    node_data: nd.NodeData = undefined,
+    node_data: NodeData.NodeData = undefined,
 
     fn unconstrain(self: *PopupNode) void {
         if (!self.popup.base.initialized) return;
@@ -315,6 +316,7 @@ pub const PopupNode = struct {
             node.popup.current.geometry.width,
             node.popup.current.geometry.height,
         });
+        Mirror.updateMirrors(node.view);
         if (node.context.output) |out| out.scheduleFrame();
     }
 
@@ -357,6 +359,9 @@ pub const PopupNode = struct {
         if (std.mem.indexOfScalar(*PopupNode, list.items, node)) |i| {
             _ = list.swapRemove(i);
         }
+        // Reconcile mirrors now that the popup left the live list, so the
+        // copy node is dropped before the popup surface is freed.
+        Mirror.updateMirrors(node.view);
         std.heap.c_allocator.destroy(node);
     }
 };
@@ -494,7 +499,6 @@ fn createPopupNode(context: *ServerContext, view: *View, popup: *wlroots.XdgPopu
     // pacing works for the bufferless case.
     if (context.output) |out| popup.base.surface.sendEnter(out);
 
-
     // Nested popups (submenus, flyouts) are parented to a popup; listen on
     // this popup's base too so the whole chain reaches zylr.
     node.new_popup_listener = wl.Listener(*wlroots.XdgPopup).init(onNewPopupForNode);
@@ -560,11 +564,13 @@ fn dumpSceneStructure(view: *View, popup_tree: *wlroots.SceneTree, popup_node: *
 fn onNewXdgPopup(listener: *wl.Listener(*wlroots.XdgPopup), popup: *wlroots.XdgPopup) void {
     const view: *View = @fieldParentPtr("new_popup_listener", listener);
     _ = createPopupNode(view.context, view, popup);
+    Mirror.updateMirrors(view);
 }
 
 fn onNewPopupForNode(listener: *wl.Listener(*wlroots.XdgPopup), popup: *wlroots.XdgPopup) void {
     const node: *PopupNode = @fieldParentPtr("new_popup_listener", listener);
     _ = createPopupNode(node.context, node.view, popup);
+    Mirror.updateMirrors(node.view);
 }
 
 pub fn commitToplevel(
@@ -637,7 +643,7 @@ pub fn commitToplevel(
     view.slot_w = ew;
     view.slot_h = eh;
 
-    // Mango-exact: the toplevel's content box is the slot inset by the
+    // the toplevel's content box is the slot inset by the
     // border width. The scene surface sits at +bw inside the slot, so a
     // slot-sized ring can wrap it without spilling into neighbours.
     const bw: c_int = @intCast(context.border_width);

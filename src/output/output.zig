@@ -4,6 +4,7 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const AnimationManager = @import("../view/animation.zig");
+const Mirror = @import("../mirror.zig");
 const ServerContext = @import("../server.zig");
 const OutputContext = @This();
 
@@ -61,6 +62,12 @@ pub fn onNewOutput(
         return;
     };
     std.log.info("Output added to output layout", .{});
+
+    // Make this connector leaseable (zwlr_drm_lease_v1): a client like
+    // Waydroid/VR can drive it directly with zero compositor copies.
+    if (context.drm_lease) |lease| {
+        _ = lease.offerOutput(output);
+    }
 
     const scene_output =
         context.scene.createSceneOutput(output) catch {
@@ -191,6 +198,9 @@ pub fn onOutputFrame(listener: *wl.Listener(*wlroots.Output), output: *wlroots.O
     var now: std.c.timespec = undefined;
     _ = clock_gettime(CLOCK_MONOTONIC, &now);
     output_ctx.scene_output.sendFrameDone(@ptrCast(&now));
+    // Pace mirror kicks off the REAL output frame (once per vsync), never
+    // off client commits: an unvsync'd kick loop hung the GPU pipeline.
+    Mirror.onOutputFrame(context, &now);
 }
 
 /// True when the focused surface has requested asynchronous (tearing)

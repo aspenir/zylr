@@ -16,7 +16,7 @@ pub const Wallpaper = struct {
     height: i32,
 };
 
-const config = @import("config.zig");
+const Config = @import("config.zig");
 const LayerView = @import("view/layer.zig");
 const View = @import("view/view.zig");
 const XCursorManager = @import("view/xcursor.zig");
@@ -32,6 +32,87 @@ pub const UndoEntry = union(enum) {
     viewport: struct { prev_target: i32 },
     fullscreen: struct { view: *View, prev_fullscreen: bool },
     focus: struct { restore: ?*View },
+    row_switch: struct { prev_row: usize },
+};
+
+/// One copy node inside a mirror tree: clones a scene buffer of the source's
+/// real (hidden) scene tree - a subsurface or an xdg popup - at its exact
+/// scene position, so the mirror reproduces wlroots' own composition.
+pub const SubCopy = struct {
+    /// Source surface: the sub-surface's wl_surface (identified by pointer).
+    src: *wlroots.Surface,
+    node: *wlroots.SceneBuffer,
+    /// Mirror owning the copy, for re-feeding on the source's commits.
+    owner: *Mirror,
+    /// Commit listener on `src` so popup/subsurface content feeds live.
+    commit: wl.Listener(*wlroots.Surface) = undefined,
+    /// Destroy listener on `src` so dead surfaces can't dangle in the
+    /// signal list (their freed memory would crash the next remove).
+    destroy: wl.Listener(*wlroots.Surface) = undefined,
+    /// True while the commit/destroy listeners are still linked.
+    linked: bool = true,
+};
+
+pub const max_rows = 8;
+
+/// One workspace "row": a horizontal stack of windows with its own
+/// horizontal scroll. The compositor swaps the shared working set
+/// (context.views + anim arrays + viewport_x) in and out of these on
+/// row switches so the render/layout/animation code stays row-agnostic:
+/// at any moment `context.views` IS the active row's window list.
+pub const Row = struct {
+    views: std.ArrayListUnmanaged(*View) = .empty,
+    animation_x: std.ArrayListUnmanaged(f32) = .empty,
+    animation_w: std.ArrayListUnmanaged(f32) = .empty,
+    scroll_x: i32 = 0,
+    target_x: i32 = 0,
+};
+
+pub const Mirror = struct {
+    view: *View,
+    /// Source surface for manually-fed copies (non-self mirrors are plain
+    /// scene buffers fed from surface.current per commit, not scene
+    /// surfaces). Null for self-mirrors, which ride the surface itself.
+    surf: ?*wlroots.Surface = null,
+    tree: *wlroots.SceneTree,
+    buf_node: ?*wlroots.SceneBuffer = null,
+    /// Copy nodes for every subsurface in the source's surface tree,
+    /// mirroring wlroots' unmirrored per-surface composition (Firefox renders
+    /// content on subsurfaces; feeding only the toplevel leaves it blank).
+    // Pointers, never values: these structs carry wl_listeners linked into
+    // wlroots signal lists, so moving their bytes (swapRemove) would corrupt
+    // the commit/destroy lists and GP or infinitely loop.
+    sub_copies: std.ArrayListUnmanaged(*SubCopy) = .empty,
+    /// Rounded full-box border rect under the buffer, like a window's.
+    border_rect: ?*wlroots.SceneRect = null,
+
+    active: bool = false,
+    /// True for the derived self-mirror (renders at the source's own slot
+    /// and rides the window); false for mirrored copies (independent tiles).
+    is_self: bool = false,
+    slot_x: i32 = 0,
+    slot_y: i32 = 0,
+    slot_w: i32 = 0,
+    slot_h: i32 = 0,
+    natural_w: i32 = 0,
+    natural_h: i32 = 0,
+    /// Raw source surface size at last placement, for resize detection (the
+    /// re-place check matches live surface size against THIS, since
+    /// natural_w/h are the geometry-clamped CONTENT box - for xdg windows
+    /// with CSD margins the two differ and comparing bases caused a re-place
+    /// on every commit).
+    surf_w: i32 = 0,
+    surf_h: i32 = 0,
+    diag_buf: ?*wlroots.Buffer = null,
+    /// Commit counter (diagnostics only).
+    pushed: u32 = 0,
+    feed_in_progress: bool = false,
+    /// Row-flow docking for mirrored-copy tiles: the copy rides right after
+    /// `dock_view` (its dock cluster), at `dock_order`. null = row lead
+    /// (before the first window). Defaults: same-row mirror docks to its own
+    /// source; cross-row mirror docks after the row's last tiled window.
+    dock_view: ?*View = null,
+    dock_order: u32 = 0,
 };
 
 // Ring buffer of undo snapshots (oldest overwritten first).
@@ -45,11 +126,24 @@ allocator: *wlroots.Allocator,
 renderer: *wlroots.Renderer,
 xdg_shell: *wlroots.XdgShell,
 tearing: ?*wlroots.TearingControlManagerV1 = null,
+drm_lease: ?*wlroots.DrmLeaseManagerV1 = null,
 wayland_socket: []const u8,
 focused_layer: ?*LayerView = null,
 focused_surface: ?*wlroots.Surface = null,
 focused_view: ?*View = null,
 previous_focused_view: ?*View = null,
+/// When keyboard cycling lands on a mirrored copy, the slot_x of
+/// exactly that tile. The focus ring then lights ONLY that copy instead
+/// of every mirror of the focused view, so the active tile is obvious.
+/// -1 = no anchor (all mirrors of the focused view are lit).
+kbd_anchor_row: usize = 0,
+kbd_anchor_slot_x: i32 = -1,
+/// The exact tile the last keyboard-cycle press landed on: its view plus
+/// the mirror slot_x (-1 = the view's home slot). Cycling anchors on this
+/// tile, not the view's home, so a copy between A and B can be cycled PAST
+/// (otherwise repeated Step+L spins on the copy forever).
+kbd_cycle_view: ?*View = null,
+kbd_cycle_slot: i32 = -1,
 focus_history: std.ArrayListUnmanaged(*View) = .empty,
 output: ?*wlroots.Output = null,
 session: ?*wlroots.Session = null,
@@ -81,11 +175,11 @@ focused_border_color: [4]f32 = .{ 0.3, 0.6, 1.0, 1.0 },
 /// Corner radius (logical px) for rounded window corners; 0 disables.
 corner_radius: i32 = 16,
 /// Compiled keybind table (see config.zig); matched on every keypress.
-keybinds: []const config.CompiledBind = &.{},
+keybinds: []const Config.CompiledBind = &.{},
 /// Compiled gesture table; matched at swipe/pinch/hold end.
-gestures: []const config.CompiledGesture = &.{},
+gestures: []const Config.CompiledGesture = &.{},
 /// Compiled switch table; matched on lid/tablet-mode toggle.
-switches: []const config.CompiledSwitch = &.{},
+switches: []const Config.CompiledSwitch = &.{},
 /// XKB rule names applied to physical keyboards; defaults to "gb",
 /// overridden by the keyboard section of the config.
 xkb_names: xkb.RuleNames = .{
@@ -137,6 +231,18 @@ viewport_y: i32 = 0,
 viewport_target: i32 = 0,
 viewport_anim: f32 = 0,
 
+// Workspace rows. `views`/animation arrays/viewport_x above are the
+// ACTIVE row's working set; the rest of the rows park their windows,
+// animation arrays, and scroll offset in `rows[].` Switch with row.zig.
+rows: [max_rows]?Row = [_]?Row{null} ** max_rows,
+active_row: usize = 0,
+/// Mirrors per row, independent of Row optional (active row's Row is null
+/// but its mirrors must remain accessible).
+row_mirrors: [max_rows]std.ArrayListUnmanaged(Mirror) = [_]std.ArrayListUnmanaged(Mirror){.empty} ** max_rows,
+/// Mirror view pointers per row — survives row switches. Mirror trees are
+/// destroyed on deactivation and recreated from this list on activation.
+row_sources: [max_rows]std.ArrayListUnmanaged(*View) = [_]std.ArrayListUnmanaged(*View){.empty} ** max_rows,
+
 // Mod+drag state for moving (reordering) the focused view in the column.
 drag_active: bool = false,
 drag_view: ?*View = null,
@@ -158,8 +264,8 @@ idle: ?*@import("idle.zig").Idle = null,
 session_lock: ?*@import("session_lock.zig").SessionLock = null,
 /// Raw config (kept for idle timers and reload).
 cfg: @import("config.zig").Config = .{},
-keybind_repeat: config.RepeatConfig = .{},
-gesture_repeat: config.RepeatConfig = .{},
+keybind_repeat: Config.RepeatConfig = .{},
+gesture_repeat: Config.RepeatConfig = .{},
 /// Monotonic-ms stamp of the last gesture firing, for cooldowns.
 last_gesture_fire_ms: u64 = 0,
 
@@ -233,7 +339,7 @@ pub fn onRequestSetPrimarySelection(
 
 /// Apply a loaded config to the compositor context fields.
 /// Called at startup and on config reload.
-pub fn applyConfig(self: *@This(), loaded: config.Loaded) void {
+pub fn applyConfig(self: *@This(), loaded: Config.Loaded) void {
     self.cfg = loaded.cfg;
     self.keybinds = loaded.binds;
     self.gestures = loaded.gestures;
@@ -247,7 +353,7 @@ pub fn applyConfig(self: *@This(), loaded: config.Loaded) void {
     self.view_width_ratio = loaded.cfg.width_ratio;
     self.view_scale = loaded.cfg.scale;
     self.keybind_repeat = loaded.cfg.keybind_repeat;
-    self.gesture_repeat = loaded.cfg.gesture_repeat;
+    self.gesture_repeat = loaded.cfg.gestures.repeat;
 }
 
 /// Drop undo snapshots referencing `view` before it is freed, so undo

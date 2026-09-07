@@ -4,7 +4,7 @@ const wlroots = @import("wlroots");
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const nd = @import("../view/utils/node_data.zig");
+const NodeData = @import("../view/utils/node_data.zig");
 
 /// Pointer constraints (zwp_pointer_constraints_v1). The 0.20 wlroots
 /// module only registers the global and reports new_constraint; the
@@ -93,7 +93,7 @@ pub fn onPointerFocus(context: *ServerContext, node: ?*wlroots.SceneNode) void {
     var cur = node;
     while (cur) |n| {
         if (n.type == .buffer) {
-            if (nd.hitSurface(n)) |surface| {
+            if (NodeData.hitSurface(n)) |surface| {
                 if (module.manager.constraintForSurface(surface, module.seat)) |constraint| {
                     var lx: c_int = 0;
                     var ly: c_int = 0;

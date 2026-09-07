@@ -68,8 +68,7 @@ pub const session_vars = [_][:0]const u8{
 /// Publish `values` (parallel to session_vars; null = drop the var) into
 /// the systemd user manager and the D-Bus activation environment. Apps
 /// started through D-Bus/systemd never see our process env - without
-/// this they inherit whichever login session set the vars last (e.g.
-/// mango's socket when zylr runs nested).
+/// this they inherit whichever login session set the vars last
 pub fn updateActivationEnv(
     context: *ServerContext,
     values: anytype,

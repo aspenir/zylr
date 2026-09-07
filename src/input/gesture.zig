@@ -4,11 +4,11 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const config = @import("../config.zig");
+const Config = @import("../config.zig");
 const KeyboardContext = @import("keyboard.zig");
 const View = @import("../view/view.zig");
-const nd = @import("../view/utils/node_data.zig");
-const Action = config.Action;
+const NodeData = @import("../view/utils/node_data.zig");
+const Action = Config.Action;
 
 const GestureContext = @This();
 
@@ -21,7 +21,7 @@ extern fn libinput_device_has_capability(device: *anyopaque, cap: c_uint) c_int;
 
 pointer: *wlroots.Pointer,
 context: *ServerContext,
-device_kind: config.GestureDevice,
+device_kind: Config.GestureDevice,
 
 swipe_begin_listener: wl.Listener(*wlroots.Pointer.event.SwipeBegin) = undefined,
 swipe_update_listener: wl.Listener(*wlroots.Pointer.event.SwipeUpdate) = undefined,
@@ -47,7 +47,7 @@ freed: bool = false,
 /// Touchscreen vs touchpad, from libinput caps. Touchscreens carry no
 /// GESTURE cap (libinput doesn't interpret their gestures), so TOUCH is
 /// checked first. Devices we can't classify match every bind.
-pub fn classify(device: *wlroots.InputDevice) config.GestureDevice {
+pub fn classify(device: *wlroots.InputDevice) Config.GestureDevice {
     const handle = device.getLibinputDevice() orelse return .both;
     const h: *anyopaque = @ptrCast(handle);
     if (libinput_device_has_capability(h, CAP_TOUCH) != 0) return .touch;
@@ -140,12 +140,12 @@ pub fn deinit(self: *GestureContext) void {
 /// First matching bind wins. A bind without `dir` matches any
 /// direction; `on` must equal the classified device unless `.both`.
 fn matchGesture(
-    gestures: []const config.CompiledGesture,
+    gestures: []const Config.CompiledGesture,
     fingers: u32,
-    kind: config.GestureKind,
-    dir: ?config.GestureDir,
-    device_kind: config.GestureDevice,
-) ?config.CompiledGesture {
+    kind: Config.GestureKind,
+    dir: ?Config.GestureDir,
+    device_kind: Config.GestureDevice,
+) ?Config.CompiledGesture {
     for (gestures) |g| {
         if (g.fingers != fingers or g.kind != kind) continue;
         if (g.dir) |d| {
@@ -161,10 +161,10 @@ fn matchGesture(
 /// Shared by the libinput-gesture path and the raw-touchscreen detector.
 pub fn fire(
     context: *ServerContext,
-    device_kind: config.GestureDevice,
+    device_kind: Config.GestureDevice,
     fingers: u32,
-    kind: config.GestureKind,
-    dir: ?config.GestureDir,
+    kind: Config.GestureKind,
+    dir: ?Config.GestureDir,
     target_view: ?*View,
 ) void {
     // Cooldown between consecutive firings (config.gesture_repeat).
@@ -194,14 +194,14 @@ pub fn fire(
 
 fn dispatch(
     self: *GestureContext,
-    kind: config.GestureKind,
-    dir: ?config.GestureDir,
+    kind: Config.GestureKind,
+    dir: ?Config.GestureDir,
 ) void {
     fire(self.context, self.device_kind, self.fingers, kind, dir, viewAtCursor(self.context));
 }
 
 fn viewAtCursor(context: *ServerContext) ?*View {
-    const hit = nd.resolveAt(&context.scene.tree, context.cursor.x, context.cursor.y) orelse return null;
+    const hit = NodeData.resolveAt(&context.scene.tree, context.cursor.x, context.cursor.y) orelse return null;
     return switch (hit.data.*) {
         .view => |view| @as(*View, @ptrCast(@alignCast(view))),
         .layer => null,
@@ -252,7 +252,7 @@ fn onSwipeEnd(
 
     // Dominant axis past the threshold names the direction; a too-short
     // swipe only matches binds that left `dir` unset.
-    const dir: ?config.GestureDir = blk: {
+    const dir: ?Config.GestureDir = blk: {
         const threshold = self.context.cfg.gestures.trackpad.swipe_min_px;
         if (@abs(self.dx) > threshold or @abs(self.dy) > threshold) {
             if (@abs(self.dx) > @abs(self.dy)) {
@@ -311,7 +311,7 @@ fn onPinchEnd(
 ) void {
     const self: *GestureContext = @fieldParentPtr("pinch_end_listener", listener);
 
-    const dir: ?config.GestureDir = blk: {
+    const dir: ?Config.GestureDir = blk: {
         const threshold = self.context.cfg.gestures.trackpad.pinch_scale;
         if (self.scale > 1 + threshold) break :blk .out;
         if (self.scale < 1 - threshold) break :blk .in;
@@ -357,7 +357,7 @@ fn onHoldEnd(
 }
 
 test "matchGesture fingers/kind/dir/device" {
-    const gestures = [_]config.CompiledGesture{
+    const gestures = [_]Config.CompiledGesture{
         .{ .fingers = 3, .kind = .swipe, .dir = .left, .on = .both, .action = .focus_right },
         .{ .fingers = 2, .kind = .pinch, .dir = null, .on = .trackpad, .action = .close },
         .{ .fingers = 4, .kind = .swipe, .dir = .down, .on = .touch, .action = .shrink },
