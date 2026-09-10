@@ -4,6 +4,7 @@ const ServerContext = @import("server.zig");
 const View = @import("view/view.zig");
 const ViewManager = @import("view/view_manager.zig");
 const Mirror = @import("mirror.zig");
+const AnimationManager = @import("view/animation.zig");
 
 /// Switch the active row to `new`. Ownership model:
 ///   - The ACTIVE row lives in the shared working set (context.views,
@@ -19,14 +20,19 @@ pub fn switchTo(context: *ServerContext, new_row: usize) void {
     if (new_row == context.active_row) return;
     std.debug.assert(new_row < ServerContext.max_rows);
 
-    // Destroy outgoing row's mirror trees (they'll be rebuilt on reactivation).
-    Mirror.deactivateMirrors(context, context.active_row);
-    // Hide the outgoing row's windows before they get parked.
-    setRowVisible(context, context.active_row, false);
+    // A switch while a transition is still in flight: settle it first (its
+    // outgoing row is still rendered) before sliding a new pair.
+    settleTransition(context);
+
+    const from_row = context.active_row;
+
+    // Destroy the outgoing row's mirror trees (they'll be rebuilt on
+    // reactivation). Its windows stay visible to slide out.
+    Mirror.deactivateMirrors(context, from_row);
 
     // Stash the current working set into the outgoing row.
-    std.debug.assert(context.rows[context.active_row] == null);
-    context.rows[context.active_row] = .{
+    std.debug.assert(context.rows[from_row] == null);
+    context.rows[from_row] = .{
         .views = context.views,
         .animation_x = context.animation_x,
         .animation_w = context.animation_w,
@@ -59,6 +65,51 @@ pub fn switchTo(context: *ServerContext, new_row: usize) void {
     // Rebuild and position mirrors for the newly active row.
     Mirror.activateMirrors(context, new_row);
     context.animation_active = true;
+    AnimationManager.wake(context);
+
+    // Start the slide/fade. Frame 0: the incoming row is fully transparent
+    // (content would flash at rest position before the slide begins) and its
+    // borders dropped (a scene rect can't fade); the tick slides both rows
+    // and fades the border in with the window.
+    for (context.views.items) |view| {
+        if (view.border) |*b| b.rect.node.setEnabled(false);
+        AnimationManager.setTreeOpacity(&view.scene_tree.node, 0);
+    }
+    for (context.row_mirrors[context.active_row].items) |*m| {
+        AnimationManager.setTreeOpacity(&m.tree.node, 0);
+    }
+    const slide: f32 = @floatFromInt(@max(1, context.usable_area.height));
+    context.row_anim = .{
+        .from_row = from_row,
+        .dir = if (new_row > from_row) @as(i32, 1) else -1,
+        .slide = slide,
+        .started = context.nowMs(),
+    };
+}
+
+/// End the current transition (completion, or pre-empted by the next
+/// switch): un-render the outgoing row for good, restore full opacity, and
+/// forget the state. Idempotent when no transition is in flight.
+pub fn settleTransition(context: *ServerContext) void {
+    const t = context.row_anim orelse return;
+    resetRowOpacity(context, t.from_row);
+    setRowVisible(context, t.from_row, false);
+    resetRowOpacity(context, context.active_row);
+    context.row_anim = null;
+}
+
+/// Restore full opacity on every window and mirror tree of `row` (only the
+/// trees a transition may have faded).
+fn resetRowOpacity(context: *ServerContext, row: usize) void {
+    for (viewsOf(context, row)) |view| AnimationManager.setTreeOpacity(&view.scene_tree.node, 1.0);
+    for (context.row_mirrors[row].items) |*m| AnimationManager.setTreeOpacity(&m.tree.node, 1.0);
+}
+
+/// The window list for `row` (working set if active, parked if not).
+fn viewsOf(context: *ServerContext, row: usize) []const *View {
+    if (row == context.active_row) return context.views.items;
+    if (context.rows[row]) |parked| return parked.views.items;
+    return &.{};
 }
 
 /// Enable or disable the scene trees (and borders) of every window in
@@ -66,13 +117,7 @@ pub fn switchTo(context: *ServerContext, new_row: usize) void {
 /// Mapped surface state is untouched: windows stay "mapped" to their
 /// clients but are hidden from the output until their row is active.
 fn setRowVisible(context: *ServerContext, row: usize, visible: bool) void {
-    const views = if (row == context.active_row)
-        context.views.items
-    else if (context.rows[row]) |parked|
-        parked.views.items
-    else
-        &.{};
-    for (views) |view| {
+    for (viewsOf(context, row)) |view| {
         // A mirrored source's real surface stays hidden even when its row is
         // shown - its representations are mirrors, not the real surface.
         if (visible and Mirror.isHiddenSource(context, view)) continue;

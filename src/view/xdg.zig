@@ -599,11 +599,15 @@ pub fn commitToplevel(
         const left = context.usable_area.x;
         const right = ew - (context.usable_area.x + context.usable_area.width);
         ew -= left + right;
+        // Both side gaps stay visible even at ratio 1.0: the tile spans
+        // usable.width - 2*gaps, and its left edge sits at usable.x + gaps.
+        ew -= @as(c_int, @intCast(context.gaps_out * 2));
         eh = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
     }
 
     // A window resized by edge-drag keeps its width across commits.
-    // New windows default to a fraction of the output width.
+    // New windows default to a fraction of the usable width (post-waybar):
+    // ratio 1.0 fills the area next to the bar, never under it.
     if (view.custom_width) |w| {
         ew = w;
     } else {

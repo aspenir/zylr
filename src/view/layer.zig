@@ -37,6 +37,20 @@ fn recomputeUsableArea(context: *ServerContext) void {
         const ls = layer.layer_surface;
         if (!ls.initialized) continue;
         const st = ls.current;
+
+        std.log.info("usable: {s} ez={d} T={} B={} L={} R={} mT={d} mB={d} mL={d} mR={d}", .{
+            std.mem.span(ls.namespace),
+            st.exclusive_zone,
+            st.anchor.top,
+            st.anchor.bottom,
+            st.anchor.left,
+            st.anchor.right,
+            st.margin.top,
+            st.margin.bottom,
+            st.margin.left,
+            st.margin.right,
+        });
+
         if (st.exclusive_zone < 0) continue;
 
         const ez = st.exclusive_zone;
@@ -65,6 +79,10 @@ fn recomputeUsableArea(context: *ServerContext) void {
 
     if (usable.width < 0) usable.width = 0;
     if (usable.height < 0) usable.height = 0;
+
+    std.log.info("usabox: x={d} y={d} w={d} h={d}", .{
+        usable.x, usable.y, usable.width, usable.height,
+    });
 
     context.usable_area = usable;
 }

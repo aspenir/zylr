@@ -183,8 +183,11 @@ pub fn runAction(
         },
         .row_up, .row_down => {
             const dir: i32 = if (action == .row_up) -1 else 1;
-            const target: usize = @intCast(@as(i32, @intCast(context.active_row)) + dir);
-            if (target >= ServerContext.max_rows) return;
+            // Compute in signed space first: casting a negative i32 to a
+            // usize traps on row_up from the top row.
+            const target_signed: i32 = @as(i32, @intCast(context.active_row)) + dir;
+            if (target_signed < 0 or target_signed >= ServerContext.max_rows) return;
+            const target: usize = @intCast(target_signed);
             pushUndoEntry(context, .{ .row_switch = .{ .prev_row = context.active_row } });
             Row.switchTo(context, target);
             ViewManager.updateViewPositions(context);
@@ -213,9 +216,11 @@ pub fn runAction(
         .grow, .shrink => {
             const view = context.focused_view orelse return;
             pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_floating = view.floating } });
+            const base: f32 = @floatFromInt(@max(1, context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2))));
+            const step: f32 = base * 0.05;
             const cur: f32 = @floatFromInt(ViewManager.getViewWidth(view));
-            const factor: f32 = if (action == .grow) 1.15 else 1.0 / 1.15;
-            view.custom_width = @max(200, @as(i32, @intFromFloat(cur * factor)));
+            const new_w: f32 = if (action == .grow) cur + step else cur - step;
+            view.custom_width = @max(200, @as(i32, @intFromFloat(new_w)));
             const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
             relayoutView(context, view, idx);
         },
@@ -278,11 +283,15 @@ pub fn runAction(
                 var ow: c_int = 0;
                 var oh: c_int = 0;
                 context.output.?.effectiveResolution(&ow, &oh);
+                // width_ratio scales the usable width (post-waybar): ratio
+                // 1.0 fills the area next to the bar.
                 var ew: c_int = ow - 2 * context.gaps_out;
                 if (context.usable_area.width > 0) {
                     const left = context.usable_area.x;
                     const right = ow - (context.usable_area.x + context.usable_area.width);
                     ew -= left + right;
+                    // Both side gaps stay visible even at ratio 1.0.
+                    ew -= 2 * context.gaps_out;
                 }
                 const tw: i32 = @intFromFloat(@as(f32, @floatFromInt(ew)) * context.view_width_ratio);
                 view.custom_width = tw;

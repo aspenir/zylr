@@ -67,6 +67,20 @@ pub const Row = struct {
     scroll_x: i32 = 0,
     target_x: i32 = 0,
 };
+/// A row-switch slide/fade in flight. The outgoing row's windows stay
+/// rendered (parked in `rows[]`) while the incoming row slides in over
+/// them; the animation tick animates both rows and settles when done.
+pub const RowAnim = struct {
+    /// Row being switched away FROM; its windows slide out.
+    from_row: usize,
+    /// +1 for a downward switch (incoming slides in from below),
+    /// -1 for an upward switch (incoming from above).
+    dir: i32,
+    /// Distance (px) both rows travel: the active row's vertical extent.
+    slide: f32,
+    /// Monotonic ms at which the transition started.
+    started: u64,
+};
 
 pub const Mirror = struct {
     view: *View,
@@ -155,6 +169,8 @@ animation_x: std.ArrayListUnmanaged(f32) = .empty,
 animation_w: std.ArrayListUnmanaged(f32) = .empty,
 animation_active: bool = false,
 animation_timer: ?*wl.EventSource = null,
+    /// Row-switch slide/fade in flight; null when no switch is animating.
+    row_anim: ?RowAnim = null,
 // Tiled-column slot lefts (absolute), cached for the cursor's
 // resize-edge binary search. Rebuilt only when a layout pass bumps
 // layout_seq; read only up to resize_len.

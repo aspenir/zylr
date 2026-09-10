@@ -5,6 +5,7 @@ const std = @import("std");
 
 const NodeData = @import("utils/node_data.zig").NodeData;
 const ServerContext = @import("../server.zig");
+const Row = @import("../row.zig");
 const Border = @import("border.zig");
 const Blur = @import("blur.zig");
 const FocusManager = @import("focus.zig");
@@ -177,10 +178,18 @@ pub fn onRequestActivate(
 
     if (!view.isMapped()) return;
 
+    const context = view.context;
+
+    // The taskbar lists every row's windows; a click on a window living
+    // on another row must switch to that row before it can be focused.
+    if (Row.rowOf(context, view)) |row| {
+        if (row != context.active_row) Row.switchTo(context, row);
+    }
+
     // Don't scroll the viewport away from wherever the user is looking
     // unless the window is actually off-screen.
-    ViewManager.scrollIntoView(view.context, view);
-    FocusManager.setFocus(view.context, .{
+    ViewManager.scrollIntoView(context, view);
+    FocusManager.setFocus(context, .{
         .view = .{
             .view = view,
             .surface = view.surface(),
@@ -239,6 +248,16 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
     // checks and the XWayland configure targets below would use stale
     // coordinates (scrollToView used to recompute internally).
     ViewManager.updateViewPositions(context);
+
+    std.log.info("PLACE view x={d} y={d} slot_w={d} slot_h={d} vp={d} float={} fs={}", .{
+        view.x,
+        view.y,
+        view.slot_w,
+        view.slot_h,
+        context.viewport_x,
+        view.floating,
+        view.fullscreen,
+    });
 
     // Bring the mapped window into view WITHOUT re-centering the
     // viewport. scrollToView on every map (loading window, then main
