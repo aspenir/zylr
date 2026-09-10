@@ -317,6 +317,10 @@ pub fn scrollToViewNoLayout(
 ) void {
     const output = context.output orelse return;
 
+    // A row-switch slide owns the viewport for its duration; the animation
+    // tick recentres on the focused window once the transition settles.
+    if (context.row_anim != null) return;
+
     var out_w: c_int = 0;
     var out_h: c_int = 0;
     output.effectiveResolution(&out_w, &out_h);
@@ -324,5 +328,12 @@ pub fn scrollToViewNoLayout(
     const view_width = getViewWidth(view);
     const target = view.x + @divTrunc(view_width, 2) - @divTrunc(out_w, 2);
 
-    context.viewport_target = @max(0, target);
+    // Clamp the centered viewport so the tile's left edge never slides
+    // under a reserved layer-shell strip (e.g. waybar on the left): a
+    // full-width tile would otherwise self-center its left edge off
+    // screen, underneath the bar. At the limit the tile sits flush at
+    // the usable left edge instead.
+    const max_vp = view.x - context.usable_area.x - @as(i32, @intCast(context.gaps_out));
+
+    context.viewport_target = @max(0, @min(target, max_vp));
 }

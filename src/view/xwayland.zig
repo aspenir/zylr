@@ -337,6 +337,8 @@ pub fn commitSurface(
         const left = context.usable_area.x;
         const right = ew - (context.usable_area.x + context.usable_area.width);
         ew -= left + right;
+        // Both side gaps stay visible even at ratio 1.0.
+        ew -= @as(c_int, @intCast(context.gaps_out * 2));
         eh = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
     }
 

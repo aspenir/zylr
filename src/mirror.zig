@@ -921,7 +921,10 @@ fn placeWindowCluster(context: *ServerContext, mirrors: *std.ArrayListUnmanaged(
 fn mirrorWidth(context: *ServerContext, src: *View) i32 {
     const vw = ViewManager.getViewWidth(src);
     if (vw > 0) return vw;
-    return @as(i32, @intFromFloat(@as(f32, @floatFromInt(@max(1, context.usable_area.width))) * context.view_width_ratio)) + 2 * @as(i32, @intCast(context.border_width));
+    // The ratio scales the usable width (post-waybar), minus both side gaps
+    // so ratio 1.0 keeps a gap on either edge.
+    const bw_usable = @max(1, context.usable_area.width - @as(i32, @intCast(context.gaps_out * 2)));
+    return @as(i32, @intFromFloat(@as(f32, @floatFromInt(bw_usable)) * context.view_width_ratio)) + 2 * @as(i32, @intCast(context.border_width));
 }
 
 /// True if `view` is one of the windows of `row`.

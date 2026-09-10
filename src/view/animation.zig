@@ -1,9 +1,26 @@
-const std = @import("std");
-
-const ServerContext = @import("../server.zig");
+const std = @import("std");const ServerContext = @import("../server.zig");
 const Border = @import("border.zig");
 const ViewManager = @import("view_manager.zig");
+const Row = @import("../row.zig");
 const Mirror = @import("../mirror.zig");
+const wlroots = @import("wlroots");
+
+/// Length of a row-switch slide/fade in ms.
+const row_transition_ms: u64 = 220;
+
+/// Set the opacity of every scene buffer under `node` (a window's or mirror
+/// tree) to `opacity` (0..1). Borders are scene rects, not buffers, and are
+/// deliberately left alone.
+pub fn setTreeOpacity(node: *wlroots.SceneNode, opacity: f32) void {
+    var value: f32 = opacity;
+    node.forEachBuffer(*f32, setBufferOpacity, &value);
+}
+
+fn setBufferOpacity(buffer: *wlroots.SceneBuffer, sx: c_int, sy: c_int, data: *f32) void {
+    _ = sx;
+    _ = sy;
+    buffer.setOpacity(data.*);
+}
 
 pub fn wake(context: *ServerContext) void {
     if (context.animation_timer) |timer| {
@@ -28,6 +45,40 @@ pub fn tick(context: *ServerContext) void {
     if (!context.animation_active) return;
 
     var still_animating = false;
+
+    // Row-switch slide: the outgoing row (parked but still rendered) slides
+    // out and fades while the incoming row slides in over it.
+    var slide_off: f32 = 0; // incoming y offset from the slide
+    var fade: f32 = 1; // incoming opacity
+    if (context.row_anim) |t| {
+        const elapsed = context.nowMs() - t.started;
+        if (elapsed >= row_transition_ms) {
+            // Slide complete: retire the outgoing row, restore full
+            // opacity, then centre the viewport on the focused window.
+            Row.settleTransition(context);
+            if (context.focused_view) |fv| ViewManager.scrollToView(context, fv);
+        } else {
+            const p = @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(row_transition_ms));
+            const smooth = p * p * (3.0 - 2.0 * p); // smoothstep
+            const dir: f32 = @floatFromInt(t.dir);
+            // Both rows translate the same way (a rigid scroll): the
+            // incoming row enters from the switch direction while the
+            // outgoing one exits past the opposite edge.
+            const outgoing_off: c_int = @intFromFloat(@round(-t.slide * smooth * dir));
+            if (context.rows[t.from_row]) |parked| {
+                for (parked.views.items) |v| {
+                    v.scene_tree.node.setPosition(
+                        v.x - parked.scroll_x,
+                        v.y - context.viewport_y + outgoing_off,
+                    );
+                    setTreeOpacity(&v.scene_tree.node, 1.0 - smooth);
+                }
+            }
+            slide_off = t.slide * (1.0 - smooth) * dir;
+            fade = smooth;
+            still_animating = true;
+        }
+    }
 
     // Animate the viewport scroll offset.
     const target_vp: f32 = @floatFromInt(context.viewport_target);
@@ -112,8 +163,16 @@ pub fn tick(context: *ServerContext) void {
 
         const viewport_x: f32 = @floatFromInt(context.viewport_x);
         const scene_x: c_int = @intFromFloat(current - viewport_x);
-        const scene_y: c_int = view.y - context.viewport_y;
+        var scene_y: c_int = view.y - context.viewport_y;
+        if (fade < 1.0) scene_y += @intFromFloat(@round(slide_off));
         view.scene_tree.node.setPosition(scene_x, scene_y);
+        if (fade < 1.0) {
+            setTreeOpacity(&view.scene_tree.node, fade);
+            // Windows fade in at the incoming offset; the border is a scene
+            // rect (no opacity), so bring it back once more than a sliver
+            // of the window is visible.
+            if (view.border) |*b| b.rect.node.setEnabled(fade > 0.02);
+        }
 
         // Lay this view's mirrors (self-mirror + same-row copies) into the
         // active tiled flow so they scroll and animate like real tiles.
@@ -127,6 +186,11 @@ pub fn tick(context: *ServerContext) void {
         slot_x += w_items[i] + @as(f32, @floatFromInt(context.gaps_in));
         // Same-row mirror copies extend the tile flow after their window.
         slot_x += @floatFromInt(Mirror.extraTilesWidth(context, view));
+    }
+
+    // Fade the incoming row's mirrors in step with their windows.
+    if (fade < 1.0) {
+        for (context.row_mirrors[context.active_row].items) |*m| setTreeOpacity(&m.tree.node, fade);
     }
 
     context.animation_active = still_animating;
