@@ -33,6 +33,9 @@ pub const Action = enum {
     /// Mirror the focused view to the row given as the first arg ("mirror", "0").
     /// Creates a mirror showing the same live content on the target row.
     mirror,
+    /// Enter the submap named by the first arg ("submap", "resize"); its
+    /// binds then match first until an action or unmatched key leaves it.
+    submap,
 };
 
 pub const Bind = struct {
@@ -40,6 +43,9 @@ pub const Bind = struct {
     action: Action,
     args: ?[]const []const u8 = null,
     through_lock: bool = false,
+    /// The submap (mode) this bind belongs to; null = the always-active root
+    /// bind set. Submaps are entered by an action=.submap bind (arg = name).
+    submap: ?[]const u8 = null,
 };
 
 pub const GestureKind = enum { swipe, pinch, hold };
@@ -217,6 +223,13 @@ pub const CompiledBind = struct {
     through_lock: bool = false,
 };
 
+/// A submap compiled the same way as the root binds, looked up by name when
+/// `context.active_submap` is set.
+pub const CompiledSubmap = struct {
+    name: []const u8,
+    binds: []const CompiledBind,
+};
+
 /// A gesture bind resolved against live gesture events; matched by
 /// integer comparisons in gesture.zig.
 pub const CompiledGesture = struct {
@@ -300,15 +313,71 @@ fn optDupeZ(a: std.mem.Allocator, s: []const u8) !?[*:0]const u8 {
     return (try dupeZ(a, s)).ptr;
 }
 
-fn compileBinds(a: std.mem.Allocator, binds: []const Bind) ![]CompiledBind {
-    const out = try a.alloc(CompiledBind, binds.len);
-    for (binds, 0..) |b, i| {
-        const pk = try parseKey(b.key);
-        const args = b.args orelse &.{};
-        if (b.action == .spawn and args.len == 0) return error.SpawnWithoutArgs;
-        out[i] = .{ .mods = pk.mods, .sym = pk.sym, .action = b.action, .args = args, .through_lock = b.through_lock };
+fn compileBind(a: std.mem.Allocator, b: Bind) !CompiledBind {
+    _ = a;
+    const pk = try parseKey(b.key);
+    const args = b.args orelse &.{};
+    if (b.action == .spawn and args.len == 0) return error.SpawnWithoutArgs;
+    if (b.action == .submap and args.len == 0) return error.SubmapWithoutName;
+    return .{ .mods = pk.mods, .sym = pk.sym, .action = b.action, .args = args, .through_lock = b.through_lock };
+}
+
+/// Compiled root binds plus the submaps grouped out of the same flat list by
+/// each bind's `submap` name (binds with a submap never fire from the root).
+pub const CompiledKeybinds = struct {
+    binds: []const CompiledBind,
+    submaps: []const CompiledSubmap,
+};
+
+fn compileKeybinds(a: std.mem.Allocator, binds: []const Bind) !CompiledKeybinds {
+    // Distinct submap names in first-seen order.
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var n_root: usize = 0;
+    for (binds) |b| {
+        const name = b.submap orelse {
+            n_root += 1;
+            continue;
+        };
+        var seen = false;
+        for (names.items) |n| {
+            if (std.mem.eql(u8, n, name)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try names.append(a, name);
     }
-    return out;
+
+    const submaps = try a.alloc(CompiledSubmap, names.items.len);
+    for (names.items, 0..) |name, i| {
+        var n: usize = 0;
+        for (binds) |b| {
+            if (b.submap) |s| {
+                if (std.mem.eql(u8, s, name)) n += 1;
+            }
+        }
+        const sbinds = try a.alloc(CompiledBind, n);
+        var k: usize = 0;
+        for (binds) |b| {
+            if (b.submap) |s| {
+                if (std.mem.eql(u8, s, name)) {
+                    sbinds[k] = try compileBind(a, b);
+                    k += 1;
+                }
+            }
+        }
+        submaps[i] = .{ .name = name, .binds = sbinds };
+    }
+
+    const root = try a.alloc(CompiledBind, n_root);
+    var ri: usize = 0;
+    for (binds) |b| {
+        if (b.submap == null) {
+            root[ri] = try compileBind(a, b);
+            ri += 1;
+        }
+    }
+    return .{ .binds = root, .submaps = submaps };
 }
 
 fn compileGestures(a: std.mem.Allocator, binds: []const GestureBind) ![]CompiledGesture {
@@ -360,6 +429,7 @@ pub const Loaded = struct {
     binds: []const CompiledBind,
     gestures: []const CompiledGesture,
     switches: []const CompiledSwitch,
+    submaps: []const CompiledSubmap,
     border_color: [4]f32,
     xkb_names: xkb.RuleNames,
 };
@@ -400,6 +470,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, log_missing: bool) Loaded {
         .binds = &.{},
         .gestures = &.{},
         .switches = &.{},
+        .submaps = &.{},
         .border_color = .{ 0.3, 0.6, 1.0, 1.0 },
         .xkb_names = .{ .rules = null, .model = null, .layout = "gb", .variant = null, .options = null },
     };
@@ -429,10 +500,12 @@ pub fn load(io: std.Io, a: std.mem.Allocator, log_missing: bool) Loaded {
         },
     }
 
-    loaded.binds = compileBinds(a, cfg.keybinds) catch blk: {
+    const kb = compileKeybinds(a, cfg.keybinds) catch blk: {
         std.log.err("config: bad keybind, keeping default binds", .{});
-        break :blk compileBinds(a, &default_keybinds) catch unreachable;
+        break :blk compileKeybinds(a, &default_keybinds) catch unreachable;
     };
+    loaded.binds = kb.binds;
+    loaded.submaps = kb.submaps;
 
     loaded.gestures = compileGestures(a, cfg.gestures.binds) catch blk: {
         std.log.err("config: bad gesture bind, disabling gestures", .{});
@@ -519,10 +592,11 @@ test "ziggy document deserializes into Config" {
 
     try std.testing.expectEqualStrings("de", cfg.keyboard.custom.layout);
 
-    const binds = try compileBinds(a, cfg.keybinds);
-    try std.testing.expectEqual(@as(usize, 2), binds.len);
-    try std.testing.expectEqual(Action.spawn, binds[0].action);
-    try std.testing.expectEqualStrings("alacritty", binds[0].args[0]);
+    const kb = try compileKeybinds(a, cfg.keybinds);
+    try std.testing.expectEqual(@as(usize, 2), kb.binds.len);
+    try std.testing.expectEqual(Action.spawn, kb.binds[0].action);
+    try std.testing.expectEqualStrings("alacritty", kb.binds[0].args[0]);
+    try std.testing.expectEqual(@as(usize, 0), kb.submaps.len);
 
     const color = try parseColor(cfg.decorations.border.color);
     try std.testing.expectEqual(@as(f32, 1), color[0]);
@@ -554,4 +628,40 @@ test "compileGestures rejects direction/kind mismatches" {
 
 fn expectInvalid(a: std.mem.Allocator, binds: []const GestureBind) !void {
     try std.testing.expectError(error.InvalidGestureDir, compileGestures(a, binds));
+}
+
+test "submaps group out of the flat keybind list" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const kb = try compileKeybinds(a, &.{
+        // Root bind: enters the resize submap.
+        .{ .key = "Super+r", .action = .submap, .args = &.{"resize"} },
+        // resize submap binds (interleaved with root binds on purpose).
+        .{ .key = "h", .action = .shrink, .submap = "resize" },
+        .{ .key = "Super+q", .action = .close },
+        // Nested: from resize, enter the other submap.
+        .{ .key = "g", .action = .submap, .args = &.{"other"}, .submap = "resize" },
+        .{ .key = "k", .action = .row_up, .submap = "other" },
+    });
+
+    // Root set: only binds without a submap.
+    try std.testing.expectEqual(@as(usize, 2), kb.binds.len);
+    try std.testing.expectEqual(Action.submap, kb.binds[0].action);
+    try std.testing.expectEqual(Action.close, kb.binds[1].action);
+    // Root binds never include submapped ones.
+    for (kb.binds) |b| try std.testing.expect(b.action != .shrink);
+
+    try std.testing.expectEqual(@as(usize, 2), kb.submaps.len);
+    try std.testing.expectEqualStrings("resize", kb.submaps[0].name);
+    try std.testing.expectEqual(@as(usize, 2), kb.submaps[0].binds.len);
+    try std.testing.expectEqual(Action.shrink, kb.submaps[0].binds[0].action);
+    try std.testing.expectEqualStrings("other", kb.submaps[0].binds[1].args[0]);
+    try std.testing.expectEqualStrings("other", kb.submaps[1].name);
+    try std.testing.expectEqual(Action.row_up, kb.submaps[1].binds[0].action);
+
+    try std.testing.expectError(error.SubmapWithoutName, compileKeybinds(a, &.{
+        .{ .key = "x", .action = .submap },
+    }));
 }

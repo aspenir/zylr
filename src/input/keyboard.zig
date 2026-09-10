@@ -203,6 +203,13 @@ pub fn runAction(
             if (row_idx >= ServerContext.max_rows) return;
             Mirror.mirrorToRow(context, view, row_idx);
         },
+        .submap => {
+            // Enter the named mode; its binds match first from the next
+            // press until an action or an unmatched key leaves it.
+            if (args) |a| {
+                if (a.len > 0) context.active_submap = a[0];
+            }
+        },
         .grow, .shrink => {
             const view = context.focused_view orelse return;
             pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_floating = view.floating } });
@@ -218,6 +225,9 @@ pub fn runAction(
             a.free(context.keybinds);
             a.free(context.gestures);
             a.free(context.switches);
+            a.free(context.submaps);
+            // A reloaded config may rename/remove submaps; leave the mode.
+            context.active_submap = null;
             if (context.xkb_names.rules) |p| a.free(std.mem.span(p));
             if (context.xkb_names.model) |p| a.free(std.mem.span(p));
             if (context.xkb_names.layout) |p| a.free(std.mem.span(p));
@@ -359,6 +369,54 @@ pub fn runAction(
     }
 }
 
+fn submapBinds(context: *ServerContext, name: []const u8) ?[]const Config.CompiledBind {
+    for (context.submaps) |s| {
+        if (std.mem.eql(u8, s.name, name)) return s.binds;
+    }
+    return null;
+}
+
+/// Match `norm_sym` (+ mods) against `binds` with the same gating as the
+/// root bind set (locked passthrough, hold-repeat, cooldown). A hit runs the
+/// action and returns to the root binds (helix-style: the mode is a prefix,
+/// not a sticky layer), or enters the named submap and stays in it.
+/// Returns true when the keypress belonged to `binds` (fired or held).
+fn dispatchKey(
+    keyboard_context: *KeyboardContext,
+    context: *ServerContext,
+    binds: []const Config.CompiledBind,
+    norm_sym: u32,
+    depressed: u32,
+) bool {
+    for (binds) |bind| {
+        if (bind.sym != norm_sym or bind.mods != depressed) continue;
+        // Locked: only binds marked through_lock run here; anything
+        // else falls through to the client below.
+        if (context.locked and !bind.through_lock) continue;
+
+        if (!context.locked) {
+            const rep = context.keybind_repeat;
+            const now = context.nowMs();
+            const is_hold = keyboard_context.bind_hold_sym == norm_sym;
+            const within_cooldown = rep.cooldown_ms > 0 and
+                (now - keyboard_context.last_fire_ms) < rep.cooldown_ms;
+            // A held key only re-fires if repeats are enabled;
+            // otherwise the first press is the only one.
+            const suppressed = (!rep.enabled and is_hold) or within_cooldown;
+            keyboard_context.bind_hold_sym = norm_sym;
+            if (suppressed) return true; // consumed; keep any active submap
+            keyboard_context.last_fire_ms = now;
+        }
+
+        const entering = bind.action == .submap;
+        runAction(context, bind.action, bind.args, null);
+        // Entering a mode keeps it; any other action ends the mode.
+        if (!entering) context.active_submap = null;
+        return true;
+    }
+    return false;
+}
+
 pub fn onKeyboardKey(
     listener: *wl.Listener(*wlroots.Keyboard.event.Key),
     event: *wlroots.Keyboard.event.Key,
@@ -395,28 +453,16 @@ pub fn onKeyboardKey(
         // Normalize event keysym to lowercase so "Super+Shift+h"
         // (compiled as keysym=0x68) matches the shifted keysym (0x48).
         const norm_sym: u32 = if (sym_int >= 'A' and sym_int <= 'Z') sym_int + 32 else sym_int;
-        for (context.keybinds) |bind| {
-            if (bind.sym != norm_sym or bind.mods != depressed) continue;
-            // Locked: only binds marked through_lock run here; anything
-            // else falls through to the client below.
-            if (context.locked and !bind.through_lock) continue;
 
-            if (!context.locked) {
-                const rep = context.keybind_repeat;
-                const now = context.nowMs();
-                const is_hold = keyboard_context.bind_hold_sym == norm_sym;
-                const within_cooldown = rep.cooldown_ms > 0 and
-                    (now - keyboard_context.last_fire_ms) < rep.cooldown_ms;
-                // A held key only re-fires if repeats are enabled;
-                // otherwise the first press is the only one.
-                const suppressed = (!rep.enabled and is_hold) or within_cooldown;
-                keyboard_context.bind_hold_sym = norm_sym;
-                if (suppressed) return;
-                keyboard_context.last_fire_ms = now;
+        // Submap (mode) active: its binds match first. A key that matches
+        // nothing leaves the mode so the next key is back to the root binds.
+        if (context.active_submap) |name| {
+            if (submapBinds(context, name)) |sbinds| {
+                if (dispatchKey(keyboard_context, context, sbinds, norm_sym, depressed)) return;
             }
-            runAction(context, bind.action, bind.args, null);
-            return;
+            context.active_submap = null;
         }
+        if (dispatchKey(keyboard_context, context, context.keybinds, norm_sym, depressed)) return;
     }
 
     // The seat broadcasts ONE keymap to all clients, so it must follow the
