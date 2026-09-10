@@ -176,6 +176,10 @@ focused_border_color: [4]f32 = .{ 0.3, 0.6, 1.0, 1.0 },
 corner_radius: i32 = 16,
 /// Compiled keybind table (see config.zig); matched on every keypress.
 keybinds: []const Config.CompiledBind = &.{},
+    /// Compiled submap bind sets (see config `submaps`).
+    submaps: []const Config.CompiledSubmap = &.{},
+    /// Name of the currently active submap (mode); null = root bind set.
+    active_submap: ?[]const u8 = null,
 /// Compiled gesture table; matched at swipe/pinch/hold end.
 gestures: []const Config.CompiledGesture = &.{},
 /// Compiled switch table; matched on lid/tablet-mode toggle.
@@ -351,6 +355,7 @@ pub fn applyConfig(self: *@This(), loaded: Config.Loaded) void {
     self.keybinds = loaded.binds;
     self.gestures = loaded.gestures;
     self.switches = loaded.switches;
+    self.submaps = loaded.submaps;
     self.xkb_names = loaded.xkb_names;
     self.corner_radius = loaded.cfg.decorations.rounding;
     self.border_width = loaded.cfg.decorations.border.width;
