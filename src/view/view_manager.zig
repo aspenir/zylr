@@ -3,30 +3,46 @@ const wlroots = @import("wlroots");
 
 const ServerContext = @import("../server.zig");
 const View = @import("view.zig");
-const border_mod = @import("border.zig");
+const Border = @import("border.zig");
 const AnimationManager = @import("animation.zig");
+const Mirror = @import("../mirror.zig");
+
+const Row = @import("../row.zig");
 
 pub fn removeView(
     context: *ServerContext,
     view: *View,
 ) void {
-    const i = std.mem.indexOfScalar(*View, context.views.items, view) orelse {
-        std.log.warn(
-            "Tried to remove View that was not in context.views",
-            .{},
-        );
+    // A closing window may live on an inactive row: each workspace row
+    // parks its own window list, so remove it from whichever row owns it.
+    const row = Row.rowOf(context, view) orelse {
+        std.log.warn("Tried to remove View not in any row", .{});
         return;
     };
-    // animation_x is appended in lockstep with views, but guard the
+    const arr = if (row == context.active_row) blk: {
+        break :blk &context.views;
+    } else blk: {
+        // Guaranteed non-null for an inactive row that owns a view.
+        break :blk &context.rows[row].?.views;
+    };
+    const i = std.mem.indexOfScalar(*View, arr.items, view) orelse return;
+
+    // animation_x/w are appended in lockstep with views, but guard the
     // remove anyway: if its append failed (OOM) the lists diverge and
     // indexing it by the views index would read out of bounds.
-    if (i < context.animation_x.items.len) {
-        _ = context.animation_x.orderedRemove(i);
+    const ax = if (row == context.active_row) &context.animation_x else &context.rows[row].?.animation_x;
+    const aw = if (row == context.active_row) &context.animation_w else &context.rows[row].?.animation_w;
+    if (i < ax.items.len) _ = ax.orderedRemove(i);
+    if (i < aw.items.len) _ = aw.orderedRemove(i);
+    _ = arr.orderedRemove(i);
+
+    // The window whose mirror collapse opened `head_gap` is gone: release the
+    // gap so the next layout pass flows remaining windows from the row start
+    // (the animation retargets to the gap-free flow on its next tick).
+    if (context.head_gap_owner == view) {
+        context.head_gap = 0;
+        context.head_gap_owner = null;
     }
-    if (i < context.animation_w.items.len) {
-        _ = context.animation_w.orderedRemove(i);
-    }
-    _ = context.views.orderedRemove(i);
 }
 
 /// Move `view` to the column slot whose x-range covers `x` (logical px).
@@ -36,7 +52,7 @@ pub fn moveViewToSlot(
     view: *View,
     x: f64,
 ) void {
-    var slot_x: i32 = context.usable_area.x + context.gaps_out;
+    var slot_x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
     var target_index: ?usize = null;
 
     for (context.views.items, 0..) |candidate, i| {
@@ -89,7 +105,7 @@ pub fn applyFullscreen(context: *ServerContext, view: *View) void {
         view.scene_tree.node.raiseToTop();
         if (view.border) |*b| b.rect.node.setEnabled(false);
         // Clear rounded corners — scenefx clips them otherwise.
-        border_mod.clearAllBufferCorners(view);
+        Border.clearAllBufferCorners(view);
         // Clear any clips from the tiled layout so the surface fills
         // the entire output.
         if (view.surface_tree) |st| {
@@ -190,12 +206,13 @@ const CLOCK_MONOTONIC: c_int = 1;
 /// their borders are NOT touched, saving the dominant per-call cost
 /// (scene-graph mutations) for views that didn't move.
 pub fn updateViewPositionsFrom(context: *ServerContext, start_idx: usize) void {
-    var x: i32 = context.usable_area.x + context.gaps_out;
+    // Row-lead copies (dock_view == null) push the first window right.
+    var x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
 
     // Fast-forward x past the unchanged prefix.
     for (context.views.items[0..start_idx]) |view| {
         if (!view.isMapped() or view.floating or view.fullscreen) continue;
-        x += getViewWidth(view) + context.gaps_in;
+        x += getViewWidth(view) + context.gaps_in + Mirror.extraTilesWidth(context, view);
     }
 
     for (context.views.items[start_idx..]) |view| {
@@ -206,21 +223,21 @@ pub fn updateViewPositionsFrom(context: *ServerContext, start_idx: usize) void {
         view.x = x;
         view.y = context.usable_area.y + context.gaps_out;
 
-        border_mod.updateViewBorder(view, @floatFromInt(view.x), null);
+        Border.updateViewBorder(view, @floatFromInt(view.x), null);
 
-        x += width + context.gaps_in;
+        x += width + context.gaps_in + Mirror.extraTilesWidth(context, view);
     }
+    Mirror.layoutMirrorsAll(context);
     context.animation_active = true;
     AnimationManager.wake(context);
     context.layout_seq +|= 1;
 }
 
-
 /// Place windows at their targets immediately, skipping the position
 /// lerp. Used while interactively resizing so the layout tracks the
 /// cursor instead of rubber-banding behind it.
 pub fn layoutViews(context: *ServerContext) void {
-    var x: i32 = context.usable_area.x + context.gaps_out;
+    var x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
 
     for (context.views.items, 0..) |view, i| {
         if (!view.isMapped() or view.floating or view.fullscreen) continue;
@@ -235,10 +252,13 @@ pub fn layoutViews(context: *ServerContext) void {
             view.y - context.viewport_y,
         );
         context.animation_x.items[i] = @floatFromInt(view.x);
-        border_mod.updateViewBorder(view, @floatFromInt(view.x), null);
+        Border.updateViewBorder(view, @floatFromInt(view.x), null);
 
-        x += width + context.gaps_in;
+        // Same-row mirror copies are real tiles: advance past them too so the
+        // following windows shift right instead of overlapping the copy.
+        x += width + context.gaps_in + Mirror.extraTilesWidth(context, view);
     }
+    Mirror.layoutMirrorsAll(context);
     context.layout_seq +|= 1;
 }
 
@@ -272,6 +292,20 @@ pub fn scrollToView(
     // mapped windows (e.g. after a sibling was unmapped).
     updateViewPositions(context);
     scrollToViewNoLayout(context, view);
+}
+
+/// Center the viewport on an arbitrary tile (e.g. a mirrored copy mirror tile
+/// that isn't a window's home slot): the tile's center lands on the screen
+/// center, matching scrollToView's behaviour for windows. Clamped to 0.
+pub fn scrollToX(context: *ServerContext, x: i32, tile_w: i32) void {
+    const output = context.output orelse return;
+    var out_w: c_int = 0;
+    var out_h: c_int = 0;
+    output.effectiveResolution(&out_w, &out_h);
+    context.viewport_target = @max(0, x + @divTrunc(tile_w, 2) - @divTrunc(out_w, 2));
+    context.viewport_anim = @floatFromInt(context.viewport_x);
+    context.animation_active = true;
+    AnimationManager.wake(context);
 }
 
 /// Set the viewport target to center `view` without recomputing

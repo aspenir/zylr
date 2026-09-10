@@ -27,6 +27,12 @@ pub const Action = enum {
     /// output center, tiled views get the viewport scrolled to center them.
     center_window,
     dpms_off,
+    /// Switch to the workspace row above/below.
+    row_up,
+    row_down,
+    /// Mirror the focused view to the row given as the first arg ("mirror", "0").
+    /// Creates a mirror showing the same live content on the target row.
+    mirror,
 };
 
 pub const Bind = struct {
@@ -101,6 +107,10 @@ pub const GestureConfig = struct {
     touch: TouchGestureConfig = .{},
     trackpad: TrackpadGestureConfig = .{},
     binds: []const GestureBind = &.{},
+    /// Whether a gesture may re-fire while the gesture continues, and
+    /// the minimum gap between consecutive gesture firings. Gestures
+    /// default to firing once per gesture (old behavior).
+    repeat: RepeatConfig = .{ .enabled = false },
 };
 
 /// Re-fire policy for binds and gestures.
@@ -160,10 +170,6 @@ pub const Config = struct {
     idle: []const IdleTimer = &.{},
     /// Whether a keybind may re-fire on key auto-repeat, and how often.
     keybind_repeat: RepeatConfig = .{},
-    /// Whether a gesture may re-fire while the gesture continues, and
-    /// the minimum gap between consecutive gesture firings. Gestures
-    /// default to firing once per gesture (old behavior).
-    gesture_repeat: RepeatConfig = .{ .enabled = false },
     /// Give keyboard focus to the view under the pointer on hover
     /// (focus-follows-mouse) instead of only on click.
     focus_follows_mouse: bool = false,
@@ -181,8 +187,8 @@ pub const Config = struct {
 /// The bind set that used to be hardcoded in onKeyboardKey.
 const default_keybinds = [_]Bind{
     .{ .key = "Super+h", .action = .focus_left },
-    .{ .key = "Super+j", .action = .viewport_down },
-    .{ .key = "Super+k", .action = .viewport_up },
+    .{ .key = "Super+j", .action = .row_down },
+    .{ .key = "Super+k", .action = .row_up },
     .{ .key = "Super+l", .action = .focus_right },
     .{ .key = "Super+space", .action = .spawn, .args = &.{"fuzzel"} },
     .{ .key = "Super+v", .action = .toggle_floating },

@@ -35,7 +35,11 @@ custom_width: ?i32 = null,
 /// When true the view floats above the tiling layout: it keeps its
 /// current position and is excluded from tile calculations.
 floating: bool = false,
-fullscreen: bool = false,
+    fullscreen: bool = false,
+    /// Authored by the user with Super+q on its self-mirror tile: the self
+    /// mirror at its home slot is suppressed until the view has no mirrors
+    /// left (then the flag resets and re-mirroring restores it).
+    self_mirror_suppressed: bool = false,
 
 /// The tiling slot this view occupies (set by the backend commit
 /// handlers). The border ring fills it exactly, so the ring can never
@@ -400,6 +404,9 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
     // Remove it from the WM's live view list BEFORE freeing it.
     ViewManager.removeView(context, view);
 
+    // Destroy all mirror SceneBuffer nodes that reference this view.
+    mirror_mod.destroyAllMirrors(context, view);
+
     // Re-pack the remaining windows.
     ViewManager.updateViewPositions(context);
 
@@ -461,6 +468,8 @@ pub fn onViewCommit(
         .xwayland => |x| xw_mod.commitSurface(view, x, wlr_surface),
     }
 
+    mirror_mod.updateMirrors(view);
+
     // Re-sync the border/rounding now that surface.current.width/height
     // have caught up with the client's buffer, so the ring matches the
     // window immediately on resize instead of on the next animation tick.
@@ -470,3 +479,4 @@ pub fn onViewCommit(
 
 const xdg_mod = @import("xdg.zig");
 const xw_mod = @import("xwayland.zig");
+const mirror_mod = @import("../mirror.zig");

@@ -4,6 +4,7 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const AnimationManager = @import("../view/animation.zig");
+const Mirror = @import("../mirror.zig");
 const ServerContext = @import("../server.zig");
 const OutputContext = @This();
 
@@ -61,6 +62,12 @@ pub fn onNewOutput(
         return;
     };
     std.log.info("Output added to output layout", .{});
+
+    // Make this connector leaseable (zwlr_drm_lease_v1): a client like
+    // Waydroid/VR can drive it directly with zero compositor copies.
+    if (context.drm_lease) |lease| {
+        _ = lease.offerOutput(output);
+    }
 
     const scene_output =
         context.scene.createSceneOutput(output) catch {
@@ -150,17 +157,58 @@ pub fn onOutputDestroy(listener: *wl.Listener(*wlroots.Output), output: *wlroots
 pub fn onOutputFrame(listener: *wl.Listener(*wlroots.Output), output: *wlroots.Output) void {
     _ = output;
     const output_ctx: *OutputContext = @fieldParentPtr("frame_listener", listener);
+    const context = output_ctx.context;
 
-    AnimationManager.tick(output_ctx.context);
+    AnimationManager.tick(context);
 
-    if (!output_ctx.scene_output.commit(null)) {
+    // wlr_scene_output_commit() has no tearing support, so build the output
+    // state ourselves (swapchain-managed, like onManagerApply) to set
+    // tearing_page_flip when the focused surface requests async tearing.
+    if (!output_ctx.scene_output.needsFrame()) {
+        return;
+    }
+
+    var swapchain: wlroots.OutputSwapchainManager = undefined;
+    swapchain.init(context.backend);
+    defer swapchain.finish();
+
+    var states: [1]wlroots.Backend.OutputState = undefined;
+    states[0] = .{ .output = output_ctx.scene_output.output, .base = wlroots.Output.State.init() };
+    defer states[0].base.finish();
+
+    if (!swapchain.prepare(&states)) {
+        std.log.err("swapchain prepare failed", .{});
+        return;
+    }
+
+    _ = output_ctx.scene_output.buildState(&states[0].base, &.{
+        .swapchain = swapchain.getSwapchain(output_ctx.scene_output.output),
+    });
+
+    if (wantsTearing(context)) {
+        states[0].base.tearing_page_flip = true;
+    }
+
+    if (!context.backend.commit(&states)) {
         std.log.err("Failed to commit scene output", .{});
         return;
     }
+    swapchain.apply();
 
     var now: std.c.timespec = undefined;
     _ = clock_gettime(CLOCK_MONOTONIC, &now);
     output_ctx.scene_output.sendFrameDone(@ptrCast(&now));
+    // Pace mirror kicks off the REAL output frame (once per vsync), never
+    // off client commits: an unvsync'd kick loop hung the GPU pipeline.
+    Mirror.onOutputFrame(context, &now);
+}
+
+/// True when the focused surface has requested asynchronous (tearing)
+/// presentation, in which case we skip vsync with a tearing page flip.
+fn wantsTearing(context: *ServerContext) bool {
+    const tearing = context.tearing orelse return false;
+    const surface = context.focused_surface orelse return false;
+    return tearing.hintFromSurface(surface) == .async;
 }
 extern fn clock_gettime(clk_id: c_int, tp: *anyopaque) c_int;
 const CLOCK_MONOTONIC: c_int = 1;

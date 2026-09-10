@@ -4,13 +4,14 @@ const wlroots = @import("wlroots");
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
-const nd = @import("../view/utils/node_data.zig");
+const NodeData = @import("../view/utils/node_data.zig");
 const FocusManager = @import("../view/focus.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const LayerView = @import("../view/layer.zig");
 const View = @import("../view/view.zig");
 const ResizeEdge = @import("../server.zig").ResizeEdge;
 const PointerConstraints = @import("pointer_constraints.zig");
+const Mirror = @import("../mirror.zig");
 pub fn onCursorMotion(
     listener: *wl.Listener(*wlroots.Pointer.event.Motion),
     event: *wlroots.Pointer.event.Motion,
@@ -79,8 +80,16 @@ pub fn onCursorMotionAbsolute(
 /// surface under the cursor, enter/move the pointer, and optionally move
 /// keyboard focus (focus-follows-mouse). Keyboard focus is deliberately
 /// kept while the cursor is over a gap — only pointer focus clears.
+/// Diag helper: printable node type name.
+fn _nodeTypeName(t: anytype) []const u8 {
+    return switch (t) {
+        .tree => "tree",
+        .buffer => "buffer",
+        .rect => "rect",
+    };
+}
 fn onPointerHit(context: *ServerContext, time_msec: u32) void {
-    const hit = nd.resolveAt(&context.scene.tree, context.cursor.x, context.cursor.y) orelse {
+    const hit = NodeData.resolveAt(&context.scene.tree, context.cursor.x, context.cursor.y) orelse {
         context.seat.pointerClearFocus();
         context.focused_surface = null;
         PointerConstraints.onPointerFocus(context, null);
@@ -90,15 +99,27 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
     switch (hit.data.*) {
         .view => |view| {
             const view_ptr: *View = @ptrCast(@alignCast(view));
+            // Pointer focus is position-explicit: drop any keyboard-cycle
+            // anchor(s) so the ring follows the pointed tile again and the
+            // next cycle re-anchors on the focused view's home.
+            context.kbd_anchor_slot_x = -1;
+            context.kbd_cycle_view = null;
+            context.kbd_cycle_slot = -1;
             if (view_ptr.backend == .xwayland) {
                 const xw = view_ptr.backend.xwayland;
                 std.log.warn("PTR xwl win=0x{x} ored={} cl={?s} in={?s} tt={?s} hit={?*} sx={d:.0} sy={d:.0} cur=({d:.0},{d:.0})", .{ xw.window_id, xw.override_redirect, xw.class, xw.instance, xw.title, hit.surface, hit.sx, hit.sy, context.cursor.x, context.cursor.y });
             }
-            const surface = hit.surface orelse view_ptr.surface();
+            // Mirrors are plain scene buffers: resolveAt returns the source
+            // view with node-local coords, so route them through the mirror
+            // back into the source surface space or clicks land off-target.
+            const target = Mirror.mirrorInputTarget(context, view_ptr, hit.node, hit.sx, hit.sy);
+            const surface = if (target) |t| t.surface else (hit.surface orelse view_ptr.surface());
+            const ix = if (target) |t| t.sx else hit.sx;
+            const iy = if (target) |t| t.sy else hit.sy;
 
             const first_enter = context.focused_surface != surface;
             if (first_enter) {
-                context.seat.pointerNotifyEnter(surface, hit.sx, hit.sy);
+                context.seat.pointerNotifyEnter(surface, ix, iy);
                 context.focused_surface = surface;
             }
 
@@ -112,11 +133,22 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
                 !view_ptr.isOrWindow())
             {
                 FocusManager.setFocus(context, .{
-                    .view = .{ .view = view_ptr, .surface = hit.surface orelse view_ptr.surface(), .sx = hit.sx, .sy = hit.sy },
+                    .view = .{ .view = view_ptr, .surface = surface, .sx = ix, .sy = iy },
                 });
             }
+            if (context.cfg.focus_follows_mouse) {
+                if (target) |t| {
+                    if (!t.mirror.is_self) {
+                        // Hovered a mirror copy tile: pin the ring to it so a
+                        // later Super+q (or cycle) targets this copy even if
+                        // the pointer moved away in between.
+                        context.kbd_anchor_row = t.row;
+                        context.kbd_anchor_slot_x = t.mirror.slot_x;
+                    }
+                }
+            }
 
-            context.seat.pointerNotifyMotion(time_msec, hit.sx, hit.sy);
+            context.seat.pointerNotifyMotion(time_msec, ix, iy);
             // Xwayland only dispatches pointer motion on a wl_pointer.frame
             // (wl_pointer v5+). Sending one right after the motion over an
             // X window removes any cadence gap between the cursor's frame

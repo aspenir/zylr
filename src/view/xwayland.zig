@@ -314,8 +314,8 @@ pub fn commitSurface(
         view.y = xw_surface.y;
         view.scene_tree.node.setPosition(xw_surface.x, xw_surface.y);
         std.log.warn("ORPOS win=0x{x} geo=({d},{d},{d},{d})", .{
-            xw_surface.window_id, xw_surface.x, xw_surface.y,
-            xw_surface.width, xw_surface.height,
+            xw_surface.window_id, xw_surface.x,      xw_surface.y,
+            xw_surface.width,     xw_surface.height,
         });
         return;
     }
@@ -366,8 +366,7 @@ pub fn commitSurface(
     view.slot_w = ew;
     view.slot_h = eh;
 
-    // Mango-exact geometry for EVERY client, CSD or not: configure the
-    // content box to slot-2bw at slot+(bw,bw), and inset + crop the
+    // configure the content box to slot-2bw at slot+(bw,bw), and inset + crop the
     // content subtree to that box so shadow margins or a stale buffer
     // can never cover the ring band.
     const bw: c_int = @intCast(context.border_width);
@@ -413,14 +412,14 @@ pub fn commitSurface(
         xw_cfg_diag += 1;
         if (xw_cfg_diag <= 30 or xw_cfg_diag % 300 == 0) {
             std.log.warn("XW cfg vx={d} vy={d} vp=({d},{d}) bw={d} tgt=({d},{d},{d},{d}) old=({d},{d}) cur=({d},{d}) moved={d} wrong={d}", .{
-                view.x,              view.y,
-                context.viewport_x,  context.viewport_y,
-                bw,                  target_x,
-                target_y,            target_w,
-                target_h,            xw_surface.x,
-                xw_surface.y,        surface.current.width,
-                surface.current.height,
-                @intFromBool(moved), @intFromBool(wrong_size),
+                view.x,                   view.y,
+                context.viewport_x,       context.viewport_y,
+                bw,                       target_x,
+                target_y,                 target_w,
+                target_h,                 xw_surface.x,
+                xw_surface.y,             surface.current.width,
+                surface.current.height,   @intFromBool(moved),
+                @intFromBool(wrong_size),
             });
         }
     }

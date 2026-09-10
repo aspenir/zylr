@@ -1,7 +1,7 @@
 const wlroots = @import("wlroots");
 
 /// scenefx-0.5 (a wlroots 0.20 scene-graph fork, linked ahead of
-/// wlroots-0.20 like mango does) adds rounded corners to scene rects
+/// wlroots-0.20) adds rounded corners to scene rects
 /// and buffers. The renderer is scenefx's fx renderer; these externs
 /// bind to libscenefx. Radius 0 means square (skip the call entirely).
 pub const CornerRadii = extern struct {
@@ -11,7 +11,7 @@ pub const CornerRadii = extern struct {
     bottom_left: u16,
 };
 
-/// Mango-style border: a full-box rect whose interior (the window
+/// border: a full-box rect whose interior (the window
 /// area) is clipped out, so the rect renders as a pure ring that can
 /// never tint the window, whatever the client's transparency or the
 /// scene z-order. Node-relative box.

@@ -3,6 +3,7 @@ const std = @import("std");
 const ServerContext = @import("../server.zig");
 const Border = @import("border.zig");
 const ViewManager = @import("view_manager.zig");
+const Mirror = @import("../mirror.zig");
 
 pub fn wake(context: *ServerContext) void {
     if (context.animation_timer) |timer| {
@@ -32,6 +33,8 @@ pub fn tick(context: *ServerContext) void {
     const target_vp: f32 = @floatFromInt(context.viewport_target);
     var vcur = context.viewport_anim;
     if (@abs(target_vp - vcur) < 0.5) {
+        if (context.viewport_x != context.viewport_target and context.viewport_target > 0)
+            std.log.warn("SCROLL SETTLED vp={} target={}", .{ context.viewport_target, context.viewport_target });
         vcur = target_vp;
         context.viewport_x = context.viewport_target;
     } else {
@@ -88,6 +91,9 @@ pub fn tick(context: *ServerContext) void {
     }
 
     var slot_x: f32 = @floatFromInt(context.usable_area.x + context.gaps_out);
+    // Lead copies (docked to no window) ride at the row start.
+    Mirror.syncLeadTiles(context);
+    slot_x += @floatFromInt(Mirror.leadWidth(context));
     for (context.views.items, 0..) |view, i| {
         if (!view.isMapped() or view.floating or view.fullscreen) continue;
 
@@ -109,12 +115,18 @@ pub fn tick(context: *ServerContext) void {
         const scene_y: c_int = view.y - context.viewport_y;
         view.scene_tree.node.setPosition(scene_x, scene_y);
 
+        // Lay this view's mirrors (self-mirror + same-row copies) into the
+        // active tiled flow so they scroll and animate like real tiles.
+        Mirror.syncActiveTile(view, current, w_items[i]);
+
         // Views past the 64-wide target buffer have no w_moving entry.
         if (x_moving or (i < w_moving.len and w_moving[i])) {
             Border.updateViewBorder(view, current, w_items[i]);
         }
 
         slot_x += w_items[i] + @as(f32, @floatFromInt(context.gaps_in));
+        // Same-row mirror copies extend the tile flow after their window.
+        slot_x += @floatFromInt(Mirror.extraTilesWidth(context, view));
     }
 
     context.animation_active = still_animating;
