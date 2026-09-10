@@ -38,19 +38,6 @@ fn recomputeUsableArea(context: *ServerContext) void {
         if (!ls.initialized) continue;
         const st = ls.current;
 
-        std.log.info("usable: {s} ez={d} T={} B={} L={} R={} mT={d} mB={d} mL={d} mR={d}", .{
-            std.mem.span(ls.namespace),
-            st.exclusive_zone,
-            st.anchor.top,
-            st.anchor.bottom,
-            st.anchor.left,
-            st.anchor.right,
-            st.margin.top,
-            st.margin.bottom,
-            st.margin.left,
-            st.margin.right,
-        });
-
         if (st.exclusive_zone < 0) continue;
 
         const ez = st.exclusive_zone;
@@ -80,10 +67,6 @@ fn recomputeUsableArea(context: *ServerContext) void {
     if (usable.width < 0) usable.width = 0;
     if (usable.height < 0) usable.height = 0;
 
-    std.log.info("usabox: x={d} y={d} w={d} h={d}", .{
-        usable.x, usable.y, usable.width, usable.height,
-    });
-
     context.usable_area = usable;
 }
 
@@ -99,6 +82,12 @@ fn recomputeUsableAreaChanged(context: *ServerContext) bool {
         prev.y != context.usable_area.y or
         prev.width != context.usable_area.width or
         prev.height != context.usable_area.height;
+    if (changed) {
+        std.log.debug("usabox: x={d} y={d} w={d} h={d}", .{
+            context.usable_area.x, context.usable_area.y,
+            context.usable_area.width, context.usable_area.height,
+        });
+    }
     return changed;
 }
 
@@ -198,29 +187,26 @@ pub fn onLayerSurfaceCommit(
         .height = @divTrunc(output.height, scale),
     };
 
-    // Every commit — initial included — goes through the scene arranger:
-    // it derives the box from anchors, margins and the client's desired
-    // size, and only sends a configure when the size actually changes.
-    // A real size, not 0x0: a wallpaper/background client sizes its
-    // viewport destination from the configured size, and wlroots'
-    // viewporter rejects a 0-sized destination.
-    var usable_area = full_area;
-
-    layer.scene_layer.configure(
-        &full_area,
-        &usable_area,
-    );
-
     const context = layer.context;
-    // Client-agnostic: focus any layer that asks for keyboard interactivity.
-    if (layer_surface.current.keyboard_interactive != .none) {
-        FocusManager.setFocus(layer.context, .{
-            .layer = .{
-                .layer = layer,
-                .sx = context.cursor.x,
-                .sy = context.cursor.y,
-            },
-        });
+    // Re-derive the usable area on every commit: a layer can change its
+    // exclusive zone / anchors without attaching a buffer (the OSK hides
+    // by clearing its zone), which must re-expand the usable area and
+    // retile windows.
+    const area_changed = recomputeUsableAreaChanged(layer.context);
+
+    // Configure the scene arranger only when the layer's geometry needs
+    // updating: initial positioning or a change in anchors/margins/ez.
+    // Plain buffer-only commits (annotation overlay redraws, wallpaper
+    // refreshes) skip this — wlr_scene_layer_surface_v1_configure
+    // unconditionally mutates the scene tree, marking output damage that
+    // feeds a frame-callback loop: damage → frame → sendFrameDone →
+    // client commits → configure → damage → …
+    if (layer_surface.initial_commit or area_changed) {
+        var usable_area = full_area;
+        layer.scene_layer.configure(
+            &full_area,
+            &usable_area,
+        );
     }
 
     if (layer_surface.initial_commit) {
@@ -229,7 +215,20 @@ pub fn onLayerSurfaceCommit(
             .{std.mem.span(layer_surface.namespace)},
         );
 
-        if (recomputeUsableAreaChanged(layer.context)) {
+        // Focus keyboard-interactive layers on their first commit so they
+        // receive keyboard input. Cursor-motion focus is handled separately
+        // by onPointerHit.
+        if (layer_surface.current.keyboard_interactive != .none) {
+            FocusManager.setFocus(layer.context, .{
+                .layer = .{
+                    .layer = layer,
+                    .sx = context.cursor.x,
+                    .sy = context.cursor.y,
+                },
+            });
+        }
+
+        if (area_changed) {
             ViewManager.refreshTiledSizes(layer.context);
         }
         ViewManager.updateViewPositions(layer.context);
@@ -237,22 +236,6 @@ pub fn onLayerSurfaceCommit(
         return;
     }
 
-    if (layer_surface.current.keyboard_interactive != .none) {
-        FocusManager.setFocus(layer.context, .{
-            .layer = .{
-                .layer = layer,
-                .sx = context.cursor.x,
-                .sy = context.cursor.y,
-            },
-        });
-    }
-
-    // Re-derive the usable area even on an empty (null-buffer) commit: a
-    // layer can change its exclusive zone / anchors without attaching a
-    // buffer (the OSK hides by clearing its zone), which must re-expand the
-    // usable area and retile windows. updateViewPositions runs below on the
-    // buffered path, and here whenever the area changed.
-    const area_changed = recomputeUsableAreaChanged(layer.context);
     if (area_changed) {
         ViewManager.refreshTiledSizes(layer.context);
     }
@@ -292,7 +275,14 @@ pub fn onLayerSurfaceCommit(
         }
     }
 
-    ViewManager.updateViewPositions(layer.context);
+    // Only retile when the usable area changed (e.g. a bar appeared or
+    // disappeared). Unconditionally calling updateViewPositions on every
+    // layer-frame commit wakes the animation timer and drives a tight
+    // 60 fps render loop that makes annotation overlays flash.
+    if (area_changed) {
+        ViewManager.updateViewPositions(layer.context);
+    }
+
 }
 pub fn onNewLayerSurface(
     listener: *wl.Listener(*wlroots.LayerSurfaceV1),

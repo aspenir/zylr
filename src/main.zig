@@ -92,7 +92,6 @@ fn zylrLogFn(
     const rest = std.fmt.bufPrint(buf[prefix.len..], format, args) catch buf[prefix.len..][0..0];
     buf[prefix.len + rest.len] = '\n';
     _ = std.c.write(zylr_log_fd, buf[0 .. prefix.len + rest.len + 1].ptr, prefix.len + rest.len + 1);
-    _ = std.c.fsync(zylr_log_fd);
 }
 pub const std_options: std.Options = .{
     .log_level = log_level,

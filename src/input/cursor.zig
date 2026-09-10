@@ -159,11 +159,20 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
         },
         .layer => |layer| {
             const layer_ptr: *LayerView = @ptrCast(@alignCast(layer));
-            if (context.focused_layer != layer_ptr) {
-                FocusManager.setFocus(context, .{
-                    .layer = .{ .layer = layer_ptr, .sx = hit.sx, .sy = hit.sy },
-                });
+            const surface = layer_ptr.layer_surface.surface;
+            if (context.focused_surface != surface) {
+                context.seat.pointerNotifyEnter(
+                    surface,
+                    hit.sx,
+                    hit.sy,
+                );
+                context.focused_surface = surface;
             }
+            // Layer shell surfaces get pointer focus on hover but not
+            // keyboard focus — that only changes on initial commit or
+            // explicit click.  Skipping setFocus here avoids expensive
+            // updateBorders / layoutMirrorsAll scene mutations when the
+            // cursor briefly exits and re-enters the layer at speed.
             context.seat.pointerNotifyMotion(time_msec, hit.sx, hit.sy);
         },
         .im_popup => |popup_raw| {

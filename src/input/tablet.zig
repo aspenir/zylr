@@ -8,11 +8,27 @@ const NodeData = @import("../view/utils/node_data.zig");
 
 const View = @import("../view/view.zig");
 const Layer = @import("../view/layer.zig");
+/// Max plausible pen travel per report, normalized to the tablet (a hand
+/// at full speed spans the tablet in ~10 reports, so 0.35 is beyond
+/// physical motion but far smaller than the old 0.5 boundary clamp).
+const MAX_STEP: f64 = 0.35;
+/// An event this far from the anchor is a coordinate-clamp teleport (the
+/// pen reports a position pinned to the tablet border/corner): drop it flat
+/// instead of letting it yank the stream across the screen.
+const TELEPORT: f64 = 0.85;
 const TabletContext = @This();
 
 tablet: *wlroots.Tablet,
 v2_tablet: *wlroots.TabletV2Tablet,
 context: *ServerContext,
+
+/// Last forwarded normalized axis position. Kept across proximity so the
+/// first report after a re-contact is still clamped (no stroke-start
+/// teleport). onAxis drops border-clamped teleports and clamps per-report
+/// travel to `MAX_STEP` so the stream never jumps across the screen.
+has_pos: bool = false,
+sx: f64 = 0,
+sy: f64 = 0,
 
 axis_listener: wl.Listener(*wlroots.Tablet.event.Axis) = undefined,
 proximity_listener: wl.Listener(*wlroots.Tablet.event.Proximity) = undefined,
@@ -126,7 +142,36 @@ pub fn onAxis(
 
     const tool = self.getTool(event.tool) orelse return;
 
-    const pos = self.toolPosition(event.x, event.y);
+    var x = event.x;
+    var y = event.y;
+    if (self.has_pos) {
+        const dx = x - self.sx;
+        const dy = y - self.sy;
+
+        if (@abs(dx) > TELEPORT or @abs(dy) > TELEPORT) {
+            // Coordinate clamped to the tablet border: don't move the stream
+            // at all, keep the anchor so a follow-up quirk can't decay it.
+            std.log.debug("tablet: dropping teleport axis jump ({d}, {d}) -> ({d}, {d})", .{
+                self.sx, self.sy, event.x, event.y,
+            });
+            return;
+        }
+
+        // Clamp the per-report travel so a transient out-of-range coordinate
+        // glides at max plausible hand speed instead of teleporting, and the
+        // stream never has a stale anchor to recover from.
+        if (@abs(dx) > MAX_STEP) {
+            x = self.sx + std.math.copysign(MAX_STEP, dx);
+        }
+        if (@abs(dy) > MAX_STEP) {
+            y = self.sy + std.math.copysign(MAX_STEP, dy);
+        }
+    }
+    self.sx = x;
+    self.sy = y;
+    self.has_pos = true;
+
+    const pos = self.toolPosition(x, y);
     wlroots.TabletV2TabletTool.notifyMotion(tool, pos.ox, pos.oy);
 
     if (event.updated_axes.pressure) {
@@ -159,9 +204,14 @@ pub fn onProximity(
 
     if (event.state == .out) {
         wlroots.TabletV2TabletTool.notifyProximityOut(tool);
+        // Keep the position anchor across proximity: the first axis report
+        // after a re-contact can still be stale or border-clamped, and the
+        // onAxis clamp must be able to catch it (no first-event teleport).
         return;
     }
 
+    // In proximity: the onAxis clamp keeps the stream anchored to the last
+    // known position, so there is nothing to reset here.
     const pos = self.toolPosition(event.x, event.y);
     const surface = surfaceAt(self.context, pos.ox, pos.oy) orelse return;
 

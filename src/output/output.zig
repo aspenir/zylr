@@ -15,6 +15,8 @@ destroy_listener: wl.Listener(*wlroots.Output) = undefined,
 /// then, so the shutdown path must not remove them a second time.
 destroyed: bool = false,
 context: *ServerContext,
+last_frame_ns: u64 = 0,
+last_way_commits: u64 = 0,
 
 
 pub fn onNewOutput(
@@ -47,7 +49,7 @@ pub fn onNewOutput(
 
     state.setScale(if (context.view_scale > 0) context.view_scale else defaultScale(output));
 
-    if (output.adaptive_sync_supported) {
+    if (output.adaptive_sync_supported and context.cfg.vrr) {
         state.setAdaptiveSyncEnabled(true);
         std.log.info("VRR: adaptive sync supported, enabled", .{});
     }
@@ -161,39 +163,19 @@ pub fn onOutputFrame(listener: *wl.Listener(*wlroots.Output), output: *wlroots.O
 
     AnimationManager.tick(context);
 
-    // wlr_scene_output_commit() has no tearing support, so build the output
-    // state ourselves (swapchain-managed, like onManagerApply) to set
-    // tearing_page_flip when the focused surface requests async tearing.
-    if (!output_ctx.scene_output.needsFrame()) {
-        return;
-    }
-
-    var swapchain: wlroots.OutputSwapchainManager = undefined;
-    swapchain.init(context.backend);
-    defer swapchain.finish();
-
-    var states: [1]wlroots.Backend.OutputState = undefined;
-    states[0] = .{ .output = output_ctx.scene_output.output, .base = wlroots.Output.State.init() };
-    defer states[0].base.finish();
-
-    if (!swapchain.prepare(&states)) {
-        std.log.err("swapchain prepare failed", .{});
-        return;
-    }
-
-    _ = output_ctx.scene_output.buildState(&states[0].base, &.{
-        .swapchain = swapchain.getSwapchain(output_ctx.scene_output.output),
-    });
-
-    if (wantsTearing(context)) {
-        states[0].base.tearing_page_flip = true;
-    }
-
-    if (!context.backend.commit(&states)) {
+    // Stock present path: wlr_scene_output_commit() -> wlr_output_commit_state
+    // -> drm_connector_commit, which REFUSES to queue a page flip while one is
+    // still pending (single-flip pacing — the behavior of every compositor).
+    // The former device-wide path (wlr_backend_commit -> commit_drm_device)
+    // queued back-to-back flips with no such gate; that unrestricted pacing was
+    // the one present-path behavior unique to zylr among the WMs that do not
+    // flash. Tearing cannot go through this path, but it was dead anyway: the
+    // device path rejected tearing_page_flip outright and no client requests
+    // async tearing.
+    if (!output_ctx.scene_output.commit(null)) {
         std.log.err("Failed to commit scene output", .{});
         return;
     }
-    swapchain.apply();
 
     var now: std.c.timespec = undefined;
     _ = clock_gettime(CLOCK_MONOTONIC, &now);
@@ -201,14 +183,6 @@ pub fn onOutputFrame(listener: *wl.Listener(*wlroots.Output), output: *wlroots.O
     // Pace mirror kicks off the REAL output frame (once per vsync), never
     // off client commits: an unvsync'd kick loop hung the GPU pipeline.
     Mirror.onOutputFrame(context, &now);
-}
-
-/// True when the focused surface has requested asynchronous (tearing)
-/// presentation, in which case we skip vsync with a tearing page flip.
-fn wantsTearing(context: *ServerContext) bool {
-    const tearing = context.tearing orelse return false;
-    const surface = context.focused_surface orelse return false;
-    return tearing.hintFromSurface(surface) == .async;
 }
 extern fn clock_gettime(clk_id: c_int, tp: *anyopaque) c_int;
 const CLOCK_MONOTONIC: c_int = 1;

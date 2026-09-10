@@ -188,6 +188,10 @@ pub const Config = struct {
     width_ratio: f32 = 0.6,
     /// Output scale factor override; 0 = use the display's preferred scale.
     scale: f32 = 0,
+    /// Adaptive sync (VRR/Freesync) on the main output. Some laptop panels
+    /// flicker under the erratic frame rates caused by bursty pen/mouse
+    /// input; set false to force the panel to its fixed refresh rate.
+    vrr: bool = true,
 };
 
 /// The bind set that used to be hardcoded in onKeyboardKey.
