@@ -35,7 +35,11 @@ custom_width: ?i32 = null,
 /// When true the view floats above the tiling layout: it keeps its
 /// current position and is excluded from tile calculations.
 floating: bool = false,
-fullscreen: bool = false,
+    fullscreen: bool = false,
+    /// Authored by the user with Super+q on its self-mirror tile: the self
+    /// mirror at its home slot is suppressed until the view has no mirrors
+    /// left (then the flag resets and re-mirroring restores it).
+    self_mirror_suppressed: bool = false,
 
 /// The tiling slot this view occupies (set by the backend commit
 /// handlers). The border ring fills it exactly, so the ring can never

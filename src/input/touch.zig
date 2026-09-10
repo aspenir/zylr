@@ -10,6 +10,7 @@ const NodeData = @import("../view/utils/node_data.zig");
 const FocusManager = @import("../view/focus.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const LayerView = @import("../view/layer.zig");
+const Mirror = @import("../mirror.zig");
 const View = @import("../view/view.zig");
 
 const TouchContext = @This();
@@ -228,21 +229,32 @@ fn position(
     };
 }
 
+const SurfaceHit = struct {
+    surface: *wlroots.Surface,
+    sx: f64,
+    sy: f64,
+    view: ?*View,
+    /// Mirror hit, when the touch landed on one of the view's mirrors.
+    mirror: ?Mirror.InputTarget,
+};
+
 fn surfaceAt(
     context: *ServerContext,
     x: f64,
     y: f64,
-) ?struct { surface: *wlroots.Surface, sx: f64, sy: f64, view: ?*View } {
+) ?SurfaceHit {
     const hit = NodeData.resolveAt(&context.scene.tree, x, y) orelse return null;
 
     switch (hit.data.*) {
         .view => |view| {
             const view_ptr: *View = @ptrCast(@alignCast(view));
+            const target = Mirror.mirrorInputTarget(context, view_ptr, hit.node, hit.sx, hit.sy);
             return .{
-                .surface = hit.surface orelse view_ptr.surface(),
-                .sx = hit.sx,
-                .sy = hit.sy,
+                .surface = if (target) |t| t.surface else (hit.surface orelse view_ptr.surface()),
+                .sx = if (target) |t| t.sx else hit.sx,
+                .sy = if (target) |t| t.sy else hit.sy,
                 .view = view_ptr,
+                .mirror = target,
             };
         },
         .layer => |layer| {
@@ -252,6 +264,7 @@ fn surfaceAt(
                 .sx = hit.sx,
                 .sy = hit.sy,
                 .view = null,
+                .mirror = null,
             };
         },
         .im_popup => |popup_raw| {
@@ -261,6 +274,7 @@ fn surfaceAt(
                 .sx = hit.sx,
                 .sy = hit.sy,
                 .view = null,
+                .mirror = null,
             };
         },
         .popup => |popup_raw| {
@@ -270,6 +284,7 @@ fn surfaceAt(
                 .sx = hit.sx,
                 .sy = hit.sy,
                 .view = null,
+                .mirror = null,
             };
         },
     }
@@ -295,8 +310,22 @@ pub fn onDown(
                 .sy = hit.sy,
             },
         });
-        // Touching a window hanging off-screen brings it in.
-        ViewManager.scrollIntoView(self.context, view);
+        // Mirror tiles anchor the ring on the touched copy and scroll the
+        // row to it, like pointer clicks and keyboard cycling. Other windows
+        // get brought in only when hanging off-screen.
+        if (hit.mirror) |t| {
+            const m = t.mirror;
+            self.context.kbd_cycle_view = view;
+            self.context.kbd_cycle_slot = m.slot_x;
+            self.context.kbd_anchor_row = t.row;
+            self.context.kbd_anchor_slot_x = m.slot_x;
+            Mirror.refreshMirrorFocus(self.context);
+            if (t.row == self.context.active_row) {
+                ViewManager.scrollToX(self.context, m.slot_x, m.slot_w);
+            }
+        } else {
+            ViewManager.scrollIntoView(self.context, view);
+        }
     }
 
     self.cancelHold();

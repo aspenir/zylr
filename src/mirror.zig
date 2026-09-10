@@ -9,6 +9,7 @@ const View = @import("view/view.zig");
 const ViewManager = @import("view/view_manager.zig");
 const Rounding = @import("view/rounding.zig");
 const Border = @import("view/border.zig");
+const FocusManager = @import("view/focus.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -21,39 +22,15 @@ var last_mirror_kick_ns: i128 = -999999999999;
 // client produces exactly one frame per vsync, never an unvsync'd hot loop.
 const kick_hidden_source = true;
 
-pub fn boot(boot_nonce: usize) void {
-    const f = std.c.fopen("/tmp/zylr_genesis.log", "a") orelse return;
-    const line = std.fmt.allocPrint(std.heap.c_allocator, "BOOT nonce={d}", .{boot_nonce}) catch "";
-    defer if (line.len > 0) std.heap.c_allocator.free(line);
-    _ = std.c.fwrite(line.ptr, 1, line.len, f);
-    const nl = [1]u8{10};
-    _ = std.c.fwrite(&nl, 1, 1, f);
-    _ = std.c.fclose(f);
-}
-
 const log = std.log.scoped(.mirror);
-
-const dbg_path = "/tmp/zylrpin.db";
-fn dbg(comptime fmt: []const u8, args: anytype) void {
-    const line = std.fmt.allocPrint(std.heap.c_allocator, fmt, args) catch return;
-    defer std.heap.c_allocator.free(line);
-    const f = std.c.fopen(dbg_path, "a") orelse return;
-    _ = std.c.fwrite(line.ptr, 1, line.len, f);
-    _ = std.c.fwrite("\n", 1, 1, f);
-    _ = std.c.fclose(f);
-}
 
 /// Create a mirror of `view` on `target_row`. For the active row we
 /// immediately create the scene trees; for inactive rows we only record
 /// the intent in `row_sources`, and lazily create the scene tree on row
 /// activation
 pub fn mirrorToRow(context: *ServerContext, view: *View, target_row: usize) void {
-    dbg("MIRROR-ENTER view={*} row={d} focused={*}", .{ view, target_row, context.focused_view orelse null });
     if (target_row >= ServerContext.max_rows) return;
-    if (findMirrors(context, view, target_row)) |_| {
-        dbg("MIRROR-DUP view={*} row={d}", .{ view, target_row });
-        return;
-    }
+    if (findMirrors(context, view, target_row)) |_| return;
 
     // Record the mirrored copy on the target row.
     context.row_sources[target_row].append(allocator, view) catch return;
@@ -62,13 +39,121 @@ pub fn mirrorToRow(context: *ServerContext, view: *View, target_row: usize) void
     refreshSourceVisibility(context, view);
 }
 
-/// Delete mirror `view` from `target_row`.
-pub fn deleteMirrorFromRow(context: *ServerContext, view: *View, target_row: usize) void {
-    if (target_row >= ServerContext.max_rows) return;
-    if (findMirrors(context, view, target_row)) |idx| {
-        _ = context.row_sources[target_row].orderedRemove(idx);
-    }
+/// Delete the mirror of `view` on `target_row` (the single source entry for
+/// that row). Returns true when a mirror was actually removed.
+pub fn deleteMirrorFromRow(context: *ServerContext, view: *View, target_row: usize) bool {
+    if (target_row >= ServerContext.max_rows) return false;
+    const idx = findMirrors(context, view, target_row) orelse return false;
+    _ = context.row_sources[target_row].orderedRemove(idx);
     refreshSourceVisibility(context, view);
+    return true;
+}
+
+/// super+q on a mirror: remove exactly the focused tile. On a COPY (a docked
+/// mirror from `row_sources`) that tile is removed and the source survives; on
+/// the SELF mirror (the source's home tile shown as its own mirror) just that
+/// tile is removed too - the slot goes blank, the source stays hidden and any
+/// copies remain. When removing the tile leaves exactly one mirror behind, the
+/// source dissolves into a real window in the survivor's place (no window
+/// resurrecting on a later close). Returns true when a mirror tile (self or
+/// copy) was handled; false when the focused view is an ordinary window
+/// (caller closes it).
+pub fn closeFocusedMirrorCopy(context: *ServerContext) bool {
+    const view = context.focused_view orelse return false;
+
+    // Resolve which tile is focused: the keyboard-anchored slot first, else
+    // the tile under the pointer. The anchor is matched by nearest slot, not
+    // exactly: layout passes re-place mirrors and drift slot_x away from the
+    // anchor, so an exact match goes stale and mis-identifies the ring's tile
+    // (closing the self mirror used to silently delete the copy instead).
+    const kbd_row: usize = if (context.kbd_anchor_slot_x >= 0) context.kbd_anchor_row else ServerContext.max_rows;
+    var row: usize = kbd_row;
+    var is_self = false;
+    var pinned = false;
+    if (kbd_row < ServerContext.max_rows) {
+        if (closestMirrorAt(context, view, kbd_row, context.kbd_anchor_slot_x)) |m| {
+            pinned = true;
+            is_self = m.is_self;
+        }
+    }
+    if (!pinned) {
+        // Ring on a home slot never pins a keyboard anchor (home tiles carry
+        // mirror_slot_x=-1 in tileCycle), yet the surface there is the SELF
+        // mirror. Prefer closing that ringed tile over whatever the cursor
+        // happens to sit on - otherwise Super+q over a stray pointer on the
+        // neighbouring copy removes the copy, not the ringed self mirror.
+        var self_on_row = false;
+        for (context.row_mirrors[context.active_row].items) |*m| {
+            if (m.view == view and m.active and m.is_self) {
+                self_on_row = true;
+                break;
+            }
+        }
+        if (self_on_row) {
+            pinned = true;
+            is_self = true;
+        } else {
+            var sx: f64 = 0;
+            var sy: f64 = 0;
+            const node = context.scene.tree.node.at(context.cursor.x, context.cursor.y, &sx, &sy);
+            if (node) |n| {
+                if (mirrorInputTarget(context, view, n, sx, sy)) |t| {
+                    row = t.row;
+                    is_self = t.mirror.is_self;
+                    pinned = true;
+                }
+            }
+        }
+    }
+
+    if (pinned and is_self) {
+        // Self-mirror (source's home slot rendered as a mirror): remove just
+        // this tile. The source stays hidden because its copies still exist.
+        view.self_mirror_suppressed = true;
+        refreshSourceVisibility(context, view);
+        context.kbd_anchor_slot_x = -1;
+        context.kbd_cycle_slot = -1;
+        return dissolveCollapse(context, view);
+    }
+    if (pinned) {
+        // Concrete copy tile.
+        if (deleteMirrorFromRow(context, view, row)) {
+            context.kbd_anchor_slot_x = -1;
+            context.kbd_cycle_slot = -1;
+            killIfLastCopyOnHiddenRow(context, view);
+            return dissolveCollapse(context, view);
+        }
+    }
+
+    // Nothing anchored to a visible tile (focus ring is on the home slot,
+    // whose surface is hidden behind the self mirror). Remove just that tile.
+    if (hasAnyMirrors(context, view)) {
+        view.self_mirror_suppressed = true;
+        refreshSourceVisibility(context, view);
+        context.kbd_anchor_slot_x = -1;
+        context.kbd_cycle_slot = -1;
+        return dissolveCollapse(context, view);
+    }
+    return false;
+}
+
+/// The tile of `view` on `row` nearest the given anchor slot, or null when the
+/// view has no (placed) mirror there. Used instead of an exact slot match so a
+/// stale keyboard anchor still resolves to the ring's actual tile.
+
+fn closestMirrorAt(context: *ServerContext, view: *View, row: usize, slot_x: i32) ?*ServerContext.Mirror {
+    if (row >= ServerContext.max_rows) return null;
+    var best: ?*ServerContext.Mirror = null;
+    var best_d: u64 = std.math.maxInt(u64);
+    for (context.row_mirrors[row].items) |*m| {
+        if (m.view != view or !m.active or m.slot_x == std.math.minInt(i32)) continue;
+        const d = @abs(@as(i64, @intCast(m.slot_x)) - @as(i64, @intCast(slot_x)));
+        if (d < best_d) {
+            best_d = d;
+            best = m;
+        }
+    }
+    return best;
 }
 
 /// Remove all mirrors for `view` (called on view destroy).
@@ -87,6 +172,7 @@ pub fn destroyAllMirrors(context: *ServerContext, view: *View) void {
             mi -= 1;
             if (context.row_mirrors[r].items[mi].view == view) {
                 tearDownMirror(&context.row_mirrors[r].items[mi]);
+                context.row_mirrors[r].items[mi].tree.node.destroy();
                 _ = context.row_mirrors[r].orderedRemove(mi);
             }
         }
@@ -110,7 +196,6 @@ fn tearDownMirror(m: *ServerContext.Mirror) void {
 /// sure its home row carries a self-mirror so it stays visible as a mirror.
 /// Re-shows the real surface and drops the self-mirror once it has no mirrors.
 fn refreshSourceVisibility(context: *ServerContext, view: *View) void {
-    dbg("MIRROR view={*} backend={s} focused={*}", .{ view, @tagName(view.backend), context.focused_view orelse null });
     // Self-mirrors are NOT stored in `row_sources`; they are derived at build
     // time from "is this window of the row mirrored anywhere?". So here we only
     // hide/show the real surface and rebuild the mirrors of any row this
@@ -118,6 +203,7 @@ fn refreshSourceVisibility(context: *ServerContext, view: *View) void {
     if (hasAnyMirrors(context, view)) {
         view.scene_tree.node.setEnabled(false);
     } else {
+        view.self_mirror_suppressed = false;
         view.scene_tree.node.setEnabled(true);
     }
     // Rebuild the visible row's mirrors: a change can add/remove a copy
@@ -141,6 +227,90 @@ fn hasAnyMirrors(context: *ServerContext, view: *View) bool {
         if (findMirrors(context, view, r) != null) return true;
     }
     return false;
+}
+
+/// Total number of mirror tiles currently standing for `view`: one per row
+/// that holds a copy, plus the self-mirror rendered at home (unless the user
+/// suppressed it).
+fn countMirrors(context: *ServerContext, view: *View) usize {
+    var n: usize = 0;
+    for (0..ServerContext.max_rows) |r| {
+        if (findMirrors(context, view, r) != null) n += 1;
+    }
+    if (n > 0 and !view.self_mirror_suppressed) n += 1;
+    return n;
+}
+
+const SurvivingCopy = struct { row: usize, x: i32 };
+
+/// The one copy tile that would survive once the self-mirror is gone (the
+/// last row still holding this view). Returns the row and its tile x.
+fn survivingCopy(context: *ServerContext, view: *View) ?SurvivingCopy {
+    var out: ?SurvivingCopy = null;
+    for (0..ServerContext.max_rows) |r| {
+        if (findMirrors(context, view, r) == null) continue;
+        for (context.row_mirrors[r].items) |m| {
+            if (m.view != view or m.is_self) continue;
+            out = .{ .row = r, .x = m.slot_x };
+        }
+    }
+    return out;
+}
+
+/// Collapse rule: after a mirror tile was removed, when only ONE mirror tile
+/// remains, dissolve the whole mirror set and turn the source back into a real
+/// window in the survivor's slot - the mirrored window keeps existing instead
+/// of a phantom copy later resurrecting it. `killIfLastCopyOnHiddenRow`
+/// already ran, so a survivor can only be on the active row or an active-row
+/// copy; a lone surviving self-mirror therefore means the source simply flows
+/// at its home slot. Re-focuses the active row so keyboard focus leaves the
+/// removed tile.
+fn dissolveCollapse(context: *ServerContext, view: *View) bool {
+    if (countMirrors(context, view) != 1) {
+        FocusManager.focusActiveRow(context);
+        return true;
+    }
+    const survivor = survivingCopy(context, view);
+    for (0..ServerContext.max_rows) |r| context.row_sources[r].clearRetainingCapacity();
+    view.self_mirror_suppressed = false;
+    destroyAllMirrors(context, view);
+    refreshSourceVisibility(context, view);
+    if (survivor) |s| {
+        if (s.row == context.active_row and std.mem.indexOfScalar(*View, context.views.items, view) != null) {
+            // The collapse reflow just placed the source at its home slot.
+            const home_x = view.x;
+            ViewManager.moveViewToSlot(context, view, @as(f64, @floatFromInt(s.x)));
+            // moveViewToSlot only reorders between existing window slots; a
+            // lone window has no slot at the survivor's x, so it no-ops and
+            // the source would snap home. Surface it at the survivor position
+            // instead and hold the vacated home slot open as head_gap.
+            if (view.x == home_x and s.x > home_x) {
+                context.head_gap = s.x - home_x;
+                context.head_gap_owner = view;
+                ViewManager.updateViewPositionsFrom(context, 0);
+                // Snap the surface straight to the survivor position (the
+                // reflow woke the animation; with the gap applied its target
+                // is exactly there, so marking animation_x prevents a slide).
+                const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
+                if (idx < context.animation_x.items.len) {
+                    context.animation_x.items[idx] = @floatFromInt(s.x);
+                }
+            }
+        }
+    }
+    FocusManager.focusActiveRow(context);
+    return true;
+}
+
+/// After deleting a copy: when the source no longer has ANY mirrors and it
+/// lives on a hidden (parked) row, its real surface would be re-enabled off-
+/// screen — a zombie. Kill it so closing the last copy does close the source.
+/// A source that lives on the active row survives: it reverts to a normal
+/// window (its real surface re-enables in place).
+fn killIfLastCopyOnHiddenRow(context: *ServerContext, view: *View) void {
+    if (hasAnyMirrors(context, view)) return;
+    const home = homeRowOf(context, view) orelse return;
+    if (home != context.active_row) view.sendClose();
 }
 
 /// The row this window lives on (active working set or a parked row).
@@ -264,8 +434,6 @@ const MirrorFeed = struct {
 /// become a copy (bind listeners on it self-recursed and GP'd).
 fn mirrorSurfaceIter(s: *wlroots.Surface, sx: c_int, sy: c_int, ctx: *MirrorFeed) void {
     const m = ctx.m;
-    const is_popup = if (wlroots.XdgSurface.tryFromWlrSurface(s)) |xdg| xdg.role == .popup else false;
-    dbg("WALK s={*} self={} pop={} buf={} pos=({d},{d})", .{ s, s == m.surf, is_popup, s.buffer != null, sx, sy });
     if (s == m.surf) return;
     if (std.mem.indexOfScalar(*wlroots.Surface, ctx.live.items, s) == null) ctx.live.append(allocator, s) catch {};
     const scn: *wlroots.SceneBuffer = if (findSubCopy(m, s)) |sc|
@@ -284,7 +452,6 @@ fn mirrorSurfaceIter(s: *wlroots.Surface, sx: c_int, sy: c_int, ctx: *MirrorFeed
         // binding a commit listener on it self-recursed and GP'd earlier.
         sc.commit = wl.Listener(*wlroots.Surface).init(onCopySurfaceCommit);
         sc.destroy = wl.Listener(*wlroots.Surface).init(onCopySurfaceDestroy);
-        dbg("SUB-CREATE surf={*} self={} pop={} pos=({d},{d}) buf={} w={d}", .{ s, s == m.surf, is_popup, sx, sy, s.buffer != null, s.current.width });
         s.events.commit.add(&sc.commit);
         s.events.destroy.add(&sc.destroy);
         m.sub_copies.append(allocator, sc) catch {
@@ -303,7 +470,6 @@ fn mirrorSurfaceIter(s: *wlroots.Surface, sx: c_int, sy: c_int, ctx: *MirrorFeed
 /// re-feed its mirror so the copy follows even without a toplevel commit.
 fn onCopySurfaceCommit(listener: *wl.Listener(*wlroots.Surface), _: *wlroots.Surface) void {
     const sc: *ServerContext.SubCopy = @fieldParentPtr("commit", listener);
-    dbg("COPY-COMMIT n={d} linked={} node={*}", .{ sc.owner.sub_copies.items.len, sc.linked, sc.node });
     feedMirrorTree(sc.owner);
 }
 
@@ -313,7 +479,6 @@ fn onCopySurfaceCommit(listener: *wl.Listener(*wlroots.Surface), _: *wlroots.Sur
 fn onCopySurfaceDestroy(listener: *wl.Listener(*wlroots.Surface), _: *wlroots.Surface) void {
     const sc: *ServerContext.SubCopy = @fieldParentPtr("destroy", listener);
     const owner = sc.owner;
-    dbg("COPY-DESTROY n={d} linked={} node={*}", .{ owner.sub_copies.items.len, sc.linked, sc.node });
     if (sc.linked) {
         sc.commit.link.remove();
         sc.linked = false;
@@ -383,15 +548,12 @@ fn feedMirrorTree(m: *ServerContext.Mirror) void {
     m.feed_in_progress = true;
     defer m.feed_in_progress = false;
     const bn = m.buf_node orelse {
-        dbg("FEED-BAIL view={*} reason=no-bufnode", .{m.view});
         return;
     };
     const surf = m.surf orelse {
-        dbg("FEED-BAIL view={*} reason=no-surf", .{m.view});
         return;
     };
     if (!m.view.isMapped()) {
-        dbg("FEED-BAIL view={*} reason=not-mapped", .{m.view});
         return;
     }
     const context = m.view.context;
@@ -410,12 +572,10 @@ fn feedMirrorTree(m: *ServerContext.Mirror) void {
         damage.initRect(0, 0, @intCast(cb.base.width), @intCast(cb.base.height));
         defer damage.deinit();
         bn.setBufferWithDamage(&cb.base, &damage);
-        dbg("FEED-OK view={*} backend={s} surf(b{}) w={d} h={d} slot={d}x{d} pushed={d}", .{ m.view, @tagName(m.view.backend), surf.buffer != null, surf.current.width, surf.current.height, m.slot_w, m.slot_h, m.pushed });
     } else {
         damage.initRect(0, 0, std.math.maxInt(c_int), std.math.maxInt(c_int));
         defer damage.deinit();
         bn.setBuffer(null);
-        dbg("FEED-NOBUF view={*} backend={s} surf-slot={d}x{d}", .{ m.view, @tagName(m.view.backend), m.slot_w, m.slot_h });
         return;
     }
     // The source-box crop is in BUFFER coordinates while xdg geometry is in
@@ -459,22 +619,7 @@ fn feedMirrorTree(m: *ServerContext.Mirror) void {
         },
         .xwayland => {},
     }
-    for (live.items) |lv| dbg("LIVE s={*}", .{lv});
     cullSubCopies(m, live.items);
-    dbg("CULL-DONE n={d}", .{m.sub_copies.items.len});
-    if (m.pushed == 0) {
-        var tx: c_int = 0;
-        var ty: c_int = 0;
-        _ = m.tree.node.coords(&tx, &ty);
-        var dx: i32 = 0;
-        var dy: i32 = 0;
-        _ = bn.node.coords(&dx, &dy);
-        const g = switch (m.view.backend) {
-            .xdg => |t| t.base.geometry,
-            .xwayland => wlroots.Box{ .x = 0, .y = 0, .width = surf.current.width, .height = surf.current.height },
-        };
-        dbg("GEOM tree=({d},{d}) pos=({d},{d}) dst=({d}x{d}) slot=({d}x{d}) surf=({d}x{d}) scale={d} sbuf=({?d}x{?d}) geo=({d},{d},{d}x{d}) cpies={d} vp={d} bw={d}", .{ tx, ty, dx, dy, bn.dst_width, bn.dst_height, m.slot_w, m.slot_h, surf.current.width, surf.current.height, surf.current.scale, if (surf.buffer) |b| b.base.width else null, if (surf.buffer) |b| b.base.height else null, g.x, g.y, g.width, g.height, live.items.len -| 1, context.viewport_x, bw });
-    }
 }
 
 pub fn updateMirrors(view: *View) void {
@@ -498,10 +643,8 @@ pub fn updateMirrors(view: *View) void {
                 if (m.surf) |msurf| {
                     const live_w: i32 = msurf.current.width;
                     const live_h: i32 = msurf.current.height;
-                    dbg("REPLACE-CHECK view={*} self={} live=({d},{d}) surf=({d},{d}) nat=({d},{d}) slotw={d}", .{ view, m.is_self, live_w, live_h, m.surf_w, m.surf_h, m.natural_w, m.natural_h, m.slot_w });
                     if (live_w != m.surf_w or live_h != m.surf_h) {
                         placeMirror(context, m, m.slot_x, m.slot_y, m.slot_w, m.slot_h);
-                        dbg("REPLACE-DID view={*} self={} now-slotw={d}", .{ view, m.is_self, m.slot_w });
                     }
                 }
                 // Every mirror is a copy: feed it the surface's OWN client
@@ -510,12 +653,6 @@ pub fn updateMirrors(view: *View) void {
                 // the scene buffer, so the texture stays in sync with the
                 // source (which lives in memory, its real surface hidden).
                 feedMirrorTree(m);
-                if (m.pushed % 8 == 0) {
-                    var sbox: wlroots.FBox = undefined;
-                    const scale = if (view.surfaceOrNull()) |ss| ss.current.scale else 0;
-                    if (view.surfaceOrNull()) |ss| ss.getBufferSourceBox(&sbox);
-                    std.log.warn("MIRROR COMMIT view={*} self={} slotx={} slotw={} natural=({},{}) scale={} src=({d:.0}x{d:.0})", .{ view, m.is_self, m.slot_x, m.slot_w, m.natural_w, m.natural_h, scale, sbox.width, sbox.height });
-                }
             }
             i += 1;
         }
@@ -665,6 +802,7 @@ pub fn activateMirrors(context: *ServerContext, row_idx: usize) void {
     for (rowViews(context, row_idx)) |view| {
         if (!isTiledCandidate(view)) continue;
         if (!hasAnyMirrors(context, view)) continue;
+        if (view.self_mirror_suppressed) continue;
         _ = activateMirror(context, view, row_idx, true);
     }
     // COPY mirrors: explicit mirrors on this row (from row_sources), rendered as
@@ -863,7 +1001,6 @@ fn placeMirror(context: *ServerContext, m: *ServerContext.Mirror, x: i32, y: i32
         var tx: c_int = 0;
         var ty: c_int = 0;
         _ = m.tree.node.coords(&tx, &ty);
-        dbg("PLACED2 self={} slot=({d},{d}) size={d}x{d} tree=({d},{d}) vp={d}", .{ m.is_self, x, y, box_w, box_h, tx, ty, context.viewport_x });
     }
     m.tree.node.setEnabled(true);
     // Inset the surface by the border like a real window; crop self-mirrors
@@ -909,10 +1046,86 @@ pub fn layoutMirrorsAll(context: *ServerContext) void {
     for (0..ServerContext.max_rows) |row| layoutRow(context, row);
 }
 
+/// A mirror hit translated back into source-surface space, plus the mirror
+/// that was hit (for scroll/anchor feedback) and its row.
+pub const InputTarget = struct {
+    surface: *wlroots.Surface,
+    sx: f64,
+    sy: f64,
+    mirror: *ServerContext.Mirror,
+    row: usize,
+};
+
+/// Translate a pointer/touch hit on one of `view`'s mirrors back into source
+/// coordinates. Mirror nodes are plain scene buffers (no wl_surface): resolveAt
+/// returns the source view with node-local coords, which callers would feed to
+/// the source surface as-is. A hit on a SubCopy node maps 1:1 to that copy's
+/// own surface; a hit on the mirror's main buffer maps through the geometry
+/// crop into the source surface. Returns null when `node` is not part of any
+/// of `view`'s mirrors.
+pub fn mirrorInputTarget(
+    context: *ServerContext,
+    view: *View,
+    node: *wlroots.SceneNode,
+    sx: f64,
+    sy: f64,
+) ?InputTarget {
+    const bw: i32 = context.border_width;
+    for (0..ServerContext.max_rows) |r| {
+        for (context.row_mirrors[r].items) |*m| {
+            if (!m.active or m.view != view) continue;
+            // SubCopy nodes are drawn at their copied surface's own size, so
+            // node-local coords are already the surface's coords.
+            for (m.sub_copies.items) |sc| {
+                if (node == &sc.node.node) {
+                    return .{ .surface = sc.src, .sx = sx, .sy = sy, .mirror = m, .row = r };
+                }
+            }
+            var cur: ?*wlroots.SceneNode = node;
+            var inside = false;
+            while (cur) |n| {
+                if (n == &m.tree.node) {
+                    inside = true;
+                    break;
+                }
+                cur = if (n.parent) |p| &p.node else null;
+            }
+            if (!inside) continue;
+            // Cursor in tree-local coords, then through the geometry crop.
+            var nx: c_int = 0;
+            var ny: c_int = 0;
+            _ = node.coords(&nx, &ny);
+            var tx: c_int = 0;
+            var ty: c_int = 0;
+            _ = m.tree.node.coords(&tx, &ty);
+            const tree_x: f64 = @as(f64, @floatFromInt(nx)) + sx - @as(f64, @floatFromInt(tx));
+            const tree_y: f64 = @as(f64, @floatFromInt(ny)) + sy - @as(f64, @floatFromInt(ty));
+            const cw: f64 = @floatFromInt(@max(1, m.slot_w - 2 * bw));
+            const ch: f64 = @floatFromInt(@max(1, m.slot_h - 2 * bw));
+            const surf = m.surf orelse continue;
+            const g = switch (view.backend) {
+                .xdg => |t| t.base.geometry,
+                .xwayland => wlroots.Box{ .x = 0, .y = 0, .width = surf.current.width, .height = surf.current.height },
+            };
+            if (g.width <= 0 or g.height <= 0 or cw <= 0 or ch <= 0) {
+                return .{ .surface = surf, .sx = sx, .sy = sy, .mirror = m, .row = r };
+            }
+            const bx: f64 = @floatFromInt(bw);
+            return .{
+                .surface = surf,
+                .sx = @as(f64, @floatFromInt(g.x)) + @as(f64, @floatFromInt(g.width)) * (tree_x - bx) / cw,
+                .sy = @as(f64, @floatFromInt(g.y)) + @as(f64, @floatFromInt(g.height)) * (tree_y - bx) / ch,
+                .mirror = m,
+                .row = r,
+            };
+        }
+    }
+    return null;
+}
+
 // internal helpers -----------------------------------------------------
 
 fn activateMirror(context: *ServerContext, view: *View, row_idx: usize, is_self: bool) ?*ServerContext.Mirror {
-    dbg("ACTIVATE row={d} self={} view={*} backend={s} surf={*} mapped={} floating={} fullscreen={}", .{ row_idx, is_self, view, @tagName(view.backend), view.surfaceOrNull() orelse null, view.isMapped(), view.floating, view.fullscreen });
     // EVERY mirror is a COPY: a manual scene buffer fed on each commit with
     // the surface's own client buffer + its damage region (the formula
     // wlroots' scene-surface reconfigure uses). The source view's real
@@ -1027,6 +1240,11 @@ pub fn extraTilesWidth(context: *ServerContext, view: *View) i32 {
 
 /// Total width lead copies (docked to no window) push the active row's first
 /// window right by.
+///
+/// Also includes the active row's `head_gap`: a mirror collapse that surfaced
+/// the real window at its last mirror tile's position left the source's home
+/// slot open, and this is every slot flow's single choke point (positions,
+/// drag reordering, animation), so the gap is honored everywhere for free.
 pub fn leadWidth(context: *ServerContext) i32 {
     var w: i32 = 0;
     if (context.active_row >= ServerContext.max_rows) return w;
@@ -1034,7 +1252,7 @@ pub fn leadWidth(context: *ServerContext) i32 {
         if (!m.active or m.is_self) continue;
         if (m.dock_view == null) w += renderedWidth(context, m.view) + context.gaps_in;
     }
-    return w;
+    return w + context.head_gap;
 }
 
 /// Re-dock copy `m` to the head of window `w`'s cluster (immediately after
@@ -1078,13 +1296,11 @@ pub fn raiseActiveRow(context: *ServerContext) void {
 }
 
 fn destroyMirrorTrees(context: *ServerContext, row_idx: usize) void {
-    dbg("DESTROY-MIRRORS row={d} n={d}", .{ row_idx, context.row_mirrors[row_idx].items.len });
     for (context.row_mirrors[row_idx].items) |*m| {
         tearDownMirror(m);
         m.tree.node.destroy();
     }
     context.row_mirrors[row_idx].clearRetainingCapacity();
-    dbg("DESTROYED-MIRRORS row={d}", .{row_idx});
 }
 
 fn findMirrors(context: *ServerContext, view: *View, row: usize) ?usize {

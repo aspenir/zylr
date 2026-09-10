@@ -108,14 +108,6 @@ fn zylrPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 pub fn main(init: std.process.Init) !void {
-    {
-        const gf = std.c.fopen("/tmp/zylr_genesis.log", "a") orelse return;
-        const boot_marker = [_]u8{ 'B', 'O', 'O', 'T' };
-        const nl = [1]u8{10};
-        _ = std.c.fwrite(&boot_marker, 1, boot_marker.len, gf);
-        _ = std.c.fwrite(&nl, 1, 1, gf);
-        _ = std.c.fclose(gf);
-    }
     wlroots.log.init(.debug, wlrLogHandler);
 
     const version = build_options.version;

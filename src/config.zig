@@ -30,12 +30,9 @@ pub const Action = enum {
     /// Switch to the workspace row above/below.
     row_up,
     row_down,
-    /// Pin the focused view to the row given as the first arg ("pin", "0").
+    /// Mirror the focused view to the row given as the first arg ("mirror", "0").
     /// Creates a mirror showing the same live content on the target row.
     mirror,
-    /// Remove the mirror of the focused view from the current row.
-    // TODO: reconsider merging `demirror` with `mirror`
-    demirror,
 };
 
 pub const Bind = struct {

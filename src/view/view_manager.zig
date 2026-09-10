@@ -35,6 +35,14 @@ pub fn removeView(
     if (i < ax.items.len) _ = ax.orderedRemove(i);
     if (i < aw.items.len) _ = aw.orderedRemove(i);
     _ = arr.orderedRemove(i);
+
+    // The window whose mirror collapse opened `head_gap` is gone: release the
+    // gap so the next layout pass flows remaining windows from the row start
+    // (the animation retargets to the gap-free flow on its next tick).
+    if (context.head_gap_owner == view) {
+        context.head_gap = 0;
+        context.head_gap_owner = null;
+    }
 }
 
 /// Move `view` to the column slot whose x-range covers `x` (logical px).

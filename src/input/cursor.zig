@@ -11,6 +11,7 @@ const LayerView = @import("../view/layer.zig");
 const View = @import("../view/view.zig");
 const ResizeEdge = @import("../server.zig").ResizeEdge;
 const PointerConstraints = @import("pointer_constraints.zig");
+const Mirror = @import("../mirror.zig");
 pub fn onCursorMotion(
     listener: *wl.Listener(*wlroots.Pointer.event.Motion),
     event: *wlroots.Pointer.event.Motion,
@@ -108,21 +109,17 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
                 const xw = view_ptr.backend.xwayland;
                 std.log.warn("PTR xwl win=0x{x} ored={} cl={?s} in={?s} tt={?s} hit={?*} sx={d:.0} sy={d:.0} cur=({d:.0},{d:.0})", .{ xw.window_id, xw.override_redirect, xw.class, xw.instance, xw.title, hit.surface, hit.sx, hit.sy, context.cursor.x, context.cursor.y });
             }
-            const surface = hit.surface orelse view_ptr.surface();
-
-            // Diag: mirrored sources are represented by mirrors; log what is
-            // actually under the cursor so we can see whether a click on a
-            // copy mirror hits the mirror or shadows to the window below.
-            if (!view_ptr.scene_tree.node.enabled) {
-                var lx: c_int = 0;
-                var ly: c_int = 0;
-                _ = hit.node.coords(&lx, &ly);
-                std.log.warn("PTR PIN view={*} surf={?} cursor=({d:.0},{d:.0}) surf_at=({d:.0},{d:.0}) node_type={s} node_x={} node_y={} coords=({},{}) enabled={}", .{ view_ptr, hit.surface, context.cursor.x, context.cursor.y, hit.sx, hit.sy, _nodeTypeName(hit.node.type), hit.node.x, hit.node.y, lx, ly, hit.node.enabled });
-            }
+            // Mirrors are plain scene buffers: resolveAt returns the source
+            // view with node-local coords, so route them through the mirror
+            // back into the source surface space or clicks land off-target.
+            const target = Mirror.mirrorInputTarget(context, view_ptr, hit.node, hit.sx, hit.sy);
+            const surface = if (target) |t| t.surface else (hit.surface orelse view_ptr.surface());
+            const ix = if (target) |t| t.sx else hit.sx;
+            const iy = if (target) |t| t.sy else hit.sy;
 
             const first_enter = context.focused_surface != surface;
             if (first_enter) {
-                context.seat.pointerNotifyEnter(surface, hit.sx, hit.sy);
+                context.seat.pointerNotifyEnter(surface, ix, iy);
                 context.focused_surface = surface;
             }
 
@@ -136,11 +133,22 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
                 !view_ptr.isOrWindow())
             {
                 FocusManager.setFocus(context, .{
-                    .view = .{ .view = view_ptr, .surface = hit.surface orelse view_ptr.surface(), .sx = hit.sx, .sy = hit.sy },
+                    .view = .{ .view = view_ptr, .surface = surface, .sx = ix, .sy = iy },
                 });
             }
+            if (context.cfg.focus_follows_mouse) {
+                if (target) |t| {
+                    if (!t.mirror.is_self) {
+                        // Hovered a mirror copy tile: pin the ring to it so a
+                        // later Super+q (or cycle) targets this copy even if
+                        // the pointer moved away in between.
+                        context.kbd_anchor_row = t.row;
+                        context.kbd_anchor_slot_x = t.mirror.slot_x;
+                    }
+                }
+            }
 
-            context.seat.pointerNotifyMotion(time_msec, hit.sx, hit.sy);
+            context.seat.pointerNotifyMotion(time_msec, ix, iy);
             // Xwayland only dispatches pointer motion on a wl_pointer.frame
             // (wl_pointer v5+). Sending one right after the motion over an
             // X window removes any cadence gap between the cursor's frame

@@ -203,10 +203,6 @@ pub fn runAction(
             if (row_idx >= ServerContext.max_rows) return;
             Mirror.mirrorToRow(context, view, row_idx);
         },
-        .demirror => {
-            const view = context.focused_view orelse return;
-            Mirror.deleteMirrorFromRow(context, view, context.active_row);
-        },
         .grow, .shrink => {
             const view = context.focused_view orelse return;
             pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_floating = view.floating } });
@@ -242,10 +238,16 @@ pub fn runAction(
         },
         .close => {
             if (target_view orelse context.focused_view) |view| {
+                // On a mirror copy tile (pointer-hovered or keyboard-ringed),
+                // close deletes only that copy. The source stays alive; its
+                // real surface / self-mirror resumes once no copies remain.
+                if (Mirror.closeFocusedMirrorCopy(context)) return;
                 view.sendClose();
             }
         },
-        .quit => context.server.terminate(),
+        .quit => {
+            context.server.terminate();
+        },
         .focus_left => {
             pushUndoEntry(context, .{ .focus = .{ .restore = context.focused_view } });
             FocusManager.focusColumnLeft(context);

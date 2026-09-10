@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 1);
     scanner.generate("wl_seat", 7);
+    scanner.generate("wl_data_device_manager", 3);
     scanner.generate("wl_output", 4);
 
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
@@ -53,6 +54,8 @@ pub fn build(b: *std.Build) void {
 
     scanner.addSystemProtocol("staging/tearing-control/tearing-control-v1.xml");
     scanner.generate("wp_tearing_control_manager_v1", 1);
+    scanner.addSystemProtocol("staging/color-management/color-management-v1.xml");
+    scanner.generate("wp_color_manager_v1", 2);
     scanner.addSystemProtocol("staging/ext-session-lock/ext-session-lock-v1.xml");
     scanner.generate("ext_session_lock_manager_v1", 1);
     scanner.addSystemProtocol("staging/ext-idle-notify/ext-idle-notify-v1.xml");

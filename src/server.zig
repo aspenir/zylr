@@ -230,6 +230,13 @@ viewport_x: i32 = 0,
 viewport_y: i32 = 0,
 viewport_target: i32 = 0,
 viewport_anim: f32 = 0,
+/// Lead gap held at the row head after a mirror collapse: when the last
+/// mirror tile stood to the right of the source's home slot (a same-row
+/// copy), the real window takes that tile's position and the vacated home
+/// slot stays open via this width. `head_gap_owner` is the window whose
+/// collapse opened it; cleared when that window closes.
+head_gap: i32 = 0,
+head_gap_owner: ?*View = null,
 
 // Workspace rows. `views`/animation arrays/viewport_x above are the
 // ACTIVE row's working set; the rest of the rows park their windows,

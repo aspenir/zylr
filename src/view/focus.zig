@@ -53,16 +53,37 @@ pub fn focusAtCursor(context: *ServerContext) void {
             switch (data.*) {
                 .view => |view| {
                     const view_ptr: *View = @ptrCast(@alignCast(view));
+                    // Mirrors are plain scene buffers: resolveAt resolved to
+                    // the source view with node-local coords, so translate
+                    // into the source surface before focusing (mirror nodes
+                    // have no surface of their own).
+                    const target = Mirror.mirrorInputTarget(context, view_ptr, node, sx, sy);
                     setFocus(context, .{
                         .view = .{
                             .view = view_ptr,
-                            .surface = NodeData.hitSurface(node),
-                            .sx = sx,
-                            .sy = sy,
+                            .surface = if (target) |t| t.surface else NodeData.hitSurface(node),
+                            .sx = if (target) |t| t.sx else sx,
+                            .sy = if (target) |t| t.sy else sy,
                         },
                     });
                     // Clicking a window hanging off-screen brings it in.
-                    // Popups are unmanaged; never scroll for them.
+                    // Popups are unmanaged; never scroll for them. Mirrors
+                    // are tiles of their own: anchor the ring on the clicked
+                    // mirror and scroll the row to it, like keyboard cycling
+                    // does - scrolling to the source's home slot would yank
+                    // the row away from the copy.
+                    if (target) |t| {
+                        const m = t.mirror;
+                        context.kbd_cycle_view = view_ptr;
+                        context.kbd_cycle_slot = m.slot_x;
+                        context.kbd_anchor_row = t.row;
+                        context.kbd_anchor_slot_x = m.slot_x;
+                        Mirror.refreshMirrorFocus(context);
+                        if (t.row == context.active_row) {
+                            ViewManager.scrollToX(context, m.slot_x, m.slot_w);
+                        }
+                        return;
+                    }
                     if (!view_ptr.isOrWindow()) {
                         ViewManager.scrollIntoView(context, view_ptr);
                     }
