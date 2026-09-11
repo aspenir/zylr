@@ -10,6 +10,9 @@ pub const Action = enum {
     spawn,
     close,
     quit,
+    /// Show an on-screen inspect toast for the focused window
+    /// (app_id/WM_CLASS + title + rule verdict).
+    inspect,
     focus_left,
     focus_right,
     viewport_up,
@@ -165,11 +168,32 @@ pub const WindowsConfig = struct {
     gaps_in: i32 = 8,
 };
 
+
+pub const Rule = struct {
+    class: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    rounding: ?i32 = null,
+    border_width: ?i32 = null,
+    border_color: ?[]const u8 = null,
+    blur: ?bool = null,
+    float: ?bool = null,
+};
+
+pub const CompiledRule = struct {
+    class: ?[]const u8,
+    title: ?[]const u8,
+    rounding: ?i32,
+    border_width: ?i32,
+    border_color: ?[4]f32,
+    blur: ?bool,
+    float: ?bool,
+};
 pub const Config = struct {
     keyboard: KeyboardConfig = .{ .preset = "gb" },
     decorations: DecorationsConfig = .{},
     windows: WindowsConfig = .{},
     autostart: []const []const u8 = &.{},
+    rules: []const Rule = &.{},
     keybinds: []const Bind = &default_keybinds,
     gestures: GestureConfig = .{},
     switches: []const SwitchBind = &.{},
@@ -207,6 +231,7 @@ const default_keybinds = [_]Bind{
     .{ .key = "Super+z", .action = .undo },
     .{ .key = "Super+f", .action = .toggle_fullscreen },
     .{ .key = "Super+q", .action = .close },
+    .{ .key = "Super+i", .action = .inspect },
     .{ .key = "Super+minus", .action = .shrink },
     .{ .key = "Super+equal", .action = .grow },
     .{ .key = "Super+Escape", .action = .quit },
@@ -287,6 +312,53 @@ pub fn parseKey(key: []const u8) !ParsedKey {
     if (@intFromEnum(sym) == 0) return error.UnknownKeysym;
 
     return .{ .mods = mods, .sym = @intFromEnum(sym) };
+}
+
+/// Simple glob matcher: `*` matches any run of characters, `?` matches one.
+fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var p: usize = 0;
+    var t: usize = 0;
+    var star: ?usize = null;
+    var mark: usize = 0;
+    while (t < text.len) {
+        if (p < pattern.len and (pattern[p] == '?' or pattern[p] == text[t])) {
+            p += 1;
+            t += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            p += 1;
+            mark = t;
+        } else if (star) |s| {
+            p = s + 1;
+            mark += 1;
+            t = mark;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
+}
+
+pub fn matchRule(rule: CompiledRule, app_id: []const u8, title: []const u8) bool {
+    if (rule.class) |c| if (!globMatch(c, app_id)) return false;
+    if (rule.title) |t| if (!globMatch(t, title)) return false;
+    return true;
+}
+
+pub fn compileRules(a: std.mem.Allocator, rules: []const Rule) ![]CompiledRule {
+    var out: std.ArrayListUnmanaged(CompiledRule) = .empty;
+    for (rules) |r| {
+        const bc = if (r.border_color) |c| parseColor(c) catch null else null;
+        try out.append(a, .{
+            .class = r.class,
+            .title = r.title,
+            .rounding = r.rounding,
+            .border_width = r.border_width,
+            .border_color = bc,
+            .blur = r.blur,
+            .float = r.float,
+        });
+    }
+    return try out.toOwnedSlice(a);
 }
 
 /// "#rgb", "#rrggbb" or "#rrggbbaa" -> straight-alpha RGBA, channels / 255.
@@ -434,6 +506,7 @@ pub const Loaded = struct {
     gestures: []const CompiledGesture,
     switches: []const CompiledSwitch,
     submaps: []const CompiledSubmap,
+    rules: []const CompiledRule,
     border_color: [4]f32,
     xkb_names: xkb.RuleNames,
 };
@@ -470,6 +543,8 @@ pub fn load(io: std.Io, a: std.mem.Allocator, log_missing: bool) Loaded {
     }
 
     var loaded: Loaded = .{
+        .rules = &.{},
+
         .cfg = cfg,
         .binds = &.{},
         .gestures = &.{},
@@ -524,6 +599,11 @@ pub fn load(io: std.Io, a: std.mem.Allocator, log_missing: bool) Loaded {
     loaded.border_color = parseColor(cfg.decorations.border.color) catch blk: {
         std.log.err("config: bad border color '{s}', using default", .{cfg.decorations.border.color});
         break :blk .{ 0.3, 0.6, 1.0, 1.0 };
+    };
+
+    loaded.rules = compileRules(a, cfg.rules) catch blk: {
+        std.log.err("config: bad rule, ignoring all rules", .{});
+        break :blk &.{};
     };
 
     return loaded;
@@ -632,6 +712,36 @@ test "compileGestures rejects direction/kind mismatches" {
 
 fn expectInvalid(a: std.mem.Allocator, binds: []const GestureBind) !void {
     try std.testing.expectError(error.InvalidGestureDir, compileGestures(a, binds));
+}
+
+
+test "globMatch basic patterns" {
+    try std.testing.expect(globMatch("org.wez*", "org.wezfurlong.wezterm"));
+    try std.testing.expect(globMatch("fire*fox", "firefox"));
+    try std.testing.expect(!globMatch("fire*fox", "firefoxcx"));
+    try std.testing.expect(globMatch("*", "anything"));
+    try std.testing.expect(!globMatch("*term", "termite"));
+    try std.testing.expect(globMatch("?", "x"));
+    try std.testing.expect(!globMatch("org.wez.*", "kitty"));
+    try std.testing.expect(!globMatch("fire", "firefox"));
+    try std.testing.expect(globMatch("", ""));
+    try std.testing.expect(globMatch("*", ""));
+    try std.testing.expect(!globMatch("x", ""));
+}
+
+test "matchRule checks class and title" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta: ziggy.Deserializer.Meta = .init;
+    const cfg = try ziggy.deserializeLeaky(Config, a,
+        \\.{ .rules = [ .{ .class = "firefox*", .rounding = 0 } ] }
+    , &meta, .{});
+    const rules = try compileRules(a, cfg.rules);
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expect(matchRule(rules[0], "firefox", "Title"));
+    try std.testing.expect(matchRule(rules[0], "firefox-esr", ""));
+    try std.testing.expect(!matchRule(rules[0], "chromium", ""));
 }
 
 test "submaps group out of the flat keybind list" {

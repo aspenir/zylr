@@ -53,7 +53,7 @@ pub fn applyConfig(context: *ServerContext) void {
 
 pub fn createForView(view: *View, tree: *wlroots.SceneTree) void {
     const blur = wlr_scene_blur_create(tree, 1, 1) orelse return;
-    const bw: i32 = @intCast(@max(0, view.context.border_width));
+    const bw: i32 = @intCast(@max(0, view.borderWidth()));
     const content_w = @max(1, view.slot_w - 2 * bw);
     const content_h = @max(1, view.slot_h - 2 * bw);
     wlr_scene_blur_set_size(blur, content_w, content_h);
@@ -86,7 +86,7 @@ pub fn updateForView(view: *View) void {
     const blur = view.blur_node orelse return;
     const node: *wlroots.SceneNode = @alignCast(@ptrCast(blur));
 
-    if (!view.context.cfg.decorations.blur.enabled) {
+    if (!view.blurEnabled()) {
         node.setEnabled(false);
         return;
     }
@@ -96,7 +96,7 @@ pub fn updateForView(view: *View) void {
     // and must show the blurred backdrop. Gating on opaque hid the blur
     // behind every opaque window, so "blur doesn't work when enabled."
     node.setEnabled(true);
-    const bw: i32 = @intCast(@max(0, view.context.border_width));
+    const bw: i32 = @intCast(@max(0, view.borderWidth()));
     const content_w = @max(1, view.slot_w - 2 * bw);
     const content_h = @max(1, view.slot_h - 2 * bw);
     wlr_scene_blur_set_size(blur, content_w, content_h);
@@ -106,7 +106,7 @@ pub fn updateForView(view: *View) void {
 
 /// Match the content area's inner corners: r -| 1.
 fn blurUpdateRadius(view: *View, blur: *SceneBlur) void {
-    const r: u16 = @intCast(@max(0, view.context.corner_radius));
+    const r: u16 = @intCast(@max(0, view.cornerRadius()));
     const inner_r: u16 = if (r > 0) r -| 1 else 0;
     wlr_scene_blur_set_corner_radius(blur, @intCast(inner_r));
 }

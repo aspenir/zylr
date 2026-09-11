@@ -294,6 +294,31 @@ pub fn scrollToView(
     scrollToViewNoLayout(context, view);
 }
 
+/// Center a floating view in the usable area and raise it to the top.
+/// Mirror copies are re-raised so a just-docked mirror stays above the
+/// window (they'd otherwise paint over each other).
+pub fn centerFloating(context: *ServerContext, view: *View) void {
+    // The xdg map event fires during commit processing, before zylr's
+    // commit listener sizes the slot, so a freshly-mapped floating view
+    // still carries its empty initial slot (~border width) here. Center
+    // the box the client actually committed, or the top-left corner lands
+    // at screen center and the window spills into the bottom-right.
+    if (view.surfaceOrNull()) |surf| {
+        if (surf.current.width > 0 and surf.current.height > 0) {
+            const bw: c_int = @intCast(view.borderWidth());
+            view.slot_w = surf.current.width + 2 * bw;
+            view.slot_h = surf.current.height + 2 * bw;
+        }
+    }
+    const vw: f32 = @floatFromInt(@max(1, context.usable_area.width));
+    const vh: f32 = @floatFromInt(@max(1, context.usable_area.height));
+    view.x = context.usable_area.x + @as(i32, @intFromFloat((vw - @as(f32, @floatFromInt(view.slot_w))) / 2));
+    view.y = context.usable_area.y + @as(i32, @intFromFloat((vh - @as(f32, @floatFromInt(view.slot_h))) / 2));
+    view.scene_tree.node.setPosition(view.x, view.y);
+    view.scene_tree.node.raiseToTop();
+    Mirror.raiseActiveRow(context);
+}
+
 /// Center the viewport on an arbitrary tile (e.g. a mirrored copy mirror tile
 /// that isn't a window's home slot): the tile's center lands on the screen
 /// center, matching scrollToView's behaviour for windows. Clamped to 0.

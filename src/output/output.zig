@@ -5,6 +5,7 @@ const std = @import("std");
 
 const AnimationManager = @import("../view/animation.zig");
 const Mirror = @import("../mirror.zig");
+const Osd = @import("../osd.zig");
 const ServerContext = @import("../server.zig");
 const OutputContext = @This();
 
@@ -183,6 +184,7 @@ pub fn onOutputFrame(listener: *wl.Listener(*wlroots.Output), output: *wlroots.O
     // Pace mirror kicks off the REAL output frame (once per vsync), never
     // off client commits: an unvsync'd kick loop hung the GPU pipeline.
     Mirror.onOutputFrame(context, &now);
+    Osd.onFrame(context);
 }
 extern fn clock_gettime(clk_id: c_int, tp: *anyopaque) c_int;
 const CLOCK_MONOTONIC: c_int = 1;

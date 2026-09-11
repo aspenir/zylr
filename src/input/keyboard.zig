@@ -10,6 +10,7 @@ const FocusManager = @import("../view/focus.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const Row = @import("../row.zig");
 const Mirror = @import("../mirror.zig");
+const Osd = @import("../osd.zig");
 const View = @import("../view/view.zig");
 const Blur = @import("../view/blur.zig");
 const Border = @import("../view/border.zig");
@@ -143,15 +144,7 @@ fn swapTiles(context: *ServerContext, dir: i32) void {
 
 /// Center a floating view on screen and raise it above tiled views.
 fn centerFloating(context: *ServerContext, view: *View) void {
-    const vw: f32 = @floatFromInt(@max(1, context.usable_area.width));
-    const vh: f32 = @floatFromInt(@max(1, context.usable_area.height));
-    view.x = context.usable_area.x + @as(i32, @intFromFloat((vw - @as(f32, @floatFromInt(view.slot_w))) / 2));
-    view.y = context.usable_area.y + @as(i32, @intFromFloat((vh - @as(f32, @floatFromInt(view.slot_h))) / 2));
-    view.scene_tree.node.setPosition(view.x, view.y);
-    view.scene_tree.node.raiseToTop();
-    // Keep the row's mirrors above the newly-raised window so they cannot
-    // paint over the mirrors.
-    Mirror.raiseActiveRow(context);
+    ViewManager.centerFloating(context, view);
 }
 
 /// Relayout views from `start_idx` onward, sync the client size,
@@ -231,6 +224,7 @@ pub fn runAction(
             a.free(context.gestures);
             a.free(context.switches);
             a.free(context.submaps);
+            a.free(context.rules);
             // A reloaded config may rename/remove submaps; leave the mode.
             context.active_submap = null;
             if (context.xkb_names.rules) |p| a.free(std.mem.span(p));
@@ -241,6 +235,7 @@ pub fn runAction(
 
             const loaded = Config.load(context.io, a, true);
             context.applyConfig(loaded);
+            for (context.views.items) |view| view.rulesApplyToLive(false);
             Blur.applyConfig(context);
             Border.applyConfig(context);
             OutputContext.applyScale(context);
@@ -262,6 +257,9 @@ pub fn runAction(
         },
         .quit => {
             context.server.terminate();
+        },
+        .inspect => {
+            Osd.inspect(context);
         },
         .focus_left => {
             pushUndoEntry(context, .{ .focus = .{ .restore = context.focused_view } });

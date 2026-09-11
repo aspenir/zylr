@@ -11,6 +11,7 @@ const Blur = @import("blur.zig");
 const AnimationManager = @import("animation.zig");
 const FocusManager = @import("focus.zig");
 const ViewManager = @import("view_manager.zig");
+const Config = @import("../config.zig");
 
 const View = @This();
 
@@ -28,6 +29,13 @@ node_data: NodeData = undefined,
 context: *ServerContext,
 border: ?Border = null,
 blur_node: ?*Blur.SceneBlur = null,
+    /// Rule-derived appearance overrides.  -1 / null = use global default.
+    rule_border_width: i32 = -1,
+    rule_corner_radius: i32 = -1,
+    rule_border_color: ?[4]f32 = null,
+    rule_blur_enabled: ?bool = null,
+    /// Pattern string of the last matching rule (for the inspect OSD).
+    rule_note: []const u8 = &.{},
 
 x: i32 = 0,
 y: i32 = 0,
@@ -37,11 +45,11 @@ custom_width: ?i32 = null,
 /// When true the view floats above the tiling layout: it keeps its
 /// current position and is excluded from tile calculations.
 floating: bool = false,
-    fullscreen: bool = false,
-    /// Authored by the user with Super+q on its self-mirror tile: the self
-    /// mirror at its home slot is suppressed until the view has no mirrors
-    /// left (then the flag resets and re-mirroring restores it).
-    self_mirror_suppressed: bool = false,
+fullscreen: bool = false,
+/// Authored by the user with Super+q on its self-mirror tile: the self
+/// mirror at its home slot is suppressed until the view has no mirrors
+/// left (then the flag resets and re-mirroring restores it).
+self_mirror_suppressed: bool = false,
 
 /// The tiling slot this view occupies (set by the backend commit
 /// handlers). The border ring fills it exactly, so the ring can never
@@ -62,8 +70,10 @@ animated_y: f32 = 0,
 /// Open fade-in in flight: opacity animates 0 -> 1 after map.
 fading_in: bool = false,
 fade_started: u64 = 0,
-/// Current rise-offset (px) during the open animation; 0 when idle.
-open_rise: f32 = 0,
+    /// Rules were applied before the first configure, so a float rule
+    /// wins the initial layout instead of being tiled first. Reload
+    /// re-derives appearance but never re-floats (set once per map).
+    rules_applied_once: bool = false,
 /// Close fade-out in flight: opacity animates 1 -> 0, then doClose() fires.
 fading_out: bool = false,
 fade_out_started: u64 = 0,
@@ -112,6 +122,30 @@ backend: Backend,
 /// created views (every XWayland surface, XDG toplevels pre-configure)
 /// and clients that withdrew after a brief map must not take a tiling
 /// slot, or they leave phantom gaps in the layout.
+/// Derive per-view appearance fields from compiled rules (later-wins).
+/// Called on map (`apply_float = true`: a matching rule may float the
+/// window) and on config reload (`apply_float = false`: appearance only,
+/// user toggles survive reload).
+pub fn rulesApplyToLive(self: *View, apply_float: bool) void {
+    const context = self.context;
+    self.rule_border_width = -1;
+    self.rule_corner_radius = -1;
+    self.rule_border_color = null;
+    self.rule_blur_enabled = null;
+    self.rule_note = &.{};
+    for (context.rules) |rule| {
+        if (!Config.matchRule(rule, std.mem.span(self.appId()), std.mem.span(self.title()))) continue;
+        self.rule_note = rule.class orelse rule.title orelse &.{};
+        if (apply_float) {
+            if (rule.float) |f| self.floating = f;
+        }
+        if (rule.rounding) |r| self.rule_corner_radius = r;
+        if (rule.border_width) |w| self.rule_border_width = w;
+        if (rule.border_color) |c| self.rule_border_color = c;
+        if (rule.blur) |b| self.rule_blur_enabled = b;
+    }
+}
+
 pub fn isMapped(view: *View) bool {
     const s = view.surfaceOrNull() orelse return false;
     return s.mapped;
@@ -128,6 +162,26 @@ pub fn isOrWindow(view: *View) bool {
         .xdg => false,
         .xwayland => |x| x.override_redirect,
     };
+}
+
+/// Per-view border width: rule override or global default.
+pub fn borderWidth(self: *View) i32 {
+    return if (self.rule_border_width >= 0) self.rule_border_width else self.context.border_width;
+}
+
+/// Per-view corner radius: rule override or global default.
+pub fn cornerRadius(self: *View) i32 {
+    return if (self.rule_corner_radius >= 0) self.rule_corner_radius else self.context.corner_radius;
+}
+
+/// Per-view border color: rule override or global default.
+pub fn borderColor(self: *View) [4]f32 {
+    return self.rule_border_color orelse self.context.focused_border_color;
+}
+
+/// Per-view blur enabled: rule override or global default.
+pub fn blurEnabled(self: *View) bool {
+    return self.rule_blur_enabled orelse self.context.cfg.decorations.blur.enabled;
 }
 
 pub fn surface(self: *View) *wlroots.Surface {
@@ -267,6 +321,11 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
     // layout slot, no scroll. Steam's menus open exactly where the X
     // server placed them and close if we re-activate the parent while
     // they are up, so we must not run them through setFocus.
+    // Rules already ran on the first commit (before the initial
+    // configure); re-run here so a rule that floats the window today
+    // also wins on the map path.
+    view.rulesApplyToLive(true);
+
     if (!view.isOrWindow()) {
         FocusManager.setFocus(context, .{
             .view = .{
@@ -276,6 +335,14 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
                 .sy = context.cursor.y - view.y,
             },
         });
+    }
+
+    // Rule-floated windows land mapped but were never given a position:
+    // the tiling pass skips floating views and the map-time slot was
+    // sized from the client's own geometry. Center them here, the same
+    // way a manual toggle does.
+    if (view.floating) {
+        ViewManager.centerFloating(context, view);
     }
 
     // The new window must take its tiling slot first, or the position
@@ -497,14 +564,14 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
     std.heap.c_allocator.destroy(view);
 }
 
-fn title(self: *View) [*:0]const u8 {
+pub fn title(self: *View) [*:0]const u8 {
     return switch (self.backend) {
         .xdg => |t| t.title orelse "",
         .xwayland => |x| if (x.title) |t| t else "",
     };
 }
 
-fn appId(self: *View) [*:0]const u8 {
+pub fn appId(self: *View) [*:0]const u8 {
     return switch (self.backend) {
         .xdg => |t| t.app_id orelse "",
         .xwayland => |x| if (x.class) |c| c else "",
@@ -517,6 +584,15 @@ pub fn onViewCommit(
 ) void {
     const view: *View =
         @fieldParentPtr("commit_listener", listener);
+
+    // Rules must land before the first commit sizes/configures the
+    // toplevel, or a float rule is overridden by a tiled initial
+    // configure (the slot computed as a full-width tile). Apply once
+    // per map; every view sends an initial commit before its first map.
+    if (!view.rules_applied_once) {
+        view.rulesApplyToLive(true);
+        view.rules_applied_once = true;
+    }
 
     switch (view.backend) {
         .xdg => |t| xdg_mod.commitToplevel(view, t, wlr_surface),

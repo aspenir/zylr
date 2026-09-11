@@ -1,4 +1,5 @@
-const std = @import("std");const ServerContext = @import("../server.zig");
+const std = @import("std");
+const ServerContext = @import("../server.zig");
 const Border = @import("border.zig");
 const ViewManager = @import("view_manager.zig");
 const Row = @import("../row.zig");
@@ -10,9 +11,6 @@ const row_transition_ms: u64 = 220;
 
 /// Length of a window's open fade-in / close fade-out in ms.
 const fade_duration_ms: u64 = 180;
-
-/// Distance (px) a window rises from below its slot while fading in.
-const open_rise_px: f32 = 24;
 
 /// Set the opacity of every scene buffer under `node` (a window's or mirror
 /// tree) to `opacity` (0..1). Borders are scene rects, not buffers, and are
@@ -64,12 +62,10 @@ pub fn tick(context: *ServerContext) void {
             const elapsed = now - view.fade_started;
             if (elapsed >= fade_duration_ms) {
                 view.fading_in = false;
-                view.open_rise = 0;
                 setTreeOpacity(&view.scene_tree.node, 1.0);
             } else {
                 const p = @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(fade_duration_ms));
                 const smooth = p * p * (3.0 - 2.0 * p); // smoothstep
-                view.open_rise = open_rise_px * (1.0 - smooth);
                 setTreeOpacity(&view.scene_tree.node, smooth);
                 still_animating = true;
             }
@@ -206,7 +202,6 @@ pub fn tick(context: *ServerContext) void {
         const scene_x: c_int = @intFromFloat(current - viewport_x);
         var scene_y: c_int = view.y - context.viewport_y;
         if (fade < 1.0) scene_y += @intFromFloat(@round(slide_off));
-        scene_y += @intFromFloat(@round(view.open_rise));
         view.scene_tree.node.setPosition(scene_x, scene_y);
         if (fade < 1.0) {
             setTreeOpacity(&view.scene_tree.node, fade);

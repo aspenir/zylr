@@ -622,10 +622,11 @@ pub fn commitToplevel(
     // client-side shadow margins can't overflow into the neighbour.
     // Floating views keep their own geometry: set the slot from the
     // actual surface size so the border draws correctly, but don't
-    // force them into a tile slot or send a configure.
+    // force them into a tile slot (except on the first commit, which
+    // must send a configure or the client never maps).
     if (view.floating or view.fullscreen) {
         if (view.floating) {
-            const bw: c_int = @intCast(context.border_width);
+            const bw: c_int = @intCast(view.borderWidth());
             // Size the ring from the client's real content box (the XDG
             // geometry), not the buffer, which can carry CSD shadow margins.
             // Using the buffer makes the right/bottom border band bw+margin
@@ -640,6 +641,13 @@ pub fn commitToplevel(
                 view.slot_w = @max(1, surface.current.width + 2 * bw);
                 view.slot_h = @max(1, surface.current.height + 2 * bw);
             }
+            // A float rule can run before the toplevel's first commit, so
+            // the initial configure must still be sent or the client
+            // never maps. Size 0 = "choose your own natural size",
+            // the standard way to float a window.
+            if (xdg_toplevel.base.initial_commit) {
+                _ = xdg_toplevel.setSize(0, 0);
+            }
         }
         return;
     }
@@ -650,7 +658,7 @@ pub fn commitToplevel(
     // the toplevel's content box is the slot inset by the
     // border width. The scene surface sits at +bw inside the slot, so a
     // slot-sized ring can wrap it without spilling into neighbours.
-    const bw: c_int = @intCast(context.border_width);
+    const bw: c_int = @intCast(view.borderWidth());
     const content_w = @max(1, ew - 2 * bw);
     const content_h = @max(1, eh - 2 * bw);
 

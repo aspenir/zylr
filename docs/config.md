@@ -34,6 +34,30 @@ Colors take `#rgb`, `#rrggbb`, or `#rrggbbaa`.
 .scale = 0                 # output scale override; 0 = whatever the display wants
 ```
 
+
+## rules
+
+Per-window overrides, matched against app class (XDG `app_id` / XWayland class)
+and title with `*` (any run) and `?` (one char) globs. Later rules win: last
+matching rule's fields take effect. Apply on map and on `reload_config`.
+
+```ziggy
+.rules = [
+    // Steam's login window: square, no border.
+    .{ .class = "steam", .title = "*Login*", .rounding = 0, .border_width = 0 },
+    // Float anything named "Calculator".
+    .{ .title = "Calculator", .float = true },
+    // Blur only terminals, rounded further, with a fat magenta border.
+    .{ .class = "org.wez*", .blur = true, .rounding = 24,
+       .border_width = 4, .border_color = "#ff00aa" },
+]
+```
+
+Fields: `class`, `title` (globs), `rounding` (i32), `border_width` (i32),
+`border_color` (color string), `blur` (bool), `float` (bool).
+All optional — omit what you don't want to override. `float` only applies at
+map time (reloads keep your manual toggle).
+
 ## autostart
 
 ```ziggy
