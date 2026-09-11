@@ -8,6 +8,7 @@ const ServerContext = @import("../server.zig");
 const Row = @import("../row.zig");
 const Border = @import("border.zig");
 const Blur = @import("blur.zig");
+const AnimationManager = @import("animation.zig");
 const FocusManager = @import("focus.zig");
 const ViewManager = @import("view_manager.zig");
 
@@ -57,6 +58,15 @@ scene_buffer_node: ?*wlroots.SceneNode = null,
 
 animated_x: f32 = 0,
 animated_y: f32 = 0,
+
+/// Open fade-in in flight: opacity animates 0 -> 1 after map.
+fading_in: bool = false,
+fade_started: u64 = 0,
+/// Current rise-offset (px) during the open animation; 0 when idle.
+open_rise: f32 = 0,
+/// Close fade-out in flight: opacity animates 1 -> 0, then doClose() fires.
+fading_out: bool = false,
+fade_out_started: u64 = 0,
 
 map_listener: wl.Listener(void) = undefined,
 unmap_listener: wl.Listener(void) = undefined,
@@ -133,7 +143,25 @@ pub fn surfaceOrNull(self: *View) ?*wlroots.Surface {
     };
 }
 
+/// Start the close fade-out (or close immediately if the window is barely
+/// visible from an unfinished open fade). The actual wlroots close fires
+/// only after the fade completes, so the tree stays alive for every frame
+/// of the animation.
 pub fn sendClose(self: *View) void {
+    if (self.fading_out) return;
+    // If the window is still fading in, skip the fade-out: it is barely
+    // visible and disappearing instantly looks correct.
+    if (self.fading_in) {
+        self.fading_in = false;
+        self.doClose();
+        return;
+    }
+    self.fading_out = true;
+    self.fade_out_started = self.context.nowMs();
+    AnimationManager.wake(self.context);
+}
+
+pub fn doClose(self: *View) void {
     switch (self.backend) {
         .xdg => |t| t.sendClose(),
         .xwayland => |x| x.close(),
@@ -227,7 +255,13 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
         if (context.output) |out| handle.outputEnter(out);
     }
 
+    // Zero the tree's opacity before revealing it so the fade starts
+    // invisible (no 1-frame flash at full opacity), then start the fade.
+    view.fading_in = true;
+    view.fade_started = context.nowMs();
+    AnimationManager.setTreeOpacity(&view.scene_tree.node, 0);
     view.scene_tree.node.setEnabled(true);
+    AnimationManager.wake(context);
 
     // Override-redirect windows are unmanaged: no keyboard focus, no
     // layout slot, no scroll. Steam's menus open exactly where the X
@@ -287,6 +321,8 @@ pub fn onSurfaceUnmap(listener: *wl.Listener(void)) void {
 
     std.log.info("SURFACE UNMAPPED", .{});
 
+    view.fading_in = false;
+    view.fading_out = false;
     view.scene_tree.node.setEnabled(false);
 
     if (view.toplevel_handle) |handle| {
