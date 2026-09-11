@@ -194,6 +194,8 @@ corner_radius: i32 = 16,
 keybinds: []const Config.CompiledBind = &.{},
     /// Compiled submap bind sets (see config `submaps`).
     submaps: []const Config.CompiledSubmap = &.{},
+/// Compiled window rules (see config `rules`); matched per-view at map/reload.
+rules: []const Config.CompiledRule = &.{},
     /// Name of the currently active submap (mode); null = root bind set.
     active_submap: ?[]const u8 = null,
 /// Compiled gesture table; matched at swipe/pinch/hold end.
@@ -222,6 +224,12 @@ views_tree: ?*wlroots.SceneTree = null,
 top_tree: ?*wlroots.SceneTree = null,
 overlay_tree: ?*wlroots.SceneTree = null,
 fullscreen_tree: ?*wlroots.SceneTree = null,
+/// On-screen inspect toast (super+i): a self-drawn text card over the
+/// scene root. Above every layer tree; below the cursor.
+osd_tree: ?*wlroots.SceneTree = null,
+osd_buffer: ?*wlroots.Buffer = null,
+osd_node: ?*wlroots.SceneBuffer = null,
+osd_expiry: u64 = 0,
 
 xcursor_manager: *XCursorManager,
 server: *wl.Server,
@@ -372,6 +380,7 @@ pub fn applyConfig(self: *@This(), loaded: Config.Loaded) void {
     self.gestures = loaded.gestures;
     self.switches = loaded.switches;
     self.submaps = loaded.submaps;
+    self.rules = loaded.rules;
     self.xkb_names = loaded.xkb_names;
     self.corner_radius = loaded.cfg.decorations.rounding;
     self.border_width = loaded.cfg.decorations.border.width;

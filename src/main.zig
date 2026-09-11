@@ -321,6 +321,7 @@ pub fn main(init: std.process.Init) !void {
     context.top_tree = try scene.tree.createSceneTree();
     context.overlay_tree = try scene.tree.createSceneTree();
     context.fullscreen_tree = try scene.tree.createSceneTree();
+    context.osd_tree = try scene.tree.createSceneTree();
 
     // Input-method relay (zwp_input_method_v2 / zwp_text_input_v3): feeds
     // on-screen keyboards like squeekboard. Must be wired before clients

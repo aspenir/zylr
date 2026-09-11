@@ -632,7 +632,7 @@ pub fn updateMirrors(view: *View) void {
             if (m.view == view) {
                 if (m.border_rect) |br| {
                     const br_enabled = m.view == context.focused_view;
-                    Border.updateBorderRect(context, br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)));
+                    Border.updateBorderRect(br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)), context.focused_border_color, bw);
                 }
                 m.pushed +|= 1;
                 // Re-place on a surface size change: placeMirror bakes the
@@ -1014,7 +1014,7 @@ fn placeMirror(context: *ServerContext, m: *ServerContext.Mirror, x: i32, y: i32
     // Border ring via the shared view-border renderer, framed on the tile.
     if (m.border_rect) |br| {
         const br_enabled = m.view == context.focused_view;
-        Border.updateBorderRect(context, br, content_w, content_h, box_w, box_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)));
+        Border.updateBorderRect(br, content_w, content_h, box_w, box_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)), context.focused_border_color, bw);
     }
 }
 
@@ -1033,7 +1033,7 @@ pub fn refreshMirrorFocus(context: *ServerContext) void {
                 r == context.kbd_anchor_row and
                 m.slot_x == context.kbd_anchor_slot_x;
             const enabled = if (anchored) on_anchor else is_target;
-            Border.updateBorderRect(context, br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, enabled, @intCast(@max(0, context.corner_radius - 1)));
+            Border.updateBorderRect(br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, enabled, @intCast(@max(0, context.corner_radius - 1)), context.focused_border_color, bw);
         }
     }
 }

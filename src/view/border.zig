@@ -18,12 +18,10 @@ const Border = @This();
 rect: *wlroots.SceneRect,
 
 pub fn createViewBorder(view: *View) void {
-    const context = view.context;
-
-    // The rect lives INSIDE the view tree, below the surface, so it
+    const context = view.context;    // The rect lives INSIDE the view tree, below the surface, so it
     // moves and scrolls with the window; sibling order keeps the client
     // and any popups/sub-surfaces above it (and above its input region).
-    const color = context.focused_border_color;
+    const color = view.borderColor();
     const rect = view.scene_tree.createSceneRect(0, 0, &color) catch return;
     rect.node.data = &view.node_data;
 
@@ -152,7 +150,7 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
     const width = surface.current.width;
     const height = surface.current.height;
 
-    const bw = context.border_width;
+    const bw = view.borderWidth();
 
     // XDG: a non-zero geometry offset means the client renders its own
     // frame (GTK shadow margins) inside the buffer. wlroots pins the
@@ -170,7 +168,7 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
     // carries the border width on top, and the surface edge is pulled
     // 1px inside the border so the two antialiased edges don't leave a
     // fringe between them. Rounding 0 leaves the border square.
-    const r: u16 = @intCast(@max(0, context.corner_radius));
+    const r: u16 = @intCast(@max(0, view.cornerRadius()));
 
     if (r > 0) roundAllBuffers(view, r -| 1);
     // Re-do the sibling order here too: the surface tree only appears
@@ -246,7 +244,7 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
         else => height,
     };
 
-    updateBorderRect(context, rect, content_w, content_h, ring_w, ring_h, enabled, if (r > 0) r -| 1 else 0);
+    updateBorderRect(rect, content_w, content_h, ring_w, ring_h, enabled, if (r > 0) r -| 1 else 0, view.borderColor(), view.borderWidth());
 }
 
 /// Draw the shared ring for a border rect: a full box with
@@ -259,7 +257,6 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
 ///                           inset by `border_width` in the rect's local
 ///                           coords).
 pub fn updateBorderRect(
-    context: *ServerContext,
     rect: *wlroots.SceneRect,
     content_w: i32,
     content_h: i32,
@@ -267,15 +264,15 @@ pub fn updateBorderRect(
     slot_h: i32,
     enabled: bool,
     inner_r: u16,
+    color: [4]f32,
+    bw: i32,
 ) void {
     if (!enabled or slot_w <= 0 or slot_h <= 0) {
         rect.node.setEnabled(false);
         return;
     }
 
-    const bw = context.border_width;
-    const color = context.focused_border_color;
-    const r: u16 = @intCast(@max(0, context.corner_radius));
+    const r: u16 = @intCast(@max(0, inner_r));
 
     rect.setColor(&color);
     rect.setSize(slot_w, slot_h);

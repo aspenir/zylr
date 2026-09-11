@@ -263,7 +263,7 @@ fn onRequestConfigure(
 
     if (view.floating or view.fullscreen or xw.override_redirect) {
         _ = xw.configure(ev.x, ev.y, ev.width, ev.height);
-        const bw: i32 = @intCast(view.context.border_width);
+        const bw: i32 = @intCast(view.borderWidth());
         view.slot_w = @max(1, @as(i32, ev.width) + 2 * bw);
         view.slot_h = @max(1, @as(i32, ev.height) + 2 * bw);
         return;
@@ -354,7 +354,7 @@ pub fn commitSurface(
     // Floating views keep their own geometry.
     if (view.floating or view.fullscreen) {
         if (view.floating) {
-            const bw: c_int = @intCast(context.border_width);
+            const bw: c_int = @intCast(view.borderWidth());
             view.slot_w = @max(1, surface.current.width + 2 * bw);
             view.slot_h = @max(1, surface.current.height + 2 * bw);
             if (view.surface_tree) |wrap| {
@@ -371,7 +371,7 @@ pub fn commitSurface(
     // configure the content box to slot-2bw at slot+(bw,bw), and inset + crop the
     // content subtree to that box so shadow margins or a stale buffer
     // can never cover the ring band.
-    const bw: c_int = @intCast(context.border_width);
+    const bw: c_int = @intCast(view.borderWidth());
     const target_w: c_int = @max(1, ew - 2 * bw);
     const target_h: c_int = @max(1, eh - 2 * bw);
 
