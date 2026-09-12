@@ -36,6 +36,7 @@ pub fn switchTo(context: *ServerContext, new_row: usize) void {
         .views = context.views,
         .animation_x = context.animation_x,
         .animation_w = context.animation_w,
+        .animation_y = context.animation_y,
         .scroll_x = context.viewport_x,
         .target_x = context.viewport_target,
     };
@@ -48,12 +49,14 @@ pub fn switchTo(context: *ServerContext, new_row: usize) void {
         context.views = loaded.views;
         context.animation_x = loaded.animation_x;
         context.animation_w = loaded.animation_w;
+        context.animation_y = loaded.animation_y;
         context.viewport_x = loaded.scroll_x;
         context.viewport_target = loaded.target_x;
     } else {
         context.views = .empty;
         context.animation_x = .empty;
         context.animation_w = .empty;
+        context.animation_y = .empty;
         context.viewport_x = 0;
         context.viewport_target = 0;
     }

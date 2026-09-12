@@ -15,13 +15,27 @@ pub const Action = enum {
     inspect,
     focus_left,
     focus_right,
+    /// Move focus to the pile member above/below the focused view.
+    focus_up,
+    focus_down,
     viewport_up,
     viewport_down,
-    /// Multiply the focused window's width by 1.15 (or /1.15).
+    /// Multiply the focused window's width by 1.15 (or /1.15). On a pile
+    /// member, widens/narrows the whole column (all members share it).
     grow,
     shrink,
+    /// Adjust the focused pile member's vertical share inside its column.
+    grow_share,
+    shrink_share,
+    /// Move the focused pile member one slot up/down inside its column.
+    pile_up,
+    pile_down,
     reload_config,
     toggle_floating,
+    /// niri-style consume: move the focused window into the neighboring
+    /// column (Super+[ = the column to the left, Super+] = to the right).
+    consume_left,
+    consume_right,
     swap_left,
     swap_right,
     undo,
@@ -224,6 +238,8 @@ const default_keybinds = [_]Bind{
     .{ .key = "Super+j", .action = .row_down },
     .{ .key = "Super+k", .action = .row_up },
     .{ .key = "Super+l", .action = .focus_right },
+    .{ .key = "Super+[", .action = .consume_left },
+    .{ .key = "Super+]", .action = .consume_right },
     .{ .key = "Super+space", .action = .spawn, .args = &.{"fuzzel"} },
     .{ .key = "Super+v", .action = .toggle_floating },
     .{ .key = "Super+Shift+h", .action = .swap_left },
@@ -290,12 +306,45 @@ pub const ParsedKey = struct { mods: u32, sym: u32 };
 
 /// "Super+Ctrl+o" -> { mods mask, keysym }. Everything before the last '+'
 /// must name a modifier; the last token is an xkb keysym name.
+/// Single-character keys mapped to their canonical XKB keysym names
+/// (xkb_keysym_from_name does not accept literal punctuation).
+const char_keysyms = [_]struct { ch: u8, name: []const u8 }{
+    .{ .ch = '[', .name = "bracketleft" },
+    .{ .ch = ']', .name = "bracketright" },
+    .{ .ch = '<', .name = "less" },
+    .{ .ch = '>', .name = "greater" },
+    .{ .ch = ',', .name = "comma" },
+    .{ .ch = '.', .name = "period" },
+    .{ .ch = ';', .name = "semicolon" },
+    .{ .ch = '\'', .name = "apostrophe" },
+    .{ .ch = '/', .name = "slash" },
+    .{ .ch = '\\', .name = "backslash" },
+    .{ .ch = '-', .name = "minus" },
+    .{ .ch = '=', .name = "equal" },
+};
+
+/// Shifted counterparts for the keysyms most binds use with Shift. Only
+/// pairs that are identical across layouts made the list (no digits,
+/// apostrophe, backslash — those differ between us/gb).
+/// ponytail: layout-independent pairs only; if a Shift+punct bind stops
+/// firing on a specific layout, add its pair here.
+const shift_pairs = [_]struct { base: []const u8, shifted: []const u8 }{
+    .{ .base = "equal", .shifted = "plus" },
+    .{ .base = "minus", .shifted = "underscore" },
+    .{ .base = "bracketleft", .shifted = "braceleft" },
+    .{ .base = "bracketright", .shifted = "braceright" },
+    .{ .base = "comma", .shifted = "less" },
+    .{ .base = "period", .shifted = "greater" },
+    .{ .base = "semicolon", .shifted = "colon" },
+    .{ .base = "slash", .shifted = "question" },
+};
+
 pub fn parseKey(key: []const u8) !ParsedKey {
     var mods: u32 = 0;
 
     const last_plus = std.mem.lastIndexOfScalar(u8, key, '+');
     const mod_part = if (last_plus) |i| key[0..i] else "";
-    const sym_name = if (last_plus) |i| key[i + 1 ..] else key;
+    var sym_name = if (last_plus) |i| key[i + 1 ..] else key;
 
     var it = std.mem.splitScalar(u8, mod_part, '+');
     while (it.next()) |tok| {
@@ -303,9 +352,42 @@ pub fn parseKey(key: []const u8) !ParsedKey {
         mods |= modBit(tok) orelse return error.UnknownModifier;
     }
 
+    // Keysym names may arrive with any casing ("Equal", "BRACKETLEFT");
+    // tables below are lowercase, so normalize a mutable copy up front.
+    if (sym_name.len == 0) return error.UnknownKeysym;
     var buf: [64]u8 = undefined;
-    if (sym_name.len == 0 or sym_name.len >= buf.len) return error.UnknownKeysym;
+    if (sym_name.len >= buf.len) return error.UnknownKeysym;
     @memcpy(buf[0..sym_name.len], sym_name);
+    for (buf[0..sym_name.len]) |*c| c.* = std.ascii.toLower(c.*);
+    sym_name = buf[0..sym_name.len];
+
+    // Literal punctuation isn't a valid XKB keysym name ("[" parses to
+    // NoSymbol), so map the common ones to their canonical names.
+    if (sym_name.len == 1) {
+        for (char_keysyms) |m| {
+            if (sym_name[0] == m.ch) {
+                sym_name = m.name;
+                break;
+            }
+        }
+    }
+
+    // A bind like "Shift+equal" must match what the keyboard ACTUALLY
+    // produces while Shift is held: "=" becomes "+", "-" becomes "_",
+    // etc. Remove the shift flag comment and resolve the shifted keysym.
+    if ((mods & (1 << 0)) != 0) {
+        for (shift_pairs) |m| {
+            if (std.mem.eql(u8, sym_name, m.base)) {
+                sym_name = m.shifted;
+                break;
+            }
+        }
+    }
+
+    if (sym_name.len >= buf.len) return error.UnknownKeysym;
+    // sym_name may already live inside buf (the lowercased copy), so an
+    // aliasing @memcpy would panic; copyForwards permits overlap.
+    std.mem.copyForwards(u8, buf[0..sym_name.len], sym_name);
     buf[sym_name.len] = 0;
 
     const sym = xkb.Keysym.fromName(buf[0..sym_name.len :0], .case_insensitive);
@@ -637,6 +719,22 @@ test "parseKey resolves modifiers and named keysyms" {
 
     try std.testing.expectError(error.UnknownModifier, parseKey("Hyper+o"));
     try std.testing.expectError(error.UnknownKeysym, parseKey("NotAKeysymName"));
+
+    // Literal punctuation maps to canonical keysym names (Super+[, Super+]).
+    const lb = try parseKey("Super+[");
+    try std.testing.expectEqual(@as(u32, xkb.Keysym.bracketleft), lb.sym);
+    const rb = try parseKey("Super+]");
+    try std.testing.expectEqual(@as(u32, xkb.Keysym.bracketright), rb.sym);
+
+    // Shifted binds must resolve to what the key produces while Shift is
+    // held ("=" -> plus 0x2b, "-" -> underscore 0x5f), not the base sym.
+    const se = try parseKey("Super+Shift+Equal");
+    try std.testing.expectEqual(@as(u32, 0x2b), se.sym);
+    try std.testing.expectEqual(@as(u32, 0x41), se.mods);
+    const sm = try parseKey("Super+Shift+Minus");
+    try std.testing.expectEqual(@as(u32, 0x5f), sm.sym);
+    const sb = try parseKey("Super+Shift+[");
+    try std.testing.expectEqual(@as(u32, 0x7b), sb.sym);
 }
 
 test "parseColor accepts short, long and alpha forms" {

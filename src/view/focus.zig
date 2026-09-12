@@ -350,6 +350,9 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
 pub const FocusTile = struct {
     x: f64,
     w: f64,
+    /// Vertical centre of the tile (window slot or mirror slot), so
+    /// column jumps can land on the member at the same eye-line.
+    cy: f64,
     view: *View,
     /// When true this tile is a mirror copy; its slot_x is the copy's
     /// own column (scroll there instead of the source's home slot).
@@ -369,7 +372,7 @@ pub fn buildRowTiles(context: *ServerContext, tiles: *[128]FocusTile) usize {
     for (context.views.items) |v| {
         if (!v.isMapped() or v.floating or v.fullscreen) continue;
         if (n < 128) {
-            tiles[n] = .{ .x = @floatFromInt(v.x), .w = @floatFromInt(ViewManager.getViewWidth(v)), .view = v, .mirror_slot_x = -1 };
+            tiles[n] = .{ .x = @floatFromInt(v.x), .w = @floatFromInt(ViewManager.tiledWidth(context, v)), .cy = @as(f64, @floatFromInt(v.y)) + @as(f64, @floatFromInt(v.slot_h)) / 2, .view = v, .mirror_slot_x = -1 };
             n += 1;
         }
     }
@@ -377,7 +380,7 @@ pub fn buildRowTiles(context: *ServerContext, tiles: *[128]FocusTile) usize {
     for (context.row_mirrors[context.active_row].items) |*m| {
         if (!m.active or m.is_self or m.slot_x == std.math.minInt(i32)) continue;
         if (n < 128) {
-            tiles[n] = .{ .x = @floatFromInt(m.slot_x), .w = @floatFromInt(m.slot_w), .view = m.view, .mirror_slot_x = @floatFromInt(m.slot_x), .mirror = m };
+            tiles[n] = .{ .x = @floatFromInt(m.slot_x), .w = @floatFromInt(m.slot_w), .cy = @as(f64, @floatFromInt(m.slot_y)) + @as(f64, @floatFromInt(m.slot_h)) / 2, .view = m.view, .mirror_slot_x = @floatFromInt(m.slot_x), .mirror = m };
             n += 1;
         }
     }
@@ -389,45 +392,6 @@ pub fn buildRowTiles(context: *ServerContext, tiles: *[128]FocusTile) usize {
         }
     }.lt);
     return n;
-}
-
-fn tileCycle(context: *ServerContext, dir: i2) ?FocusTile {
-    var tiles: [128]FocusTile = undefined;
-    const n = buildRowTiles(context, &tiles);
-    if (n == 0) return null;
-
-    // Anchor on the EXACT tile the last cycle press landed on (which may be
-    // a copy mirror, not the view's home), falling back to the focused
-    // view's home slot. This lets cycling step past copies: from A's copy,
-    // the next step is B, not A's copy again.
-    const current = context.kbd_cycle_view orelse context.focused_view;
-    var idx: usize = 0;
-    if (current) |cv| {
-        var found = false;
-        for (tiles[0..n], 0..) |t, i| {
-            if (t.view == cv and @as(i32, @intFromFloat(t.mirror_slot_x)) == context.kbd_cycle_slot) {
-                idx = i;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            for (tiles[0..n], 0..) |t, i| {
-                if (t.view == cv) {
-                    idx = i;
-                    break;
-                }
-            }
-        }
-    }
-    // One keypress = exactly one tile, NO wrapping: at the row edges the
-    // press keeps the current tile (stays put) instead of jumping to the far
-    // side. A window's copy sits right after its home slot, so Step+L from a
-    // window lands on its own copy tile first, then the next window.
-    const step: i64 = if (dir > 0) 1 else -1;
-    const next: i64 = @as(i64, @intCast(idx)) + step;
-    if (next < 0 or next >= n) return tiles[idx];
-    return tiles[@intCast(next)];
 }
 
 fn focusFirst(context: *ServerContext) void {
@@ -463,23 +427,105 @@ fn focusTile(context: *ServerContext, t: FocusTile) void {
     }
 }
 
-fn cycleStep(context: *ServerContext, dir: i2) void {
+/// Focus the adjacent column to the focused window's own (dir -1 = left,
+/// +1 = right). A column is a run of tiles sharing the same x: every pile
+/// member plus any copy mirrors docked in it, so Super+h/l always cross a
+/// whole column, never step inside one. Inside the target column the tile
+/// with the closest vertical centre wins, so the focus keeps its eye-line.
+/// At a row edge the press stays put (no wrap).
+fn focusColumn(context: *ServerContext, dir: i32) void {
     if (context.focused_view == null) {
         focusFirst(context);
         return;
     }
-    const t = tileCycle(context, dir) orelse {
-        focusFirst(context);
-        return;
-    };
-    std.log.warn("CYCLE dir={} n=2 tile_x={d:.0} mirror={} view={*}", .{ dir, t.x, t.mirror_slot_x >= 0, t.view });
-    focusTile(context, t);
+    var tiles: [128]FocusTile = undefined;
+    const n = buildRowTiles(context, &tiles);
+    if (n < 2) return;
+
+    // Anchor on the exact tile the ring is on (a copy mirror, else the
+    // focused view's home slot), so presses keep landing where the user is.
+    const anchor = context.kbd_cycle_view orelse context.focused_view.?;
+    var cur: usize = 0;
+    var found = false;
+    if (context.kbd_cycle_view != null) {
+        for (tiles[0..n], 0..) |t, i| {
+            if (t.view == anchor and @as(i32, @intFromFloat(t.mirror_slot_x)) == context.kbd_cycle_slot) {
+                cur = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        for (tiles[0..n], 0..) |t, i| {
+            if (t.view == anchor and t.mirror_slot_x < 0) {
+                cur = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        for (tiles[0..n], 0..) |t, i| {
+            if (t.view == anchor) {
+                cur = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) return;
+
+    // Step past the anchor column's own tiles toward the neighbour column.
+    const ax = tiles[cur].x;
+    var j: i64 = @as(i64, @intCast(cur)) + dir;
+    while (j >= 0 and j < n and tiles[@intCast(j)].x == ax) j += dir;
+    if (j < 0 or j >= n) return;
+    const gs: usize = @intCast(j);
+    var g_end = gs + 1;
+    while (g_end < n and tiles[g_end].x == tiles[gs].x) g_end += 1;
+
+    // Land on the tile of the target column nearest the focused eye-line.
+    const fv = context.focused_view.?;
+    const fy = @as(f64, @floatFromInt(fv.y)) + @as(f64, @floatFromInt(fv.slot_h)) / 2;
+    var best = gs;
+    var best_d: f64 = std.math.inf(f64);
+    for (gs..g_end) |i| {
+        const d = if (tiles[i].cy > fy) tiles[i].cy - fy else fy - tiles[i].cy;
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    focusTile(context, tiles[best]);
 }
 
 pub fn focusColumnLeft(context: *ServerContext) void {
-    cycleStep(context, -1);
+    focusColumn(context, -1);
+}
+
+/// Move keyboard focus to the pile member above/below the focused view
+/// (dir -1 = up, +1 = down). No-op when the focus isn't a pile member or
+/// the column edge is reached. Anchors the horizontal tile ring on the
+/// chosen member's home tile so focus_left/right still step cleanly.
+pub fn focusPile(context: *ServerContext, dir: i32) void {
+    const view = context.focused_view orelse return;
+    if (view.pile_id == 0) return;
+    const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse return;
+    const i: i64 = @as(i64, @intCast(idx)) + dir;
+    if (i < 0 or i >= @as(i64, @intCast(context.views.items.len))) return;
+    const j: usize = @intCast(i);
+    if (context.views.items[j].pile_id != view.pile_id) return;
+    const target = context.views.items[j];
+    context.kbd_cycle_view = target;
+    context.kbd_cycle_slot = -1;
+    context.kbd_anchor_slot_x = -1;
+    setFocus(context, .{
+        .view = .{ .view = target, .surface = target.surface(), .sx = 0, .sy = 0 },
+    });
+    ViewManager.scrollToView(context, target);
 }
 
 pub fn focusColumnRight(context: *ServerContext) void {
-    cycleStep(context, @as(i2, 1));
+    focusColumn(context, 1);
 }

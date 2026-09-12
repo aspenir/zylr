@@ -140,7 +140,7 @@ pub fn tick(context: *ServerContext) void {
         // Unmapped/floating/fullscreen views don't take a slot; pin their
         // target to the current width so they can't spin the animation.
         targets[i] = if (view.isMapped() and !view.floating and !view.fullscreen)
-            @floatFromInt(ViewManager.getViewWidth(view))
+            @floatFromInt(ViewManager.tiledWidth(context, view))
         else
             w_items[i];
     }
@@ -178,6 +178,25 @@ pub fn tick(context: *ServerContext) void {
         w_items[wi] = cur_w;
     }
 
+    // Animate the vertical offset: pile share changes slide members to
+    // their new slot tops instead of jumping. Floating/fullscreen views
+    // set their own y; pin them so the array can't lag their direct moves.
+    for (context.views.items, 0..) |view, i| {
+        if (i >= context.animation_y.items.len) break;
+        const target_y: f32 = @floatFromInt(view.y);
+        if (view.isMapped() and !view.floating and !view.fullscreen) {
+            const cur_y = context.animation_y.items[i];
+            if (@abs(target_y - cur_y) < 0.5) {
+                context.animation_y.items[i] = target_y;
+            } else {
+                context.animation_y.items[i] = cur_y + (target_y - cur_y) * 0.20;
+                still_animating = true;
+            }
+        } else {
+            context.animation_y.items[i] = target_y;
+        }
+    }
+
     var slot_x: f32 = @floatFromInt(context.usable_area.x + context.gaps_out);
     // Lead copies (docked to no window) ride at the row start.
     Mirror.syncLeadTiles(context);
@@ -200,7 +219,11 @@ pub fn tick(context: *ServerContext) void {
 
         const viewport_x: f32 = @floatFromInt(context.viewport_x);
         const scene_x: c_int = @intFromFloat(current - viewport_x);
-        var scene_y: c_int = view.y - context.viewport_y;
+        const anim_y: f32 = if (i < context.animation_y.items.len)
+            context.animation_y.items[i]
+        else
+            @floatFromInt(view.y);
+        var scene_y: c_int = @as(c_int, @intFromFloat(@round(anim_y))) - context.viewport_y;
         if (fade < 1.0) scene_y += @intFromFloat(@round(slide_off));
         view.scene_tree.node.setPosition(scene_x, scene_y);
         if (fade < 1.0) {
@@ -220,9 +243,13 @@ pub fn tick(context: *ServerContext) void {
             Border.updateViewBorder(view, current, w_items[i]);
         }
 
-        slot_x += w_items[i] + @as(f32, @floatFromInt(context.gaps_in));
-        // Same-row mirror copies extend the tile flow after their window.
-        slot_x += @floatFromInt(Mirror.extraTilesWidth(context, view));
+        // Pile members share one column: only the last member advances the
+        // flow (mirrors track their window's column in syncActiveTile).
+        if (ViewManager.advanceSlotAfter(context, view, i)) {
+            slot_x += w_items[i] + @as(f32, @floatFromInt(context.gaps_in));
+            // Same-row mirror copies extend the tile flow after their window.
+            slot_x += @floatFromInt(Mirror.extraTilesWidth(context, view));
+        }
     }
 
     // Fade the incoming row's mirrors in step with their windows.

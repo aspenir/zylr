@@ -58,6 +58,21 @@ self_mirror_suppressed: bool = false,
 slot_w: i32 = 0,
 slot_h: i32 = 0,
 
+/// The client's natural size (content box) recorded at map time, before
+/// tiling stretched it. toggle_floating restores this, like Mango: a
+/// tiled window pops back to its own size when floated.
+float_size: [2]i32 = .{ 0, 0 },
+
+/// hsplit pile: non-zero when this view is stacked vertically inside a
+/// column (a "pile"). Views sharing a pile_id are consecutive in
+/// context.views, top-to-bottom. pile_share is this view's fraction of
+/// the column's usable height; shares in a pile always sum to 1.
+pile_id: u64 = 0,
+pile_share: f32 = 1,
+/// Column width shared by every member of the pile (kept in sync by the
+/// join/collapse helpers). Null = fall back to custom_width/natural.
+pile_width: ?i32 = null,
+
 /// XWayland-only: subtree holding the window content, inset to
 /// (bw,bw) and clipped to the content box by commitSurface so a client
 /// that ignores/lags its configure cannot spill over the ring band.
@@ -298,6 +313,13 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
 
     const context = view.context;
 
+    // Record the natural size before any tiling configure stretches it:
+    // the first commit that triggers map still carries the client's own
+    // preferred geometry.
+    if (view.surfaceOrNull()) |surf| {
+        view.float_size = .{ surf.current.width, surf.current.height };
+    }
+
     std.log.info("SURFACE MAPPED", .{});
 
     if (view.toplevel_handle) |handle| {
@@ -342,13 +364,16 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
     // sized from the client's own geometry. Center them here, the same
     // way a manual toggle does.
     if (view.floating) {
-        ViewManager.centerFloating(context, view);
+        ViewManager.centerFloating(context, view, null);
     }
 
     // The new window must take its tiling slot first, or the position
     // checks and the XWayland configure targets below would use stale
     // coordinates (scrollToView used to recompute internally).
-    ViewManager.updateViewPositions(context);
+    // Re-push every tiled size too: a window that was the only column
+    // (full width) must shrink to its ratio width the moment this one
+    // lands next to it.
+    ViewManager.refreshTiledSizes(context);
 
     std.log.info("PLACE view x={d} y={d} slot_w={d} slot_h={d} vp={d} float={} fs={}", .{
         view.x,
@@ -529,8 +554,9 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
     // Destroy all mirror SceneBuffer nodes that reference this view.
     mirror_mod.destroyAllMirrors(context, view);
 
-    // Re-pack the remaining windows.
-    ViewManager.updateViewPositions(context);
+    // Re-pack the remaining windows and push the new sizes: the last
+    // survivor regains full width once nothing sits beside it.
+    ViewManager.refreshTiledSizes(context);
 
     // Null out node_data pointers so scene graph lookups don't
     // dereference freed memory.

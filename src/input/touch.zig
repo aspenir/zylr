@@ -11,6 +11,7 @@ const FocusManager = @import("../view/focus.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const LayerView = @import("../view/layer.zig");
 const Mirror = @import("../mirror.zig");
+const Cursor = @import("cursor.zig");
 const View = @import("../view/view.zig");
 
 const TouchContext = @This();
@@ -298,6 +299,19 @@ pub fn onDown(
     if (self.context.idle) |idle| idle.notifyActivity();
 
     const pos = self.position(event.x, event.y);
+    // A touch on a pile divider (the gap or the member's bottom band)
+    // starts a share-resize drag instead of a tap/gesture: no client
+    // notification, no swipe tracking, no hold — pure drag grab.
+    if (self.countPoints() == 0) {
+        if (Cursor.pileDividerAtPoint(self.context, pos.ox, pos.oy, 8.0)) |div_view| {
+            self.context.pile_divider_active = true;
+            self.context.pile_divider_view = div_view;
+            self.context.pile_divider_y = pos.oy;
+            Cursor.updatePileDivider(self.context);
+            return;
+        }
+    }
+
     const hit = surfaceAt(self.context, pos.ox, pos.oy) orelse return;
 
     // Focus the touched view so keyboard bindings (Mod+Q etc.) target it.
@@ -391,6 +405,11 @@ pub fn onUp(
     // A quick tap while the gesture continues is noise; exclude it.
     if (blip and remaining >= 1) self.blip_lifts +|= 1;
 
+    if (self.context.pile_divider_active) {
+        self.context.pile_divider_active = false;
+        self.context.pile_divider_view = null;
+    }
+
     if (remaining == 0) {
         // Gesture finished: all fingers up.
         const fingers = self.activeFingers();
@@ -459,6 +478,24 @@ pub fn onMotion(
         const p = &self.points[i];
         p.x = event.x;
         p.y = event.y;
+
+        // Pile divider drag: move the divider with the finger, and keep
+        // the client under the finger notified (a finger's sx/sy vs. the
+        // drag position differ; the divider drag drives the shares).
+        if (self.context.pile_divider_active) {
+            self.context.pile_divider_y = pos.oy;
+            Cursor.updatePileDivider(self.context);
+            if (surfaceAt(self.context, pos.ox, pos.oy)) |h| {
+                _ = self.context.seat.touchNotifyMotion(
+                    event.time_msec,
+                    event.touch_id,
+                    h.sx,
+                    h.sy,
+                );
+                self.context.seat.touchNotifyFrame();
+            }
+            return;
+        }
 
         // Any finger wandering off its baseline kills a pending hold.
         if (self.hold_pending) {

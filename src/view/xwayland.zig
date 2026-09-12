@@ -206,9 +206,18 @@ fn onAssociate(listener: *wl.Listener(void)) void {
     };
     view.context.animation_w.append(
         std.heap.c_allocator,
-        @floatFromInt(ViewManager.getViewWidth(view)),
+        @floatFromInt(ViewManager.tiledWidth(view.context, view)),
     ) catch |err| {
         std.log.err("Failed to add animation_w: {}", .{err});
+        _ = view.context.animation_x.orderedRemove(view.context.animation_x.items.len - 1);
+        _ = view.context.views.orderedRemove(view.context.views.items.len - 1);
+        return;
+    };
+    view.context.animation_y.append(
+        std.heap.c_allocator,
+        @floatFromInt(view.y),
+    ) catch {
+        _ = view.context.animation_w.orderedRemove(view.context.animation_w.items.len - 1);
         _ = view.context.animation_x.orderedRemove(view.context.animation_x.items.len - 1);
         _ = view.context.views.orderedRemove(view.context.views.items.len - 1);
         return;
@@ -342,13 +351,21 @@ pub fn commitSurface(
         eh = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
     }
 
-    if (view.custom_width) |w| {
+    if (view.pile_width) |pw| {
+        ew = pw;
+    } else if (view.custom_width) |w| {
         ew = w;
     } else {
         view.custom_width = @as(i32, @intFromFloat(
             @as(f32, @floatFromInt(ew)) * context.view_width_ratio,
         ));
         ew = view.custom_width.?;
+    }
+
+    // The lone tiled window fills the workspace (width ratio 1); it
+    // shrinks back to its custom width when a second window joins the row.
+    if (!view.floating and !view.fullscreen and ViewManager.activeTiledCount(context) == 1) {
+        ew = context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2));
     }
 
     // Floating views keep their own geometry.
@@ -366,6 +383,8 @@ pub fn commitSurface(
 
     // The slot the border ring must fill exactly (see border.zig).
     view.slot_w = ew;
+    // Pile members keep their stacked slot height across commits.
+    if (ViewManager.pileSlot(context, view)) |ps| eh = ps.height;
     view.slot_h = eh;
 
     // configure the content box to slot-2bw at slot+(bw,bw), and inset + crop the

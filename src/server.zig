@@ -27,8 +27,9 @@ pub const ResizeEdge = enum { left, right };
 
 pub const UndoEntry = union(enum) {
     none,
-    resize: struct { view: *View, prev_custom_width: ?i32, prev_floating: bool },
+    resize: struct { view: *View, prev_custom_width: ?i32, prev_pile_width: ?i32, prev_floating: bool },
     swap: struct { a: usize, b: usize },
+    swap_layout: struct { start: usize, len_a: usize, len_b: usize },
     viewport: struct { prev_target: i32 },
     fullscreen: struct { view: *View, prev_fullscreen: bool },
     focus: struct { restore: ?*View },
@@ -64,6 +65,7 @@ pub const Row = struct {
     views: std.ArrayListUnmanaged(*View) = .empty,
     animation_x: std.ArrayListUnmanaged(f32) = .empty,
     animation_w: std.ArrayListUnmanaged(f32) = .empty,
+    animation_y: std.ArrayListUnmanaged(f32) = .empty,
     scroll_x: i32 = 0,
     target_x: i32 = 0,
 };
@@ -167,6 +169,7 @@ environ_map: *std.process.Environ.Map,
 // animation
 animation_x: std.ArrayListUnmanaged(f32) = .empty,
 animation_w: std.ArrayListUnmanaged(f32) = .empty,
+animation_y: std.ArrayListUnmanaged(f32) = .empty,
 animation_active: bool = false,
 animation_timer: ?*wl.EventSource = null,
     /// Row-switch slide/fade in flight; null when no switch is animating.
@@ -281,6 +284,10 @@ row_sources: [max_rows]std.ArrayListUnmanaged(*View) = [_]std.ArrayListUnmanaged
 // Mod+drag state for moving (reordering) the focused view in the column.
 drag_active: bool = false,
 drag_view: ?*View = null,
+/// Cursor→window-top-left offset captured at drag start, so a floating
+/// window follows the cursor without jumping to the grab point.
+drag_off_x: i32 = 0,
+drag_off_y: i32 = 0,
 
 // Edge-drag state for resizing a window's width.
 resize_active: bool = false,
@@ -288,7 +295,16 @@ resize_view: ?*View = null,
 resize_edge: ResizeEdge = .right,
 resize_start_x: f64 = 0,
 resize_start_width: i32 = 0,
-cursor_shape: enum { default, resize } = .default,
+resize_start_view_x: i32 = 0,
+cursor_shape: enum { default, resize, grab } = .default,
+
+// Pile divider drag: resize a member's vertical share by dragging the
+// horizontal boundary between it and the member below. Driven by both
+// the pointer and touch; pile_divider_y tracks the drag position.
+pile_divider_active: bool = false,
+pile_divider_view: ?*View = null,
+pile_divider_y: f64 = 0,
+
 tiled_count: usize = 0,
 dpms_off: bool = false,
 /// Session lock state. When locked, only lock surfaces receive input.

@@ -41,7 +41,10 @@ pub fn onCursorMotion(
         return;
     }
 
-    if (context.resize_active) {
+    context.pile_divider_y = context.cursor.y;
+    if (context.pile_divider_active) {
+        updatePileDivider(context);
+    } else if (context.resize_active) {
         updateResize(context);
     } else if (context.drag_active) {
         updateDrag(context);
@@ -67,7 +70,10 @@ pub fn onCursorMotionAbsolute(
 
     if (context.idle) |idle| idle.notifyActivity();
 
-    if (context.resize_active) {
+    context.pile_divider_y = context.cursor.y;
+    if (context.pile_divider_active) {
+        updatePileDivider(context);
+    } else if (context.resize_active) {
         updateResize(context);
     } else {
         updateCursorShape(context);
@@ -206,16 +212,31 @@ fn superHeld(context: *ServerContext) bool {
 }
 
 fn startDrag(context: *ServerContext, _: *wlroots.Pointer.event.Button) void {
-    if (!superHeld(context)) return;
-    if (context.focused_view == null) return;
+    const view = context.focused_view orelse return;
+    // Floating windows are grabbed with a bare left-drag (rice-style);
+    // tiled reordering keeps the mod+drag convention.
+    if (!superHeld(context) and !view.floating) return;
 
     context.drag_active = true;
-    context.drag_view = context.focused_view;
+    context.drag_view = view;
+    if (view.floating) {
+        const cx: i32 = @intFromFloat(context.cursor.x);
+        const cy: i32 = @intFromFloat(context.cursor.y);
+        context.drag_off_x = view.x - cx;
+        context.drag_off_y = view.y - cy;
+    }
     updateCursorShape(context);
 }
 
 fn updateDrag(context: *ServerContext) void {
     const view = context.drag_view orelse return;
+    // Floating windows move freely with the cursor; tiled ones snap to slots.
+    if (view.floating) {
+        view.x = @as(i32, @intFromFloat(context.cursor.x)) + context.drag_off_x;
+        view.y = @as(i32, @intFromFloat(context.cursor.y)) + context.drag_off_y;
+        view.scene_tree.node.setPosition(view.x, view.y);
+        return;
+    }
     ViewManager.moveViewToSlot(context, view, context.cursor.x);
 }
 
@@ -251,7 +272,7 @@ test "firstSlotAtOrAfter finds the slot and handles edges" {
 /// Edge band check for one window: left edge first, then right (matches
 /// the left-to-right scan order of the pre-binary-search walk).
 fn edgeHit(context: *ServerContext, view: *View, bw: f64) ?ResizeEdge {
-    const width = ViewManager.getViewWidth(view);
+    const width = ViewManager.tiledWidth(context, view);
     // Tiled views render at view.x minus the viewport offset; floating
     // and fullscreen views are placed at absolute view.x.
     const vp: f64 = if (view.floating or view.fullscreen) 0 else @floatFromInt(context.viewport_x);
@@ -270,13 +291,15 @@ fn rebuildResizeCache(context: *ServerContext) void {
     context.resize_seq = context.layout_seq;
     var slot_x: f64 = @floatFromInt(context.usable_area.x + context.gaps_out);
     context.resize_len = 0;
-    for (context.views.items) |view| {
+    for (context.views.items, 0..) |view, i| {
         if (!view.isMapped() or view.floating or view.fullscreen) continue;
         if (context.resize_len >= context.resize_views.len) break;
+        // One resize slot per column: stacked pile members share it.
+        if (!ViewManager.advanceSlotAfter(context, view, i)) continue;
         context.resize_views[context.resize_len] = view;
         context.resize_lefts[context.resize_len] = slot_x;
         context.resize_len += 1;
-        slot_x += @floatFromInt(ViewManager.getViewWidth(view) + context.gaps_in);
+        slot_x += @floatFromInt(ViewManager.tiledWidth(context, view) + context.gaps_in);
     }
 }
 
@@ -290,9 +313,13 @@ fn resizeEdgeAt(context: *ServerContext) ?struct {
 } {
     const bw: f64 = @floatFromInt(context.border_width + 2);
 
+    // Floating/fullscreen views: a wider grab band than tiled slot
+    // edges, so a plain-button move-grab doesn't win when the user aims
+    // for the edge to resize it.
+    const float_bw: f64 = @floatFromInt(context.border_width + 12);
     for (context.views.items) |view| {
         if (!view.isMapped() or (!view.floating and !view.fullscreen)) continue;
-        if (edgeHit(context, view, bw)) |edge| return .{ .view = view, .edge = edge };
+        if (edgeHit(context, view, float_bw)) |edge| return .{ .view = view, .edge = edge };
     }
 
     if (context.resize_len == 0 or context.resize_seq != context.layout_seq) {
@@ -308,7 +335,7 @@ fn resizeEdgeAt(context: *ServerContext) ?struct {
     if (lo > 0) {
         const prev = context.resize_views[lo - 1];
         const pr = context.resize_lefts[lo - 1] - vp +
-            @as(f64, @floatFromInt(ViewManager.getViewWidth(prev)));
+            @as(f64, @floatFromInt(ViewManager.tiledWidth(context, prev)));
         if (c >= pr - bw and c <= pr + bw) return .{ .view = prev, .edge = .right };
     }
     if (lo < context.resize_len) {
@@ -324,18 +351,80 @@ fn cursorOnResizeEdge(context: *ServerContext) bool {
     return resizeEdgeAt(context) != null;
 }
 
+/// The pile member whose bottom edge is a divider at `(x, y)` — the
+/// horizontal boundary between it and the member below it. Only members
+/// that HAVE a member below qualify. Dragging it resizes its share.
+pub fn pileDividerAtPoint(context: *ServerContext, x: f64, y: f64, band: f64) ?*View {
+    const vp: f64 = @floatFromInt(context.viewport_x);
+    for (context.views.items, 0..) |view, i| {
+        if (!view.isMapped() or view.floating or view.fullscreen) continue;
+        if (view.pile_id == 0) continue;
+        if (i + 1 >= context.views.items.len) continue;
+        if (context.views.items[i + 1].pile_id != view.pile_id) continue;
+        const slot = ViewManager.pileSlot(context, view) orelse continue;
+        const left: f64 = @as(f64, @floatFromInt(view.x)) - vp;
+        const w: f64 = @as(f64, @floatFromInt(ViewManager.tiledWidth(context, view)));
+        if (x < left - band or x > left + w + band) continue;
+        const bottom: f64 = @floatFromInt(slot.top + slot.height);
+        if (@abs(y - bottom) <= band) return view;
+    }
+    return null;
+}
+
+fn cursorPileDivider(context: *ServerContext) ?*View {
+    const band: f64 = @floatFromInt(context.border_width + 2);
+    return pileDividerAtPoint(context, context.cursor.x, context.cursor.y, band);
+}
+
+fn startPileDivider(context: *ServerContext, view: *View) void {
+    context.pile_divider_active = true;
+    context.pile_divider_view = view;
+    context.pile_divider_y = context.cursor.y;
+    updatePileDivider(context);
+}
+
+/// Follow the current drag position: the divider sits between the drag
+/// member and the one below, so its share is the fraction of the column's
+/// inner height above the cursor. Snap via layoutViews so the layout
+/// tracks the drag instead of rubber-banding behind it.
+pub fn updatePileDivider(context: *ServerContext) void {
+    const view = context.pile_divider_view orelse return;
+    const inner_h: f64 = @as(f64, @floatFromInt(context.usable_area.height)) -
+        @as(f64, @floatFromInt(context.gaps_out * 2));
+    const col_top: f64 = @as(f64, @floatFromInt(context.usable_area.y + context.gaps_out));
+    var frac: f64 = (context.pile_divider_y - col_top) / inner_h;
+    frac = @max(0.1, @min(0.9, frac));
+    ViewManager.setPileShare(context, view, @floatCast(frac));
+    ViewManager.layoutViews(context);
+    ViewManager.syncPile(context, view);
+}
+
+fn endPileDivider(context: *ServerContext) void {
+    context.pile_divider_active = false;
+    context.pile_divider_view = null;
+}
+
 fn startResize(context: *ServerContext) void {
     const grab = resizeEdgeAt(context) orelse return;
     context.resize_active = true;
     context.resize_view = grab.view;
     context.resize_edge = grab.edge;
     context.resize_start_x = context.cursor.x;
-    context.resize_start_width = ViewManager.getViewWidth(grab.view);
+    context.resize_start_view_x = grab.view.x;
+    // Floating views have no tile ratio: anchor on the ring slot, whose
+    // width is what updateFloatingResize actually changes.
+    context.resize_start_width = if (grab.view.floating) grab.view.slot_w else ViewManager.tiledWidth(context, grab.view);
     updateCursorShape(context);
 }
 
 fn updateResize(context: *ServerContext) void {
     const view = context.resize_view orelse return;
+    // Floating windows resize independently of the tiled layout; tiled
+    // resize still re-computes the column widths.
+    if (view.floating) {
+        updateFloatingResize(context, view);
+        return;
+    }
     const min_w: i32 = 200;
 
     const delta = context.cursor.x - context.resize_start_x;
@@ -350,7 +439,38 @@ fn updateResize(context: *ServerContext) void {
     view.setSize(new_width, view.surface().current.height);
 }
 
+/// Drag a floating window's left/right edge: width follows the cursor,
+/// the opposite edge stays anchored, and the result sticks for the next
+/// float epoch.
+fn updateFloatingResize(context: *ServerContext, view: *View) void {
+    const bw: i32 = @intCast(@max(0, context.border_width));
+    const min_w: i32 = 200 + 2 * bw;
+    const delta = @as(i32, @intFromFloat(context.cursor.x)) -
+        @as(i32, @intFromFloat(context.resize_start_x));
+    var new_w: i32 = switch (context.resize_edge) {
+        .right => context.resize_start_width + delta,
+        .left => context.resize_start_width - delta,
+    };
+    if (new_w < min_w) new_w = min_w;
+
+    if (context.resize_edge == .left) {
+        // Absolute from the captured start, never `+=`: the adjustment
+        // is already cumulative per drag, so += would re-add it every
+        // motion event and fling the window off-screen.
+        view.x = context.resize_start_view_x + (context.resize_start_width - new_w);
+    }
+    view.slot_w = new_w;
+    view.scene_tree.node.setPosition(view.x, view.y);
+    view.setSize(@max(1, new_w - 2 * bw), @max(1, view.slot_h - 2 * bw));
+}
+
 fn endResize(context: *ServerContext) void {
+    const view = context.resize_view orelse return;
+    // Remember the size the user settled on, so the next float re-uses it.
+    if (view.floating) {
+        const bw: i32 = @intCast(@max(0, context.border_width));
+        view.float_size = .{ @max(1, view.slot_w - 2 * bw), @max(1, view.slot_h - 2 * bw) };
+    }
     context.resize_active = false;
     context.resize_view = null;
     updateCursorShape(context);
@@ -358,14 +478,16 @@ fn endResize(context: *ServerContext) void {
 
 /// Reflect interaction state in the cursor image.
 fn updateCursorShape(context: *ServerContext) void {
+    const dragging_float = context.drag_active and if (context.drag_view) |dv| dv.floating else false;
     const new_shape: @TypeOf(context.cursor_shape) =
-        if (context.drag_active or cursorOnResizeEdge(context))
-            .resize
-        else
-            .default;
+        if (context.resize_active) .resize else if (dragging_float) .grab else .default;
     if (new_shape == context.cursor_shape) return;
     context.cursor_shape = new_shape;
-    const name: [*:0]const u8 = if (new_shape == .resize) "col-resize" else "default";
+    const name: [*:0]const u8 = switch (new_shape) {
+        .resize => "col-resize",
+        .grab => "grabbing",
+        else => "default",
+    };
     context.xcursor_manager.setXcursor(context.cursor, name);
 }
 
@@ -388,10 +510,13 @@ pub fn onCursorButton(
             FocusManager.focusAtCursor(context);
             if (resizeEdgeAt(context) != null and !superHeld(context)) {
                 startResize(context);
+            } else if (cursorPileDivider(context)) |divider_view| {
+                startPileDivider(context, divider_view);
             } else {
                 startDrag(context, event);
             }
         } else {
+            endPileDivider(context);
             endDrag(context);
             endResize(context);
         }

@@ -45,11 +45,51 @@ fn pushUndoEntry(context: *ServerContext, entry: ServerContext.UndoEntry) void {
     context.undo_count +|= 1;
 }
 
+/// Reverse `slice` in place (for the three-reversal block swap below).
+fn reverseRange(comptime T: type, slice: []T) void {
+    var a: usize = 0;
+    var b: usize = slice.len;
+    while (a < b) {
+        b -= 1;
+        std.mem.swap(T, &slice[a], &slice[b]);
+        a += 1;
+    }
+}
+
+/// Exchange the two adjacent views-array blocks [start, +len_a) and
+/// [start+len_a, +len_b). Swapping adjacent blocks twice restores the
+/// original order, so undo can replay the same call. Parallel-rotates the
+/// animation arrays so every moved column glides from its own old position.
+pub fn swapColumnRuns(context: *ServerContext, start: usize, len_a: usize, len_b: usize) void {
+    if (len_a == 0 or len_b == 0) return;
+    const end = start + len_a + len_b;
+    if (end > context.views.items.len) return;
+    inline for (.{ context.views.items, context.animation_x.items, context.animation_w.items, context.animation_y.items }) |list| {
+        const T = std.meta.Elem(@TypeOf(list));
+        reverseRange(T, list[start .. start + len_a]);
+        reverseRange(T, list[start + len_a .. end]);
+        reverseRange(T, list[start..end]);
+    }
+}
+
+/// Boundaries of the view's column run: the pile members around `idx` (a
+/// single window outside a pile is its own one-column run).
+fn pileColumnRun(context: *ServerContext, idx: usize) struct { start: usize, len: usize } {
+    const pid = context.views.items[idx].pile_id;
+    var start = idx;
+    var end = idx + 1;
+    if (pid != 0) {
+        while (start > 0 and context.views.items[start - 1].pile_id == pid) start -= 1;
+        while (end < context.views.items.len and context.views.items[end].pile_id == pid) end += 1;
+    }
+    return .{ .start = start, .len = end - start };
+}
+
 /// Swap the focused tile with its row neighbour in the given direction.
-/// Tiles are windows and mirrorred-copy mirrors alike: window<->window keeps
-/// the existing views-array swap (undoable); window<->copy re-docks the
-/// copy to the window's cluster (or to the row lead); copy<->copy exchanges
-/// docks exactly.
+/// Tiles are windows and mirrorred-copy mirrors alike: window<->window swaps
+/// whole columns (a pile member's column swaps as a unit); window<->copy
+/// re-docks the copy to the window's cluster (or to the row lead);
+/// copy<->copy exchanges docks exactly.
 fn swapTiles(context: *ServerContext, dir: i32) void {
     const view = context.focused_view orelse return;
     var tiles: [128]FocusManager.FocusTile = undefined;
@@ -80,11 +120,23 @@ fn swapTiles(context: *ServerContext, dir: i32) void {
     }
     if (!found) return;
 
-    const j: i64 = @as(i64, @intCast(cur)) + dir;
+    // Step the tile index past the focused window's own column (its pile
+    // members, plus its own copy mirrors) so the swap partner is the
+    // ADJACENT COLUMN, not the next tile inside the same pile. Single
+    // windows keep the old per-tile behaviour.
+    var j: i64 = @as(i64, @intCast(cur)) + dir;
+    if (view.pile_id != 0) {
+        while (j >= 0 and j < n) {
+            const t = tiles[@intCast(j)];
+            const in_col = (t.view == view) or (t.mirror == null and t.view.pile_id == view.pile_id);
+            if (!in_col) break;
+            j += dir;
+        }
+    }
     if (j < 0 or j >= n) return;
 
-    // The pair being exchanged is (left, right) in row order regardless of
-    // which of the two is focused, so both directions give the same swap.
+    // The pair being exchanged are the endpoint tiles regardless of which
+    // of the two is focused, so both directions give the same swap.
     const l = @min(cur, @as(usize, @intCast(j)));
     const r = @max(cur, @as(usize, @intCast(j)));
     const left = tiles[l];
@@ -94,13 +146,20 @@ fn swapTiles(context: *ServerContext, dir: i32) void {
     const focused_copy = tiles[cur].mirror;
 
     if (left_copy == null and right_copy == null) {
-        // window <-> window: existing views-array swap.
+        // window <-> window: swap the whole columns. Columns are adjacent
+        // runs in the views array (pile members are consecutive), so this
+        // is an adjacent block exchange in row order.
         const ia = std.mem.indexOfScalar(*View, context.views.items, left.view) orelse return;
         const ib = std.mem.indexOfScalar(*View, context.views.items, right.view) orelse return;
         if (ia == ib) return;
-        pushUndoEntry(context, .{ .swap = .{ .a = ia, .b = ib } });
-        std.mem.swap(*View, &context.views.items[ia], &context.views.items[ib]);
-        ViewManager.updateViewPositionsFrom(context, @min(ia, ib));
+        const run_a = pileColumnRun(context, ia);
+        const run_b = pileColumnRun(context, ib);
+        const start = @min(run_a.start, run_b.start);
+        const len_a: usize = if (start == run_a.start) run_a.len else run_b.len;
+        const len_b: usize = if (start == run_a.start) run_b.len else run_a.len;
+        pushUndoEntry(context, .{ .swap_layout = .{ .start = start, .len_a = len_a, .len_b = len_b } });
+        swapColumnRuns(context, start, len_a, len_b);
+        ViewManager.updateViewPositionsFrom(context, start);
         ViewManager.scrollToViewNoLayout(context, view);
         return;
     }
@@ -143,8 +202,8 @@ fn swapTiles(context: *ServerContext, dir: i32) void {
 }
 
 /// Center a floating view on screen and raise it above tiled views.
-fn centerFloating(context: *ServerContext, view: *View) void {
-    ViewManager.centerFloating(context, view);
+fn centerFloating(context: *ServerContext, view: *View, force_size: ?[2]i32) void {
+    ViewManager.centerFloating(context, view, force_size);
 }
 
 /// Relayout views from `start_idx` onward, sync the client size,
@@ -152,7 +211,7 @@ fn centerFloating(context: *ServerContext, view: *View) void {
 fn relayoutView(context: *ServerContext, view: *View, start_idx: usize) void {
     ViewManager.updateViewPositionsFrom(context, start_idx);
     const bw: i32 = @intCast(@max(0, context.border_width));
-    const w = view.custom_width orelse ViewManager.getViewWidth(view);
+    const w = view.custom_width orelse ViewManager.tiledWidth(context, view);
     view.setSize(@max(1, w - 2 * bw), @max(1, view.slot_h - 2 * bw));
     ViewManager.scrollToViewNoLayout(context, view);
 }
@@ -173,6 +232,77 @@ pub fn runAction(
             pushUndoEntry(context, .{ .viewport = .{ .prev_target = context.viewport_y } });
             context.viewport_y += 100;
             ViewManager.updateViewPositions(context);
+        },
+        .consume_left, .consume_right => {
+            // niri-style consume-or-expel: Super+[ moves the focused window
+            // into the column to its left, Super+] into the column to its
+            // right (stacked below it). With no neighbor column, a stacked
+            // window is expelled back into its own column.
+            const view = context.focused_view orelse {
+                std.log.warn("CONSUME no focused view", .{});
+                return;
+            };
+            if (view.floating) {
+                std.log.warn("CONSUME focused view is floating, ignored", .{});
+                return;
+            }
+            if (view.fullscreen) return;
+
+            const dir: isize = if (action == .consume_left) -1 else 1;
+            const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse {
+                std.log.warn("CONSUME focused view not in active row's views", .{});
+                return;
+            };
+
+            // This view's column bounds in the list: [col_start, col_end).
+            const pid = view.pile_id;
+            var col_start = idx;
+            while (pid != 0 and col_start > 0 and context.views.items[col_start - 1].pile_id == pid) col_start -= 1;
+            var col_end = idx + 1;
+            while (pid != 0 and col_end < context.views.items.len and context.views.items[col_end].pile_id == pid) col_end += 1;
+
+            // Neighbor column in `dir`: the first tiled view outside the
+            // focused column, scanning from col_start-1 (left) or col_end (right).
+            var anchor: ?*View = null;
+            var i: isize = if (dir < 0) @as(isize, @intCast(col_start)) - 1 else @as(isize, @intCast(col_end));
+            while (i >= 0 and i < context.views.items.len) : (i += dir) {
+                const v = context.views.items[@intCast(i)];
+                if (v.isMapped() and !v.floating and !v.fullscreen) {
+                    anchor = v;
+                    break;
+                }
+            }
+            if (anchor == null) {
+                // No neighbor column: expel a stacked window to its own column.
+                if (view.pile_id != 0) {
+                    ViewManager.splitViewFromPile(context, view);
+                    ViewManager.syncPile(context, view);
+                    // The lone column is full-height again: re-send the size.
+                    const bw: i32 = @intCast(@max(0, context.border_width));
+                    view.setSize(@max(1, view.slot_w - 2 * bw), @max(1, view.slot_h - 2 * bw));
+                    std.log.warn("CONSUME expel {s}", .{view.title()});
+                }
+                return;
+            }
+            var a = anchor.?;
+            // For rightward consume the hit is the neighbor column's TOP
+            // member; walk to its bottom so the window stacks below the pile.
+            if (dir > 0) {
+                var ai = std.mem.indexOfScalar(*View, context.views.items, a) orelse return;
+                while (a.pile_id != 0 and ai + 1 < context.views.items.len and
+                    context.views.items[ai + 1].pile_id == a.pile_id)
+                {
+                    ai += 1;
+                    a = context.views.items[ai];
+                }
+            }
+            if (a == view) return;
+
+            ViewManager.joinPileNear(context, view, a);
+            // Members were full-size single columns; re-send their configure
+            // so they actually render at the pile's stacked slot heights.
+            ViewManager.syncPile(context, a);
+            std.log.warn("CONSUME {s} into column ({d} below-num)", .{ view.title(), a.pile_id });
         },
         .row_up, .row_down => {
             const dir: i32 = if (action == .row_up) -1 else 1;
@@ -208,14 +338,39 @@ pub fn runAction(
         },
         .grow, .shrink => {
             const view = context.focused_view orelse return;
-            pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_floating = view.floating } });
+            pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_pile_width = view.pile_width, .prev_floating = view.floating } });
             const base: f32 = @floatFromInt(@max(1, context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2))));
             const step: f32 = base * 0.05;
-            const cur: f32 = @floatFromInt(ViewManager.getViewWidth(view));
+            if (view.pile_id != 0) {
+                // grow/shrink resizes the WHOLE pile column: every member
+                // shares pile_width, so widen/narrow it for all of them.
+                const cur: f32 = @floatFromInt(view.pile_width orelse ViewManager.tiledWidth(context, view));
+                const new_w: f32 = if (action == .grow) cur + step else cur - step;
+                const w: i32 = @max(200, @as(i32, @intFromFloat(new_w)));
+                for (context.views.items) |v| {
+                    if (v.pile_id == view.pile_id) v.pile_width = w;
+                }
+                ViewManager.updateViewPositions(context);
+                ViewManager.syncPile(context, view);
+                FocusManager.focusActiveRow(context);
+                return;
+            }
+            const cur: f32 = @floatFromInt(ViewManager.tiledWidth(context, view));
             const new_w: f32 = if (action == .grow) cur + step else cur - step;
             view.custom_width = @max(200, @as(i32, @intFromFloat(new_w)));
             const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
             relayoutView(context, view, idx);
+        },
+        .grow_share, .shrink_share => {
+            const view = context.focused_view orelse return;
+            // Vertical share only exists inside a pile (`separate action`
+            // for adjusting a member within its column).
+            if (view.pile_id == 0) return;
+            pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_pile_width = view.pile_width, .prev_floating = view.floating } });
+            const dstep: f32 = if (action == .grow_share) 0.05 else -0.05;
+            ViewManager.adjustPileShare(context, view, dstep);
+            ViewManager.syncPile(context, view);
+            FocusManager.focusActiveRow(context);
         },
         .reload_config => {
             // Free old heap-allocated config data before overwriting.
@@ -261,6 +416,14 @@ pub fn runAction(
         .inspect => {
             Osd.inspect(context);
         },
+        .focus_up => {
+            pushUndoEntry(context, .{ .focus = .{ .restore = context.focused_view } });
+            FocusManager.focusPile(context, -1);
+        },
+        .focus_down => {
+            pushUndoEntry(context, .{ .focus = .{ .restore = context.focused_view } });
+            FocusManager.focusPile(context, 1);
+        },
         .focus_left => {
             pushUndoEntry(context, .{ .focus = .{ .restore = context.focused_view } });
             FocusManager.focusColumnLeft(context);
@@ -271,10 +434,27 @@ pub fn runAction(
         },
         .toggle_floating => {
             const view = target_view orelse context.focused_view orelse return;
-            pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_floating = view.floating } });
+            pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_pile_width = view.pile_width, .prev_floating = view.floating } });
             view.floating = !view.floating;
             if (view.floating) {
-                centerFloating(context, view);
+                // Float at the window's remembered (formerly natural)
+                // size so a stretched tile takes less space when floated,
+                // clamped to 90% of the usable area so it never floats
+                // fullscreen. float_size is the content box; the refuse
+                // border ring wraps it.
+                const bw: i32 = @intCast(@max(0, context.border_width));
+                var fw_i: i32 = if (view.float_size[0] > 0) view.float_size[0] else @max(1, view.slot_w - 2 * bw);
+                var fh_i: i32 = if (view.float_size[1] > 0) view.float_size[1] else @max(1, view.slot_h - 2 * bw);
+                if (fw_i >= context.usable_area.width) {
+                    fw_i = @intFromFloat(@as(f32, @floatFromInt(context.usable_area.width)) * 0.9);
+                }
+                if (fh_i >= context.usable_area.height) {
+                    fh_i = @intFromFloat(@as(f32, @floatFromInt(context.usable_area.height)) * 0.9);
+                }
+                fw_i = @max(1, fw_i);
+                fh_i = @max(1, fh_i);
+                centerFloating(context, view, .{ fw_i + 2 * bw, fh_i + 2 * bw });
+                view.setSize(fw_i, fh_i);
                 const fidx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
                 ViewManager.updateViewPositionsFrom(context, fidx);
             } else {
@@ -309,6 +489,27 @@ pub fn runAction(
         },
         .swap_left => swapTiles(context, -1),
         .swap_right => swapTiles(context, 1),
+        .pile_up, .pile_down => {
+            const view = context.focused_view orelse return;
+            if (view.pile_id == 0) return;
+            const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse return;
+            const dir: i32 = if (action == .pile_up) -1 else 1;
+            const j_signed = @as(i64, @intCast(idx)) + dir;
+            if (j_signed < 0 or j_signed >= @as(i64, @intCast(context.views.items.len))) return;
+            const j: usize = @intCast(j_signed);
+            // Stay inside the pile: moving past the column edge is a no-op.
+            if (context.views.items[j].pile_id != view.pile_id) return;
+            pushUndoEntry(context, .{ .swap = .{ .a = idx, .b = j } });
+            std.mem.swap(*View, &context.views.items[idx], &context.views.items[j]);
+            std.mem.swap(f32, &context.animation_x.items[idx], &context.animation_x.items[j]);
+            std.mem.swap(f32, &context.animation_w.items[idx], &context.animation_w.items[j]);
+            std.mem.swap(f32, &context.animation_y.items[idx], &context.animation_y.items[j]);
+            // Shares ride with the moved window; re-slot and re-size.
+            ViewManager.updateViewPositionsFrom(context, @min(idx, j));
+            ViewManager.syncPile(context, view);
+            ViewManager.scrollToViewNoLayout(context, view);
+            std.log.warn("PILE move {s} {} {s}", .{ @tagName(action), j, view.title() });
+        },
         .undo => {
             if (context.undo_count == 0) return;
             context.undo_count -|= 1;
@@ -318,7 +519,12 @@ pub fn runAction(
                 .resize => |r| {
                     r.view.custom_width = r.prev_custom_width;
                     r.view.floating = r.prev_floating;
-                    if (r.prev_floating) centerFloating(context, r.view);
+                    if (r.prev_pile_width) |pw| {
+                        for (context.views.items) |v| {
+                            if (v.pile_id == r.view.pile_id) v.pile_width = pw;
+                        }
+                    }
+                    if (r.prev_floating) centerFloating(context, r.view, null);
                     const uidx = std.mem.indexOfScalar(*View, context.views.items, r.view) orelse 0;
                     relayoutView(context, r.view, uidx);
                 },
@@ -328,6 +534,11 @@ pub fn runAction(
                         ViewManager.updateViewPositionsFrom(context, @min(s.a, s.b));
                         ViewManager.scrollToViewNoLayout(context, context.views.items[s.a]);
                     }
+                },
+                .swap_layout => |s| {
+                    // Adjacent block exchange is its own inverse.
+                    swapColumnRuns(context, s.start, s.len_a, s.len_b);
+                    ViewManager.updateViewPositionsFrom(context, s.start);
                 },
                 .viewport => |v| {
                     context.viewport_y = v.prev_target;
@@ -363,7 +574,7 @@ pub fn runAction(
             const view = context.focused_view orelse return;
             if (view.fullscreen) return;
             if (view.floating) {
-                centerFloating(context, view);
+                centerFloating(context, view, null);
             } else {
                 ViewManager.scrollToView(context, view);
             }
@@ -456,7 +667,6 @@ pub fn onKeyboardKey(
         const sym_int: u32 = @intFromEnum(sym);
 
         const depressed = keyboard.modifiers.depressed;
-
         // Normalize event keysym to lowercase so "Super+Shift+h"
         // (compiled as keysym=0x68) matches the shifted keysym (0x48).
         const norm_sym: u32 = if (sym_int >= 'A' and sym_int <= 'Z') sym_int + 32 else sym_int;

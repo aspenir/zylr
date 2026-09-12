@@ -82,9 +82,19 @@ pub fn onNewXdgTopLevel(
     };
     context.animation_w.append(
         std.heap.c_allocator,
-        @floatFromInt(ViewManager.getViewWidth(view)),
+        @floatFromInt(ViewManager.tiledWidth(context, view)),
     ) catch |err| {
         std.log.err("Failed to add animation_w: {}", .{err});
+        _ = context.animation_x.orderedRemove(context.animation_x.items.len - 1);
+        _ = context.views.orderedRemove(context.views.items.len - 1);
+        std.heap.c_allocator.destroy(view);
+        return;
+    };
+    context.animation_y.append(
+        std.heap.c_allocator,
+        @floatFromInt(view.y),
+    ) catch {
+        _ = context.animation_w.orderedRemove(context.animation_w.items.len - 1);
         _ = context.animation_x.orderedRemove(context.animation_x.items.len - 1);
         _ = context.views.orderedRemove(context.views.items.len - 1);
         std.heap.c_allocator.destroy(view);
@@ -608,13 +618,21 @@ pub fn commitToplevel(
     // A window resized by edge-drag keeps its width across commits.
     // New windows default to a fraction of the usable width (post-waybar):
     // ratio 1.0 fills the area next to the bar, never under it.
-    if (view.custom_width) |w| {
+    if (view.pile_width) |pw| {
+        ew = pw;
+    } else if (view.custom_width) |w| {
         ew = w;
     } else {
         view.custom_width = @as(i32, @intFromFloat(
             @as(f32, @floatFromInt(ew)) * context.view_width_ratio,
         ));
         ew = view.custom_width.?;
+    }
+
+    // The lone tiled window fills the workspace (width ratio 1); it
+    // shrinks back to its custom width when a second window joins the row.
+    if (!view.floating and !view.fullscreen and ViewManager.activeTiledCount(context) == 1) {
+        ew = context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2));
     }
 
     // The slot the border ring must fill exactly: the ring is sized from
@@ -653,6 +671,9 @@ pub fn commitToplevel(
     }
 
     view.slot_w = ew;
+    // A pile member's commit must keep its stacked slot height, not snap
+    // back to the full viewport height (that would overlap its pile mates).
+    if (ViewManager.pileSlot(context, view)) |ps| eh = ps.height;
     view.slot_h = eh;
 
     // the toplevel's content box is the slot inset by the
