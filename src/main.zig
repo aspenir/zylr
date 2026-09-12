@@ -189,6 +189,9 @@ pub fn main(init: std.process.Init) !void {
     _ = try wlroots.Subcompositor.create(server);
     _ = try wlroots.DataDeviceManager.create(server);
     _ = try wlroots.PrimarySelectionDeviceManagerV1.create(server);
+    // wlr-data-control-v1: exports the seat's selection/primary-selection
+    // to clipboard managers (cliphist, wl-clipboard-history, ...).
+    _ = try wlroots.DataControlManagerV1.create(server);
 
     const xdg_shell = try wlroots.XdgShell.create(server, 6);
 
@@ -443,6 +446,9 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("session lock init failed: {}", .{err});
     };
 
+    _ = @import("activation.zig").Activation.init(&context) catch |err| {
+        std.log.err("Failed to init xdg-activation: {}", .{err});
+    };
     _ = @import("idle.zig").Idle.init(&context, loop) catch |err| {
         std.log.err("idle init failed: {}", .{err});
     };

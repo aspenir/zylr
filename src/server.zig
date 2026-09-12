@@ -23,6 +23,7 @@ const XCursorManager = @import("view/xcursor.zig");
 const OutputContext = @import("output/output.zig");
 const KeyboardContext = @import("input/keyboard.zig");
 const GestureContext = @import("input/gesture.zig");
+const Activation = @import("activation.zig");
 pub const ResizeEdge = enum { left, right };
 
 pub const UndoEntry = union(enum) {
@@ -311,6 +312,7 @@ dpms_off: bool = false,
 locked: bool = false,
 /// Idle management: inhibit, notifier, DPMS, and idle timer.
 idle: ?*@import("idle.zig").Idle = null,
+activation: ?*Activation = null,
 /// Session lock protocol handler.
 session_lock: ?*@import("session_lock.zig").SessionLock = null,
 /// Raw config (kept for idle timers and reload).
