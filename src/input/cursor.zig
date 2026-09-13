@@ -206,9 +206,12 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
     PointerConstraints.onPointerFocus(context, hit.node);
 }
 fn superHeld(context: *ServerContext) bool {
-    if (context.keyboards.items.len == 0) return false;
-    const modifiers = context.keyboards.items[0].keyboard.modifiers;
-    return (modifiers.depressed & (1 << 6)) != 0;
+    // Mod key on ANY keyboard: keyboards[0] can be a non-input ACPI device
+    // (Video Bus) whose modifiers never update.
+    for (context.keyboards.items) |kb| {
+        if ((kb.keyboard.modifiers.depressed & (1 << 6)) != 0) return true;
+    }
+    return false;
 }
 
 fn startDrag(context: *ServerContext, _: *wlroots.Pointer.event.Button) void {
@@ -216,6 +219,7 @@ fn startDrag(context: *ServerContext, _: *wlroots.Pointer.event.Button) void {
     // Floating windows are grabbed with a bare left-drag (rice-style);
     // tiled reordering keeps the mod+drag convention.
     if (!superHeld(context) and !view.floating) return;
+    ViewManager.endDragPreview(context);
 
     context.drag_active = true;
     context.drag_view = view;
@@ -229,6 +233,7 @@ fn startDrag(context: *ServerContext, _: *wlroots.Pointer.event.Button) void {
 }
 
 fn updateDrag(context: *ServerContext) void {
+    std.log.debug("UPDATEDRAG drag_active={} cursor=({d:.0},{d:.0})", .{ context.drag_active, context.cursor.x, context.cursor.y });
     const view = context.drag_view orelse return;
     // Floating windows move freely with the cursor; tiled ones snap to slots.
     if (view.floating) {
@@ -237,10 +242,11 @@ fn updateDrag(context: *ServerContext) void {
         view.scene_tree.node.setPosition(view.x, view.y);
         return;
     }
-    ViewManager.moveViewToSlot(context, view, context.cursor.x);
+    ViewManager.updateDragPreview(context, view, context.cursor.x, context.cursor.y);
 }
 
 fn endDrag(context: *ServerContext) void {
+    ViewManager.commitDragPreview(context);
     context.drag_active = false;
     context.drag_view = null;
     updateCursorShape(context);
@@ -508,6 +514,11 @@ pub fn onCursorButton(
     if (event.button == 272) { // BTN_LEFT
         if (event.state == .pressed) {
             FocusManager.focusAtCursor(context);
+            std.log.debug("PRESS super={} resize={?} divider={?}", .{
+                superHeld(context),
+                resizeEdgeAt(context),
+                cursorPileDivider(context) orelse null,
+            });
             if (resizeEdgeAt(context) != null and !superHeld(context)) {
                 startResize(context);
             } else if (cursorPileDivider(context)) |divider_view| {

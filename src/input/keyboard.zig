@@ -234,10 +234,6 @@ pub fn runAction(
             ViewManager.updateViewPositions(context);
         },
         .consume_left, .consume_right => {
-            // niri-style consume-or-expel: Super+[ moves the focused window
-            // into the column to its left, Super+] into the column to its
-            // right (stacked below it). With no neighbor column, a stacked
-            // window is expelled back into its own column.
             const view = context.focused_view orelse {
                 std.log.warn("CONSUME no focused view", .{});
                 return;

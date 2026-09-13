@@ -32,8 +32,6 @@ pub const Action = enum {
     pile_down,
     reload_config,
     toggle_floating,
-    /// niri-style consume: move the focused window into the neighboring
-    /// column (Super+[ = the column to the left, Super+] = to the right).
     consume_left,
     consume_right,
     swap_left,
@@ -182,7 +180,6 @@ pub const WindowsConfig = struct {
     gaps_in: i32 = 8,
 };
 
-
 pub const Rule = struct {
     class: ?[]const u8 = null,
     title: ?[]const u8 = null,
@@ -326,8 +323,6 @@ const char_keysyms = [_]struct { ch: u8, name: []const u8 }{
 /// Shifted counterparts for the keysyms most binds use with Shift. Only
 /// pairs that are identical across layouts made the list (no digits,
 /// apostrophe, backslash — those differ between us/gb).
-/// ponytail: layout-independent pairs only; if a Shift+punct bind stops
-/// firing on a specific layout, add its pair here.
 const shift_pairs = [_]struct { base: []const u8, shifted: []const u8 }{
     .{ .base = "equal", .shifted = "plus" },
     .{ .base = "minus", .shifted = "underscore" },
@@ -811,7 +806,6 @@ test "compileGestures rejects direction/kind mismatches" {
 fn expectInvalid(a: std.mem.Allocator, binds: []const GestureBind) !void {
     try std.testing.expectError(error.InvalidGestureDir, compileGestures(a, binds));
 }
-
 
 test "globMatch basic patterns" {
     try std.testing.expect(globMatch("org.wez*", "org.wezfurlong.wezterm"));

@@ -4,6 +4,7 @@ const wlroots = @import("wlroots");
 const ServerContext = @import("../server.zig");
 const View = @import("view.zig");
 const Border = @import("border.zig");
+const Rounding = @import("rounding.zig");
 const AnimationManager = @import("animation.zig");
 const Mirror = @import("../mirror.zig");
 
@@ -121,6 +122,282 @@ pub fn moveViewToSlot(
     updateViewPositions(context);
 }
 
+/// While Mod+dragging a tiled window: paint the drop preview for the column
+/// under (x, y) — the pile over there pre-shrinks to make room for the phantom
+/// and a ghost rect marks the slot — and remember it on `context.drag_preview`
+/// so commitDragPreview can realize the drop on release.
+pub fn updateDragPreview(context: *ServerContext, view: *View, x: f64, y: f64) void {
+    var slot_x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    var target_index: ?usize = null;
+    var gutter_before: ?usize = null; // list index where a gutter starts
+    for (context.views.items, 0..) |candidate, i| {
+        if (!candidate.isMapped() or candidate.floating) continue;
+        const width = tiledWidth(context, candidate);
+        if (x >= @as(f64, @floatFromInt(slot_x)) and x < @as(f64, @floatFromInt(slot_x)) + @as(f64, @floatFromInt(width))) {
+            target_index = i;
+            break;
+        }
+        // Track gap before this column for gutter-drop: cursor falls in
+        // the empty space between the previous column's right edge and
+        // this column's left edge.
+        if (x < @as(f64, @floatFromInt(slot_x))) {
+            gutter_before = i;
+            break;
+        }
+        if (advanceSlotAfter(context, candidate, i)) {
+            slot_x += width + context.gaps_in;
+        }
+    }
+
+    // Cursor is past the last column — gutter drop at end.
+    if (target_index == null and gutter_before == null) {
+        const n = activeTiledCount(context);
+        if (n <= 1) {
+            endDragPreview(context);
+            return;
+        }
+        // insert as its own standalone column at the end
+        const target = context.views.items.len;
+        if (context.drag_preview) |dp| {
+            if (dp.view == view and dp.gutter_index == target) return;
+        }
+        context.drag_preview = .{ .view = view, .anchor = view, .index = target, .gutter_index = target };
+        positionGutterGhost(context, view, target);
+        return;
+    }
+
+    // Gutter drop: cursor is in empty space before a column.
+    if (gutter_before) |gb| {
+        // The target list index is where the first member of the next
+        // column sits. Drop a standalone column here.
+        if (context.drag_preview) |dp| {
+            if (dp.view == view and dp.gutter_index == gb) return;
+        }
+        context.drag_preview = .{ .view = view, .anchor = view, .index = gb, .gutter_index = gb };
+        positionGutterGhost(context, view, gb);
+        return;
+    }
+
+    // Pile-join drop: cursor is inside an existing column.
+    const target = target_index.?;
+    const anchor = context.views.items[target];
+    if (anchor == view or (view.pile_id != 0 and anchor.pile_id == view.pile_id)) {
+        endDragPreview(context);
+        return;
+    }
+
+    var index: usize = 0;
+    if (anchor.pile_id == 0) {
+        const top_mid = @as(f64, @floatFromInt(context.usable_area.y)) +
+            @as(f64, @floatFromInt(context.usable_area.height)) / 2.0;
+        index = if (y < top_mid) 0 else 1;
+    } else {
+        for (context.views.items) |member| {
+            if (member.pile_id != anchor.pile_id) continue;
+            const ps = pileSlotRaw(context, member) orelse continue;
+            const mid = @as(f64, @floatFromInt(ps.top)) + @as(f64, @floatFromInt(ps.height)) / 2.0;
+            if (y < mid) break;
+            index += 1;
+        }
+    }
+
+    if (context.drag_preview) |dp| {
+        if (dp.view == view and dp.anchor == anchor and dp.index == index) return;
+    }
+
+    context.drag_preview = .{ .view = view, .anchor = anchor, .index = index };
+    positionDragGhost(context, anchor);
+    updateViewPositions(context);
+}
+
+/// Create/position the ghost rect painting the phantom slot of a hovered
+/// column. A lone column's phantom is the empty half; a pile's is the box at
+/// `index` inside the (count+1)-split. The layout pass (updateViewPositions
+/// via pileSlotAt) has already pre-shrunk the real members into place; this
+/// rect just outlines the hole they opened.
+fn positionDragGhost(context: *ServerContext, anchor: *View) void {
+    const dp = context.drag_preview orelse return;
+    const ghost = context.drag_ghost orelse blk: {
+        const top = context.top_tree orelse return;
+        const rect = top.createSceneRect(0, 0, &[4]f32{ 1, 1, 1, 1 }) catch return;
+        context.drag_ghost = rect;
+        break :blk rect;
+    };
+
+    // Column x of the ghost slot == the anchor's slot x.
+    var slot_x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    var found = false;
+    for (context.views.items, 0..) |candidate, i| {
+        if (!candidate.isMapped() or candidate.floating) continue;
+        const width = tiledWidth(context, candidate);
+        if (candidate == anchor) {
+            found = true;
+            break;
+        }
+        if (advanceSlotAfter(context, candidate, i)) {
+            slot_x += width + context.gaps_in;
+        }
+    }
+    if (!found) return;
+
+    const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps_out));
+    const gap: i32 = @intCast(context.gaps_in);
+
+    var top: i32 = col_top;
+    var height: i32 = 1;
+    if (anchor.pile_id == 0) {
+        const avail_h: i32 = @max(1, inner_h - gap);
+        const half: i32 = @max(1, @divFloor(avail_h, 2));
+        top = col_top + gap * @as(i32, @intCast(dp.index)) + half * @as(i32, @intCast(dp.index));
+        height = half;
+    } else {
+        var count: usize = 0;
+        for (context.views.items) |member| {
+            if (member.pile_id == anchor.pile_id) count += 1;
+        }
+        const avail_h: i32 = @max(1, inner_h - gap * @as(i32, @intCast(@max(0, @as(i32, @intCast(count + 1)) - 1))));
+        const sh: i32 = @max(1, @divFloor(avail_h, @as(i32, @intCast(count + 1))));
+        top = col_top + gap * @as(i32, @intCast(dp.index)) + sh * @as(i32, @intCast(dp.index));
+        height = sh;
+    }
+
+    // Paint the ghost as the exact slot the window would occupy: same
+    // bounds as a landed view (border ring included), tinted with the
+    // focused border color and rounded like a real window.
+    const w = @max(1, tiledWidth(context, anchor));
+    const h = @max(1, height);
+    ghost.node.setPosition(slot_x, top);
+    ghost.setSize(w, h);
+    const col = context.focused_border_color;
+    ghost.setColor(&.{ col[0], col[1], col[2], 0.35 });
+    Rounding.setRectCorners(ghost, @intCast(@max(0, context.corner_radius)));
+    ghost.node.setEnabled(true);
+    ghost.node.raiseToTop();
+}
+
+/// Gutter-drop preview: the view re-inserts into the list as its own
+/// standalone column at `target` (a list position). Ghost x = the column
+/// start it will land at (widths of columns before it, skipping the dragged
+/// view's own column since it vacates its slot), height = full column.
+fn positionGutterGhost(context: *ServerContext, view: *View, target: usize) void {
+    _ = context.drag_preview orelse return;
+    const ghost = context.drag_ghost orelse blk: {
+        const top = context.top_tree orelse return;
+        const rect = top.createSceneRect(0, 0, &[4]f32{ 1, 1, 1, 1 }) catch return;
+        context.drag_ghost = rect;
+        break :blk rect;
+    };
+
+    var x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    for (context.views.items, 0..) |candidate, i| {
+        if (i >= target) break;
+        if (candidate == view or !candidate.isMapped() or candidate.floating) continue;
+        if (advanceSlotAfter(context, candidate, i)) {
+            x += tiledWidth(context, candidate) + context.gaps_in;
+        }
+    }
+
+    const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps_out));
+    const w = tiledWidth(context, view);
+
+    ghost.node.setPosition(x, col_top);
+    ghost.setSize(@max(1, w), @max(1, inner_h));
+    const col = context.focused_border_color;
+    ghost.setColor(&.{ col[0], col[1], col[2], 0.35 });
+    Rounding.setRectCorners(ghost, @intCast(@max(0, context.corner_radius)));
+    ghost.node.setEnabled(true);
+    ghost.node.raiseToTop();
+}
+
+/// Drag ended over a previewed column: commit the drop — actually join `view`
+/// into the hovered column at `dp.index` — then clear all preview state.
+/// Reorder `view` to become its own standalone column at list position
+/// `target` (a raw views index, as computed by the gutter scan). Same
+/// remove-then-insert dance as moveViewToSlot; the view does NOT join a
+/// pile — gutter drops always produce a lone column.
+fn moveToIndex(context: *ServerContext, view: *View, target: usize) void {
+    if (view.pile_id != 0) splitViewFromPile(context, view);
+    const current = std.mem.indexOfScalar(*View, context.views.items, view) orelse return;
+    if (current == target) return;
+
+    const ax = &context.animation_x;
+    const aw = &context.animation_w;
+    const av = context.views.orderedRemove(current);
+    const axv = ax.orderedRemove(current);
+    const awv = aw.orderedRemove(current);
+    const ins = if (target > current) target - 1 else target;
+    context.views.insert(std.heap.c_allocator, ins, av) catch return;
+    ax.insert(std.heap.c_allocator, ins, axv) catch return;
+    aw.insert(std.heap.c_allocator, ins, awv) catch return;
+
+    updateViewPositions(context);
+}
+
+pub fn commitDragPreview(context: *ServerContext) void {
+    const dp = context.drag_preview orelse {
+        endDragPreview(context);
+        return;
+    };
+    if (dp.gutter_index) |target| {
+        moveToIndex(context, dp.view, target);
+        endDragPreview(context);
+        scrollToView(context, dp.view);
+        return;
+    }
+    if (dp.view.pile_id != 0) splitViewFromPile(context, dp.view);
+    joinPileNear(context, dp.view, dp.anchor);
+    // joinPileNear places the view right below the anchor; reposition it to
+    // the ghost index so the drop lands exactly where the preview showed.
+    // The pile's members are consecutive in the list, so rank = position
+    // among same-pile views; bubble the view there with lockstep animation
+    // swaps (mirroring joinPileNear's swap dance).
+    // Bubble `view` to the ghost's rank within its pile run. The pile is
+    // consecutive after joinPileNear, so the run has a real list span; the
+    // swap must walk REAL indices, not ranks, or the view lands in a foreign
+    // column and the pile fragments into separate tiled columns.
+    if (dp.index < max_pile_members) {
+        const ax = &context.animation_x;
+        const aw = &context.animation_w;
+        const ay = &context.animation_y;
+        var vi: usize = 0;
+        for (context.views.items, 0..) |member, i| {
+            if (member == dp.view) {
+                vi = i;
+                break;
+            }
+        }
+        var start = vi;
+        while (start > 0 and context.views.items[start - 1].pile_id == dp.view.pile_id) start -= 1;
+        var rank = vi - start;
+        while (rank > dp.index) : (rank -= 1) {
+            std.mem.swap(*View, &context.views.items[vi], &context.views.items[vi - 1]);
+            std.mem.swap(f32, &ax.items[vi], &ax.items[vi - 1]);
+            if (vi < aw.items.len) std.mem.swap(f32, &aw.items[vi], &aw.items[vi - 1]);
+            if (vi < ay.items.len) std.mem.swap(f32, &ay.items[vi], &ay.items[vi - 1]);
+            vi -= 1;
+        }
+        while (rank < dp.index) : (rank += 1) {
+            std.mem.swap(*View, &context.views.items[vi], &context.views.items[vi + 1]);
+            std.mem.swap(f32, &ax.items[vi], &ax.items[vi + 1]);
+            if (vi + 1 < aw.items.len) std.mem.swap(f32, &aw.items[vi], &aw.items[vi + 1]);
+            if (vi + 1 < ay.items.len) std.mem.swap(f32, &ay.items[vi], &ay.items[vi + 1]);
+            vi += 1;
+        }
+    }
+    endDragPreview(context);
+    scrollToView(context, dp.view);
+}
+
+/// Clear the drag preview (ghost + phantom layout) without committing.
+pub fn endDragPreview(context: *ServerContext) void {
+    if (context.drag_preview == null and context.drag_ghost == null) return;
+    context.drag_preview = null;
+    if (context.drag_ghost) |g| g.node.setEnabled(false);
+    updateViewPositions(context);
+}
+
 pub fn applyFullscreen(context: *ServerContext, view: *View) void {
     if (view.fullscreen) {
         // Reparent above all layers (bars, launchers) so the
@@ -228,9 +505,45 @@ pub const PileSlot = struct {
 };
 
 pub fn pileSlot(context: *ServerContext, view: *View) ?PileSlot {
-    if (view.pile_id == 0) return null;
+    return pileSlotAt(context, view, true);
+}
 
+/// `pileSlot` ignoring the drag-preview phantom: the slot the view occupies
+/// when no drop preview is active. The drop-point scan (updateDragPreview)
+/// must measure REAL geometry or the phantom drifts the mapping.
+pub fn pileSlotRaw(context: *ServerContext, view: *View) ?PileSlot {
+    return pileSlotAt(context, view, false);
+}
+
+fn pileSlotAt(context: *ServerContext, view: *View, with_preview: bool) ?PileSlot {
     const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps_out));
+    const gap: i32 = @intCast(context.gaps_in);
+
+    // Drag-preview phantom for a LONE column: not a pile, but while a tiled
+    // drag hovers it the lone window pre-splits into two equal halves (the
+    // phantom takes one, the real window keeps the other) so the drop site is
+    // visible before release. dp.index 0 = ghost on top, 1 = ghost below.
+    if (view.pile_id == 0) {
+        if (with_preview) {
+            if (context.drag_preview) |dp| {
+                if (dp.anchor == view and dp.anchor.pile_id == 0) {
+                    const phantom = [2]f32{ 0.5, 0.5 };
+                    const self_at: usize = if (dp.index == 0) 1 else 0;
+                    const off = PileMath.pileMemberOffsets(&phantom, self_at);
+                    const avail_h: i32 = @max(1, inner_h - gap);
+                    const share_h = @as(f32, @floatFromInt(avail_h));
+                    return .{
+                        .top = col_top + gap * @as(i32, @intCast(self_at)) +
+                            @as(i32, @intFromFloat(off.top_frac * share_h)),
+                        .height = @max(1, @as(i32, @intFromFloat(off.share_frac * share_h))),
+                    };
+                }
+            }
+        }
+        return null;
+    }
+
     const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse return null;
 
     // Collect this pile's shares in list order (the run is consecutive).
@@ -253,14 +566,36 @@ pub fn pileSlot(context: *ServerContext, view: *View) ?PileSlot {
         count += 1;
     }
 
+    // Drag-preview phantom for a PILE: while a tiled drag hovers this column
+    // the pile lays out as if a ghost member with an equal share had just
+    // joined at `dp.index` (0..count; count = below the last member). Real
+    // members keep their shares, but the (count+1)-split shifts each member at
+    // or above dp.index down one slot, so they all visibly pre-shrink to admit
+    // the drop. The dragged window itself keeps its own column.
+    if (with_preview) {
+        if (context.drag_preview) |dp| {
+            if (view.pile_id == dp.anchor.pile_id) {
+                const ph = 1.0 / @as(f32, @floatFromInt(count + 1));
+                var phantom: [max_pile_members + 1]f32 = undefined;
+                for (0..count + 1) |i| phantom[i] = ph;
+                var self_at = self_off;
+                if (self_off >= dp.index) self_at += 1;
+                const off2 = PileMath.pileMemberOffsets(phantom[0 .. count + 1], self_at);
+                const avail_h: i32 = @max(1, inner_h - gap * @as(i32, @intCast(@max(0, @as(i32, @intCast(count + 1)) - 1))));
+                const share_h = @as(f32, @floatFromInt(avail_h));
+                return .{
+                    .top = col_top + gap * @as(i32, @intCast(self_at)) +
+                        @as(i32, @intFromFloat(off2.top_frac * share_h)),
+                    .height = @max(1, @as(i32, @intFromFloat(off2.share_frac * share_h))),
+                };
+            }
+        }
+    }
+
+    // Normal geometry (no preview): the view's real role in its pile.
     const off = PileMath.pileMemberOffsets(shares[0..count], self_off);
-    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps_out));
     // Stacked members honor gaps_in like columns do: the pile's inner
     // height is split between the members and their inter-member gaps.
-    // ponytail: the divider drag maps pixels to shares without the gap
-    // offset, so the drag lands a few px (≤ gaps_in per divider) off;
-    // add it to updatePileDivider if it bothers anyone.
-    const gap: i32 = @intCast(context.gaps_in);
     const avail_h: i32 = @max(1, inner_h - gap * @as(i32, @intCast(@max(0, @as(i32, @intCast(count)) - 1))));
     const share_h = @as(f32, @floatFromInt(avail_h));
     return .{
@@ -269,7 +604,6 @@ pub fn pileSlot(context: *ServerContext, view: *View) ?PileSlot {
         .height = @max(1, @as(i32, @intFromFloat(off.share_frac * share_h))),
     };
 }
-
 
 /// True when the tile flow must advance past `view`'s column: always for
 /// single-column views, and for a pile member only after its last member.
@@ -631,7 +965,6 @@ fn nextPileId(context: *ServerContext) u64 {
 }
 
 /// Hsplit "undo": turn every member of `anchor`'s pile back into its own
-
 /// Set `view`'s vertical share to `share` (fraction), clamped to .1..0.9,
 /// keeping the pile's shares summing to 1 by redistributing the remainder
 /// to its siblings. Shared by the share binds and the divider drag.
@@ -680,5 +1013,3 @@ pub fn syncPile(context: *ServerContext, anchor: *View) void {
         scrollToViewNoLayout(context, v);
     }
 }
-
-

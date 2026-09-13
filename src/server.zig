@@ -26,6 +26,20 @@ const GestureContext = @import("input/gesture.zig");
 const Activation = @import("activation.zig");
 pub const ResizeEdge = enum { left, right };
 
+/// Mod+drag drop-preview state: while non-null the hovered column's pile
+/// lays out as if a phantom equal-share member had joined at `index` (the
+/// dragged window does NOT move until release), and `drag_ghost` paints the
+/// slot the drop would land in. Cleared on release.
+pub const DragPreview = struct {
+    view: *View,
+    /// Pile mode: anchor/index = the column + phantom slot to join.
+    /// Gutter mode (gutter_index != null): index = target list position after
+    /// removal — the view drops as its own standalone column there.
+    anchor: *View,
+    index: usize,
+    gutter_index: ?usize = null,
+};
+
 pub const UndoEntry = union(enum) {
     none,
     resize: struct { view: *View, prev_custom_width: ?i32, prev_pile_width: ?i32, prev_floating: bool },
@@ -289,6 +303,10 @@ drag_view: ?*View = null,
 /// window follows the cursor without jumping to the grab point.
 drag_off_x: i32 = 0,
 drag_off_y: i32 = 0,
+/// Active drag-preview state (see DragPreview).
+drag_preview: ?DragPreview = null,
+/// Ghost rect painted at the phantom slot during `drag_preview`.
+drag_ghost: ?*wlroots.SceneRect = null,
 
 // Edge-drag state for resizing a window's width.
 resize_active: bool = false,
