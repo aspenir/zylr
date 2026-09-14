@@ -6,6 +6,15 @@ const std = @import("std");
 const xkb = @import("xkbcommon");
 const ziggy = @import("ziggy");
 
+/// Output rotation: clockwise quarter turns of the primary display.
+pub const Transform = enum {
+    normal,
+    /// Clockwise 90° (right edge becomes top).
+    @"90",
+    @"180",
+    @"270",
+};
+
 pub const Action = enum {
     spawn,
     close,
@@ -321,6 +330,9 @@ pub const Config = struct {
     // New views take a fraction of the output width; zylr's tiling has no
     // absolute default width because it is output-relative.
     width_ratio: f32 = 0.6,
+    /// Screen rotation for the primary output. `.normal`, `.90`, `.180`,
+    /// `.270` are clockwise steps; reload applies the change live.
+    transform: Transform = .normal,
     /// Output scale factor override; 0 = use the display's preferred scale.
     scale: f32 = 0,
     /// Adaptive sync (VRR/Freesync) on the main output. Some laptop panels
@@ -944,6 +956,7 @@ test "ziggy document deserializes into Config" {
     const doc =
         \\.{
         \\    .keyboard = .custom(.{ .layout = "de", .variant = "nodeadkeys" }),
+        \\    .transform = .90,
         \\    .decorations = .{ .rounding = 4, .border = .{ .width = 2, .sides = .{ .top = 4, .right = 6 }, .color = .solid("#ff0000"), .inactive_color = .solid("#884422aa"), .floating_color = .solid("#00ff00"), .active_floating_color = .solid("#ff00ff"), .hover_color = .solid("#00ffff"), .pulse = true } },
         \\    .windows = .{ .gaps_out = 4 },
         \\    .autostart = [],
@@ -962,6 +975,7 @@ test "ziggy document deserializes into Config" {
     const cfg = try ziggy.deserializeLeaky(Config, a, doc, &meta, .{});
 
     try std.testing.expectEqualStrings("de", cfg.keyboard.custom.layout);
+    try std.testing.expectEqual(Transform.@"90", cfg.transform);
 
     const kb = try compileKeybinds(a, cfg.keybinds);
     try std.testing.expectEqual(@as(usize, 2), kb.binds.len);

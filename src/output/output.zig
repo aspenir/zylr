@@ -7,6 +7,8 @@ const AnimationManager = @import("../view/animation.zig");
 const Mirror = @import("../mirror.zig");
 const Osd = @import("../osd.zig");
 const ServerContext = @import("../server.zig");
+const Config = @import("../config.zig");
+const ViewManager = @import("../view/view_manager.zig");
 const OutputContext = @This();
 
 scene_output: *wlroots.SceneOutput,
@@ -18,7 +20,6 @@ destroyed: bool = false,
 context: *ServerContext,
 last_frame_ns: u64 = 0,
 last_way_commits: u64 = 0,
-
 
 pub fn onNewOutput(
     listener: *wl.Listener(*wlroots.Output),
@@ -49,6 +50,7 @@ pub fn onNewOutput(
     }
 
     state.setScale(if (context.view_scale > 0) context.view_scale else defaultScale(output));
+    state.setTransform(toWlrTransform(context.cfg.transform));
 
     if (output.adaptive_sync_supported and context.cfg.vrr) {
         state.setAdaptiveSyncEnabled(true);
@@ -143,6 +145,100 @@ pub fn applyScale(context: *ServerContext) void {
     defer state.finish();
     state.setScale(if (context.view_scale > 0) context.view_scale else defaultScale(output));
     _ = output.commitState(&state);
+    output.scheduleFrame();
+}
+
+/// Re-apply the output transform (screen rotation) from config. Called on
+/// config reload: committing the transform where the reload also changed.
+pub fn applyTransform(context: *ServerContext) void {
+    const output = context.output orelse return;
+    const t = toWlrTransform(context.cfg.transform);
+    if (output.transform == t) return;
+    var state = wlroots.Output.State.init();
+    defer state.finish();
+    state.setTransform(t);
+    if (!output.commitState(&state)) {
+        std.log.err("applyTransform: commitState failed", .{});
+        return;
+    }
+    // Rotation swaps the output's logical width/height, so every tiled
+    // slot and floating anchor derived from the old size is stale. Rebuild
+    // the usable area from the new effective resolution and re-tile.
+    reconfigureAndRetile(context);
+    // Nothing was damaged by the commit, so the panel would keep showing the
+    // old-orientation framebuffer until some unrelated repaint. Request one
+    // now so the transition is immediate.
+    output.scheduleFrame();
+}
+
+fn reconfigureAndRetile(context: *ServerContext) void {
+    const output = context.output orelse return;
+    // Effective (transformed+scaled) resolution: a rotated output swaps its
+    // box here, so retiling lands on the portrait dimensions.
+    var ow: c_int = 0;
+    var oh: c_int = 0;
+    output.effectiveResolution(&ow, &oh);
+    const full_area = wlroots.Box{
+        .x = 0,
+        .y = 0,
+        .width = @max(0, @as(c_int, ow)),
+        .height = @max(0, @as(c_int, oh)),
+    };
+    var usable = full_area;
+    // Re-derive the usable area the same way layer.zig does (bars reserve
+    // their exclusive zones), then retile every view and re-center the
+    // viewport so the focused window stays in view after the size swap.
+    for (context.layers.items) |layer| {
+        const ls = layer.layer_surface;
+        if (!ls.initialized) continue;
+        const st = ls.current;
+        if (st.exclusive_zone < 0) continue;
+        const ez = st.exclusive_zone;
+        if (st.anchor.top and !st.anchor.bottom) {
+            usable.y += ez + st.margin.top;
+            usable.height -= ez + st.margin.top;
+        }
+        if (st.anchor.bottom and !st.anchor.top) {
+            usable.height -= ez + st.margin.bottom;
+        }
+        if (st.anchor.left and !st.anchor.right) {
+            usable.x += ez + st.margin.left;
+            usable.width -= ez + st.margin.left;
+        }
+        if (st.anchor.right and !st.anchor.left) {
+            usable.width -= ez + st.margin.right;
+        }
+    }
+    if (usable.width < 0) usable.width = 0;
+    if (usable.height < 0) usable.height = 0;
+    context.usable_area = usable;
+
+    // Bars and overlays keep their old-orientation geometry otherwise:
+    // wlroots reconfigures layer surfaces only when they commit, not when
+    // the output rotation changes. Force each live one onto the new boxes.
+    //
+    // Each configure call positions the layer INSIDE the bounds box and then
+    // narrows it by that layer's exclusive zone, so feed a fresh full-area
+    // starting point per pass. Passing the pre-narrowed `usable` here would
+    // offset every bar by its own ezed zone (its own height/width).
+    var layer_bounds = full_area;
+    for (context.layers.items) |layer| {
+        const ls = layer.layer_surface;
+        if (!ls.initialized) continue;
+        layer.scene_layer.configure(&full_area, &layer_bounds);
+    }
+
+    ViewManager.refreshTiledSizes(context);
+    ViewManager.updateViewPositions(context);
+}
+
+fn toWlrTransform(t: Config.Transform) wl.Output.Transform {
+    return switch (t) {
+        .normal => .normal,
+        .@"90" => .@"90",
+        .@"180" => .@"180",
+        .@"270" => .@"270",
+    };
 }
 
 /// The output is going away (hotplug, modeset loss, shutdown). Detach
@@ -257,6 +353,14 @@ pub fn onManagerApply(listener: *wl.Listener(*wlroots.OutputConfigurationV1), co
         }
     }
 
+    // A transform/scale change came through the output-management protocol
+    // (wlr-randr, accelerometer-driven rotation) rather than a config reload.
+    // The state is committed above but nothing re-derives the usable area or
+    // retiles, so a rotated output keeps its old layout. Recompute now.
+    if (context.output) |output| {
+        reconfigureAndRetile(context);
+        output.scheduleFrame();
+    }
     config.sendSucceeded();
     sendConfig(context);
 }

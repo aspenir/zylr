@@ -639,6 +639,7 @@ pub fn refreshTiledSizes(context: *ServerContext) void {
         } else {
             view.slot_h = eh;
         }
+        view.slot_w = tiledWidth(context, view);
         const ws = view.borderWidths();
         view.setSize(@max(1, view.slot_w - ws.horizontal()), @max(1, view.slot_h - ws.vertical()));
         if (view.surfaceOrNull()) |surf| {

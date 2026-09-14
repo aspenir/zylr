@@ -24,12 +24,16 @@ commit_listener: wl.Listener(*wlroots.Surface) = undefined,
 /// surface commits (size/exclusive-zone change) or is destroyed.
 fn recomputeUsableArea(context: *ServerContext) void {
     const output = context.output orelse return;
-    const scale: i32 = @intFromFloat(@max(output.scale, 1.0));
+    // effectiveResolution applies the output transform AND the scale, so the
+    // box stays correct after a 90/270° rotation (width/height swap there).
+    var ow: c_int = 0;
+    var oh: c_int = 0;
+    output.effectiveResolution(&ow, &oh);
     const full = wlroots.Box{
         .x = 0,
         .y = 0,
-        .width = @divTrunc(output.width, scale),
-        .height = @divTrunc(output.height, scale),
+        .width = @max(0, @as(c_int, ow)),
+        .height = @max(0, @as(c_int, oh)),
     };
 
     var usable = full;
@@ -178,13 +182,17 @@ pub fn onLayerSurfaceCommit(
     // The scene graph works in the output's logical (pre-scale) coordinate
     // space, so feed it logical dimensions rather than the physical mode
     // size. Otherwise scaled outputs place layers at the wrong size/offset.
-    const scale: i32 = @intFromFloat(@max(output.scale, 1.0));
+    // effectiveResolution also applies the rotation, so 90/270° outputs get
+    // their swapped box here instead of a landscape-describing one.
+    var ow: c_int = 0;
+    var oh: c_int = 0;
+    output.effectiveResolution(&ow, &oh);
 
     const full_area = wlroots.Box{
         .x = 0,
         .y = 0,
-        .width = @divTrunc(output.width, scale),
-        .height = @divTrunc(output.height, scale),
+        .width = @max(0, @as(c_int, ow)),
+        .height = @max(0, @as(c_int, oh)),
     };
 
     const context = layer.context;

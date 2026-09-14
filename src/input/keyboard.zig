@@ -390,6 +390,7 @@ pub fn runAction(
             Blur.applyConfig(context);
             Border.applyConfig(context);
             OutputContext.applyScale(context);
+            OutputContext.applyTransform(context);
             if (context.idle) |idle| idle.reloadTimers(context);
         },
         .spawn => {

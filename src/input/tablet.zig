@@ -5,6 +5,7 @@ const std = @import("std");
 
 const ServerContext = @import("../server.zig");
 const NodeData = @import("../view/utils/node_data.zig");
+const InputTransform = @import("input_transform.zig");
 
 const View = @import("../view/view.zig");
 const Layer = @import("../view/layer.zig");
@@ -120,17 +121,9 @@ fn toolPosition(
     self: *TabletContext,
     x: f64,
     y: f64,
-) struct { ox: f64, oy: f64 } {
+) InputTransform.Point {
     const output = self.context.output orelse return .{ .ox = 0, .oy = 0 };
-
-    var ow: c_int = 0;
-    var oh: c_int = 0;
-    output.effectiveResolution(&ow, &oh);
-
-    return .{
-        .ox = x * @as(f64, @floatFromInt(ow)),
-        .oy = y * @as(f64, @floatFromInt(oh)),
-    };
+    return InputTransform.toLogical(output, x, y);
 }
 
 pub fn onAxis(
