@@ -53,13 +53,13 @@ pub fn applyConfig(context: *ServerContext) void {
 
 pub fn createForView(view: *View, tree: *wlroots.SceneTree) void {
     const blur = wlr_scene_blur_create(tree, 1, 1) orelse return;
-    const bw: i32 = @intCast(@max(0, view.borderWidth()));
-    const content_w = @max(1, view.slot_w - 2 * bw);
-    const content_h = @max(1, view.slot_h - 2 * bw);
+    const ws = view.borderWidths();
+    const content_w = @max(1, view.slot_w - ws.horizontal());
+    const content_h = @max(1, view.slot_h - ws.vertical());
     wlr_scene_blur_set_size(blur, content_w, content_h);
     blurUpdateRadius(view, blur);
-    const node: *wlroots.SceneNode = @alignCast(@ptrCast(blur));
-    node.setPosition(bw, bw);
+    const node: *wlroots.SceneNode = @ptrCast(@alignCast(blur));
+    node.setPosition(ws.left, ws.top);
     // The blur must sit below the client's content so it blurs what's
     // behind the transparent window, not the window's own pixels. The
     // border ring may not exist yet (XWayland especially), so ignore it.
@@ -84,7 +84,7 @@ fn surfaceNode(view: *View) ?*wlroots.SceneNode {
 
 pub fn updateForView(view: *View) void {
     const blur = view.blur_node orelse return;
-    const node: *wlroots.SceneNode = @alignCast(@ptrCast(blur));
+    const node: *wlroots.SceneNode = @ptrCast(@alignCast(blur));
 
     if (!view.blurEnabled()) {
         node.setEnabled(false);
@@ -96,12 +96,12 @@ pub fn updateForView(view: *View) void {
     // and must show the blurred backdrop. Gating on opaque hid the blur
     // behind every opaque window, so "blur doesn't work when enabled."
     node.setEnabled(true);
-    const bw: i32 = @intCast(@max(0, view.borderWidth()));
-    const content_w = @max(1, view.slot_w - 2 * bw);
-    const content_h = @max(1, view.slot_h - 2 * bw);
+    const ws = view.borderWidths();
+    const content_w = @max(1, view.slot_w - ws.horizontal());
+    const content_h = @max(1, view.slot_h - ws.vertical());
     wlr_scene_blur_set_size(blur, content_w, content_h);
     blurUpdateRadius(view, blur);
-    node.setPosition(bw, bw);
+    node.setPosition(ws.left, ws.top);
 }
 
 /// Match the content area's inner corners: r -| 1.
@@ -113,13 +113,13 @@ fn blurUpdateRadius(view: *View, blur: *SceneBlur) void {
 
 pub fn lowerToBottom(view: *View) void {
     const blur = view.blur_node orelse return;
-    const node: *wlroots.SceneNode = @alignCast(@ptrCast(blur));
+    const node: *wlroots.SceneNode = @ptrCast(@alignCast(blur));
     node.lowerToBottom();
 }
 
 pub fn destroyForView(view: *View) void {
     if (view.blur_node) |blur| {
-        const node: *wlroots.SceneNode = @alignCast(@ptrCast(blur));
+        const node: *wlroots.SceneNode = @ptrCast(@alignCast(blur));
         node.data = null;
         node.destroy();
         view.blur_node = null;

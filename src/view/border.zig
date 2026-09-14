@@ -3,6 +3,7 @@ const wlroots = @import("wlroots");
 const View = @import("view.zig");
 const ServerContext = @import("../server.zig");
 const Rounding = @import("rounding.zig");
+const Config = @import("../config.zig");
 
 /// Border rendering; the window's own surface
 /// is rounded (its corner pixels are transparent), and a single
@@ -17,11 +18,49 @@ const Border = @This();
 /// coordinates: -bw..w+bw). Disabled when unfocused.
 rect: *wlroots.SceneRect,
 
+/// Solid strips used to fake a gradient ring (scenefx rects are
+/// solid-only). Lazily created as children of view.scene_tree below the
+/// surface; empty for solid rings. The scene nodes die with the tree;
+/// the backing slice is freed in `deinit`.
+strips: std.ArrayListUnmanaged(*wlroots.SceneRect) = .empty,
+
+/// Slice a gradient ring into this many solid strips. More strips =
+/// smoother gradients, more scene rects per view.
+pub const num_strips: usize = 32;
+
+pub fn deinit(self: *Border) void {
+    self.strips.deinit(std.heap.c_allocator);
+}
+
+fn disableStrips(self: *Border) void {
+    for (self.strips.items) |strip| strip.node.setEnabled(false);
+}
+
+fn disableAll(self: *Border) void {
+    self.rect.node.setEnabled(false);
+    self.disableStrips();
+}
+
+fn ensureStrips(self: *Border, view: *View, n: usize) void {
+    if (self.strips.items.len >= n) return;
+    const a = std.heap.c_allocator;
+    self.strips.ensureTotalCapacity(a, n) catch return;
+    while (self.strips.items.len < n) {
+        const strip = view.scene_tree.createSceneRect(0, 0, &[4]f32{ 1, 1, 1, 1 }) catch {
+            self.strips.clearAndFree(a);
+            return;
+        };
+        strip.node.data = &view.node_data;
+        strip.node.setEnabled(false);
+        self.strips.appendAssumeCapacity(strip);
+    }
+}
+
 pub fn createViewBorder(view: *View) void {
-    const context = view.context;    // The rect lives INSIDE the view tree, below the surface, so it
+    const context = view.context; // The rect lives INSIDE the view tree, below the surface, so it
     // moves and scrolls with the window; sibling order keeps the client
     // and any popups/sub-surfaces above it (and above its input region).
-    const color = view.borderColor();
+    const color = view.borderColor(context.focused_view == view).sample(0.5);
     const rect = view.scene_tree.createSceneRect(0, 0, &color) catch return;
     rect.node.data = &view.node_data;
 
@@ -123,13 +162,13 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
 
     // Fullscreen views have no border.
     if (view.fullscreen) {
-        border.rect.node.setEnabled(false);
+        border.disableAll();
         return;
     }
 
     // Override-redirect windows (Steam menus) get no border ring.
     if (view.isOrWindow()) {
-        border.rect.node.setEnabled(false);
+        border.disableAll();
         return;
     }
 
@@ -143,14 +182,14 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
     // decoration signals can fire while it is dying — and scenefx asserts
     // on re-parenting in that state (node != sibling).
     if (!view.isMapped() or surface.current.width <= 0 or surface.current.height <= 0) {
-        border.rect.node.setEnabled(false);
+        border.disableAll();
         return;
     }
 
     const width = surface.current.width;
     const height = surface.current.height;
 
-    const bw = view.borderWidth();
+    const widths = view.borderWidths();
 
     // XDG: a non-zero geometry offset means the client renders its own
     // frame (GTK shadow margins) inside the buffer. wlroots pins the
@@ -183,8 +222,8 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
         // insets its buffer node.
         const pos: [2]c_int = switch (view.backend) {
             .xdg => .{
-                @as(c_int, @intCast(bw)) - xdg_geom.x,
-                @as(c_int, @intCast(bw)) - xdg_geom.y,
+                @as(c_int, @intCast(widths.left)) - xdg_geom.x,
+                @as(c_int, @intCast(widths.top)) - xdg_geom.y,
             },
             else => .{ 0, 0 },
         };
@@ -221,8 +260,12 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
     }
 
     const rect = border.rect;
-    const enabled =
-        context.focused_view == view and view.slot_w > 0 and view.slot_h > 0;
+    // Every mapped window draws a ring; focus only selects the color
+    // (active vs inactive), so the ring survives focus switches.
+    const enabled = view.slot_w > 0 and view.slot_h > 0;
+    const ring_color = view.borderColor(context.focused_view == view);
+    // Pulse breathes only the focused ring's brightness.
+    const dim: f32 = if (context.pulse_enabled and context.focused_view == view) context.pulse_dim else 1.0;
 
     // the ring is the slot the window content is inset into,
     // so the band is uniform on all four sides and can never cross into
@@ -244,7 +287,182 @@ pub fn updateViewBorder(view: *View, anim_x: f32, anim_w: ?f32) void {
         else => height,
     };
 
-    updateBorderRect(rect, content_w, content_h, ring_w, ring_h, enabled, if (r > 0) r -| 1 else 0, view.borderColor(), view.borderWidth());
+    const inner_r: u16 = if (r > 0) r -| 1 else 0;
+    switch (ring_color) {
+        .solid => |c| {
+            border.disableStrips();
+            updateBorderRect(rect, content_w, content_h, ring_w, ring_h, enabled, inner_r, c, widths, dim);
+        },
+        .gradient => |g| updateGradientBorder(view, border, g, content_w, content_h, ring_w, ring_h, enabled, inner_r, widths, dim),
+    }
+}
+
+/// Draw a gradient ring by slicing the slot into thin solid strips, each
+/// clipped to the same ring shape (interior carved out) and colored by
+/// sampling the gradient at the strip's center projected onto the
+/// gradient axis. scenefx rects are solid-only, so a gradient is faked
+/// from N solid quads.
+fn updateGradientBorder(
+    view: *View,
+    border: *Border,
+    g: Config.Gradient,
+    content_w: i32,
+    content_h: i32,
+    slot_w: i32,
+    slot_h: i32,
+    enabled: bool,
+    inner_r: u16,
+    widths: Config.BorderWidths,
+    dim: f32,
+) void {
+    border.rect.node.setEnabled(false);
+    if (!enabled or slot_w <= 0 or slot_h <= 0) {
+        border.disableStrips();
+        return;
+    }
+    border.ensureStrips(view, Border.num_strips);
+    if (border.strips.items.len == 0) return;
+    const strips = border.strips.items;
+
+    const rad = g.angle * std.math.pi / 180.0;
+    const ca = @cos(rad);
+    const sa = @sin(rad);
+    // Slice perpendicular to the dominant gradient axis: horizontal-ish
+    // (angle ~0/180) -> vertical columns; vertical-ish (angle ~90/270)
+    // -> horizontal rows. Strip colors are then sampled correctly for
+    // any angle by projecting onto the gradient axis.
+    const columns = @abs(sa) <= @abs(ca);
+    const span: i32 = if (columns) slot_w else slot_h;
+    // Ceiling so the strips tile the whole span: floor(span / n) strips of
+    // width floor(span / n) miss the remainder pixels at the far edge
+    // (e.g. 32×3px = 96 vs a 100px slot), which showed as the ring
+    // cutting off on the bottom/right.
+    const step_i: i32 = @max(1, @divTrunc(span + @as(i32, @intCast(Border.num_strips)) - 1, @as(i32, @intCast(Border.num_strips))));
+    const n_used: usize = @min(Border.num_strips, @as(usize, @intCast(@divTrunc(span + step_i - 1, step_i))));
+
+    const r: u16 = @intCast(@max(0, inner_r));
+
+    for (strips, 0..) |strip, i| {
+        if (i >= n_used) {
+            strip.node.setEnabled(false);
+            continue;
+        }
+        const start: i32 = @as(i32, @intCast(i)) * step_i;
+        const size: i32 = @min(step_i, span - start);
+        if (columns) {
+            strip.setSize(size, slot_h);
+            strip.node.setPosition(start, 0);
+        } else {
+            strip.setSize(slot_w, size);
+            strip.node.setPosition(0, start);
+        }
+
+        // Sample at the strip center, projected onto the gradient axis
+        // and normalized over the slot's projection range.
+        const ccx: f32 = if (columns)
+            @as(f32, @floatFromInt(start)) + @as(f32, @floatFromInt(size)) / 2.0
+        else
+            @as(f32, @floatFromInt(slot_w)) / 2.0;
+        const ccy: f32 = if (columns)
+            @as(f32, @floatFromInt(slot_h)) / 2.0
+        else
+            @as(f32, @floatFromInt(start)) + @as(f32, @floatFromInt(size)) / 2.0;
+        var col = g.sample(gradientT(g, ccx, ccy, slot_w, slot_h));
+        if (dim < 1.0) {
+            col[0] *= dim;
+            col[1] *= dim;
+            col[2] *= dim;
+        }
+        strip.setColor(&col);
+
+        // Interior clip in strip-local coords: content sits at (bw,bw)
+        // in slot coords, shifted by the strip start.
+        var clip_box: wlroots.Box = if (columns)
+            .{ .x = widths.left - start, .y = widths.top, .width = content_w, .height = content_h }
+        else
+            .{ .x = widths.left, .y = widths.top - start, .width = content_w, .height = content_h };
+        if (clip_box.width <= 0 or clip_box.height <= 0) {
+            clip_box = if (columns)
+                .{ .x = widths.left - start, .y = widths.top, .width = slot_w - widths.horizontal(), .height = slot_h - widths.vertical() }
+            else
+                .{ .x = widths.left, .y = widths.top - start, .width = slot_w - widths.horizontal(), .height = slot_h - widths.vertical() };
+        }
+
+        // Outer corner radii live on the end strips (the strip that
+        // touches each slot corner); inner clip radii on the strips that
+        // contain each content-box corner.
+        var outer = Rounding.CornerRadii{ .top_left = 0, .top_right = 0, .bottom_right = 0, .bottom_left = 0 };
+        var inner = outer;
+        const left_own = i == 0 and start == 0;
+        const right_own = i == n_used - 1 and start + size >= span;
+        if (columns) {
+            if (left_own) {
+                outer.top_left = cornerR(inner_r, widths.left, widths.top);
+                outer.bottom_left = cornerR(inner_r, widths.left, widths.bottom);
+                if (widths.left >= start and widths.left < start + size) {
+                    inner.top_left = r;
+                    inner.bottom_left = r;
+                }
+            }
+            if (right_own) {
+                outer.top_right = cornerR(inner_r, widths.right, widths.top);
+                outer.bottom_right = cornerR(inner_r, widths.right, widths.bottom);
+                if (widths.left + content_w >= start and widths.left + content_w < start + size) {
+                    inner.top_right = r;
+                    inner.bottom_right = r;
+                }
+            }
+        } else {
+            if (left_own) {
+                outer.top_left = cornerR(inner_r, widths.left, widths.top);
+                outer.top_right = cornerR(inner_r, widths.right, widths.top);
+                if (widths.top >= start and widths.top < start + size) {
+                    inner.top_left = r;
+                    inner.top_right = r;
+                }
+            }
+            if (right_own) {
+                outer.bottom_left = cornerR(inner_r, widths.left, widths.bottom);
+                outer.bottom_right = cornerR(inner_r, widths.right, widths.bottom);
+                if (widths.top + content_h >= start and widths.top + content_h < start + size) {
+                    inner.bottom_left = r;
+                    inner.bottom_right = r;
+                }
+            }
+        }
+        Rounding.setRectCornersRadii(strip, outer);
+        if (clip_box.width > 0 and clip_box.height > 0) {
+            Rounding.setRectClipRadii(strip, clip_box, inner);
+        }
+        // Re-place below the surface every update (the surface tree only
+        // appears on the client's first commit).
+        if (surfaceNode(view)) |node| strip.node.placeBelow(node);
+        strip.node.setEnabled(true);
+    }
+}
+
+/// Normalized position t in [0,1] of point (cx,cy) along the gradient
+/// direction, computed by projecting the slot's corner projections.
+fn gradientT(g: Config.Gradient, cx: f32, cy: f32, slot_w: i32, slot_h: i32) f32 {
+    const rad = g.angle * std.math.pi / 180.0;
+    const ca = @cos(rad);
+    const sa = @sin(rad);
+    var pmin: f32 = std.math.floatMax(f32);
+    var pmax: f32 = -std.math.floatMax(f32);
+    const corners = [_][2]f32{
+        .{ 0, 0 },
+        .{ @floatFromInt(slot_w), 0 },
+        .{ 0, @floatFromInt(slot_h) },
+        .{ @floatFromInt(slot_w), @floatFromInt(slot_h) },
+    };
+    for (corners) |pt| {
+        const p = pt[0] * ca + pt[1] * sa;
+        pmin = @min(pmin, p);
+        pmax = @max(pmax, p);
+    }
+    if (pmax <= pmin) return 0.5;
+    const p = cx * ca + cy * sa;
+    return (p - pmin) / (pmax - pmin);
 }
 
 /// Draw the shared ring for a border rect: a full box with
@@ -265,28 +483,49 @@ pub fn updateBorderRect(
     enabled: bool,
     inner_r: u16,
     color: [4]f32,
-    bw: i32,
+    widths: Config.BorderWidths,
+    dim: f32,
 ) void {
     if (!enabled or slot_w <= 0 or slot_h <= 0) {
         rect.node.setEnabled(false);
         return;
     }
 
-    const r: u16 = @intCast(@max(0, inner_r));
-
-    rect.setColor(&color);
+    var tinted = color;
+    if (dim < 1.0) {
+        tinted[0] *= dim;
+        tinted[1] *= dim;
+        tinted[2] *= dim;
+    }
+    rect.setColor(&tinted);
     rect.setSize(slot_w, slot_h);
     rect.node.setPosition(0, 0);
 
-    const outer_r: u16 = if (r > 0) (r -| 1) + @as(u16, @intCast(@max(0, bw))) else 0;
-    Rounding.setRectCorners(rect, outer_r);
+    // Per-corner outer radii so an asymmetric ring rounds each corner by
+    // its own side widths.
+    Rounding.setRectCornersRadii(rect, .{
+        .top_left = cornerR(inner_r, widths.left, widths.top),
+        .top_right = cornerR(inner_r, widths.right, widths.top),
+        .bottom_right = cornerR(inner_r, widths.right, widths.bottom),
+        .bottom_left = cornerR(inner_r, widths.left, widths.bottom),
+    });
 
-    // Rect-local coords: content always sits at (bw,bw) by construction.
-    var clip_box: wlroots.Box = .{ .x = bw, .y = bw, .width = content_w, .height = content_h };
+    // Rect-local coords: content always sits at (left,top) by construction.
+    var clip_box: wlroots.Box = .{ .x = widths.left, .y = widths.top, .width = content_w, .height = content_h };
     if (clip_box.width <= 0 or clip_box.height <= 0) {
-        clip_box = .{ .x = bw, .y = bw, .width = slot_w - 2 * bw, .height = slot_h - 2 * bw };
+        clip_box = .{ .x = widths.left, .y = widths.top, .width = slot_w - widths.horizontal(), .height = slot_h - widths.vertical() };
     }
     Rounding.setRectClip(rect, clip_box, inner_r);
 
     rect.node.setEnabled(true);
+}
+
+/// The outer ring radius at a corner: the inner clip radius plus the
+/// border band where it rounds the corner (the larger of the two sides
+/// meeting there).
+fn cornerR(inner_r: u16, a: i32, b: i32) u16 {
+    const r: u16 = @intCast(@max(0, inner_r));
+    if (r == 0) return 0;
+    const side: u16 = @intCast(@max(0, @max(a, b)));
+    return (r -| 1) + side;
 }

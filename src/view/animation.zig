@@ -50,7 +50,10 @@ pub fn onTimerTick(context: *ServerContext) c_int {
 }
 
 pub fn tick(context: *ServerContext) void {
-    if (!context.animation_active) return;
+    // Pulse keeps the timer alive on its own: when nothing else animates,
+    // allow the idle tick through so the focused ring still breathes.
+    if (!context.pulse_enabled and !context.animation_active) return;
+    if (context.pulse_enabled) context.animation_active = true;
 
     var still_animating = false;
 
@@ -255,6 +258,19 @@ pub fn tick(context: *ServerContext) void {
     // Fade the incoming row's mirrors in step with their windows.
     if (fade < 1.0) {
         for (context.row_mirrors[context.active_row].items) |*m| setTreeOpacity(&m.tree.node, fade);
+    }
+
+    // Focused-ring pulse: breathe brightness on a ~2s sine. Repaint the
+    // focused window's ring so it dims even while the layout is idle.
+    if (context.pulse_enabled) {
+        const breathe = 0.75 + 0.25 * @sin(@as(f32, @floatFromInt(now)) * 2.0 * std.math.pi / 2000.0);
+        context.pulse_dim = breathe;
+        if (context.focused_view) |fv| {
+            if (fv.isMapped() and fv.border != null) {
+                Border.updateViewBorder(fv, @floatFromInt(fv.x), null);
+                still_animating = true;
+            }
+        }
     }
 
     context.animation_active = still_animating;

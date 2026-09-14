@@ -46,6 +46,23 @@ pub fn setRectClip(rect: *wlroots.SceneRect, box: wlroots.Box, radius: u16) void
     });
 }
 
+/// Per-corner variant of setRectCorners: applies the four radii
+/// explicitly (middle gradient strips only round the corners they own).
+pub fn setRectCornersRadii(rect: *wlroots.SceneRect, radii: CornerRadii) void {
+    wlr_scene_rect_set_corner_radii(rect, radii);
+}
+
+/// Per-corner variant of setRectClip: rounds each clip-box corner
+/// independently (gradient strips round only the content corners they
+/// contain).
+pub fn setRectClipRadii(rect: *wlroots.SceneRect, box: wlroots.Box, radii: CornerRadii) void {
+    if (box.width <= 0 or box.height <= 0) return;
+    wlr_scene_rect_set_clipped_region(rect, .{
+        .area = box,
+        .corners = radii,
+    });
+}
+
 pub fn clearBufferCorners(buffer: *wlroots.SceneBuffer) void {
     wlr_scene_buffer_set_corner_radii(buffer, zero());
 }

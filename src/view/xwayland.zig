@@ -272,9 +272,9 @@ fn onRequestConfigure(
 
     if (view.floating or view.fullscreen or xw.override_redirect) {
         _ = xw.configure(ev.x, ev.y, ev.width, ev.height);
-        const bw: i32 = @intCast(view.borderWidth());
-        view.slot_w = @max(1, @as(i32, ev.width) + 2 * bw);
-        view.slot_h = @max(1, @as(i32, ev.height) + 2 * bw);
+        const ws = view.borderWidths();
+        view.slot_w = @max(1, @as(i32, ev.width) + ws.horizontal());
+        view.slot_h = @max(1, @as(i32, ev.height) + ws.vertical());
         return;
     }
 
@@ -371,11 +371,11 @@ pub fn commitSurface(
     // Floating views keep their own geometry.
     if (view.floating or view.fullscreen) {
         if (view.floating) {
-            const bw: c_int = @intCast(view.borderWidth());
-            view.slot_w = @max(1, surface.current.width + 2 * bw);
-            view.slot_h = @max(1, surface.current.height + 2 * bw);
+            const ws = view.borderWidths();
+            view.slot_w = @max(1, surface.current.width + ws.horizontal());
+            view.slot_h = @max(1, surface.current.height + ws.vertical());
             if (view.surface_tree) |wrap| {
-                wrap.node.setPosition(bw, bw);
+                wrap.node.setPosition(ws.left, ws.top);
             }
         }
         return;
@@ -387,15 +387,15 @@ pub fn commitSurface(
     if (ViewManager.pileSlot(context, view)) |ps| eh = ps.height;
     view.slot_h = eh;
 
-    // configure the content box to slot-2bw at slot+(bw,bw), and inset + crop the
+    // configure the content box to slot-2*(l+r,t+b) at slot+(left,top), and inset + crop the
     // content subtree to that box so shadow margins or a stale buffer
     // can never cover the ring band.
-    const bw: c_int = @intCast(view.borderWidth());
-    const target_w: c_int = @max(1, ew - 2 * bw);
-    const target_h: c_int = @max(1, eh - 2 * bw);
+    const ws = view.borderWidths();
+    const target_w: c_int = @max(1, ew - ws.horizontal());
+    const target_h: c_int = @max(1, eh - ws.vertical());
 
     if (view.surface_tree) |wrap| {
-        wrap.node.setPosition(bw, bw);
+        wrap.node.setPosition(ws.left, ws.top);
         const crop: wlroots.Box = .{
             .x = 0,
             .y = 0,
@@ -412,8 +412,8 @@ pub fn commitSurface(
     // as edgeHit).
     const vp_x: c_int = if (view.floating or view.fullscreen) 0 else @intCast(context.viewport_x);
     const vp_y: c_int = if (view.floating or view.fullscreen) 0 else @intCast(context.viewport_y);
-    const target_x: i16 = @intCast(view.x + bw - vp_x);
-    const target_y: i16 = @intCast(view.y + bw - vp_y);
+    const target_x: i16 = @intCast(view.x + ws.left - vp_x);
+    const target_y: i16 = @intCast(view.y + ws.top - vp_y);
 
     // Keep Xwayland's idea of the window's geometry in lockstep with the
     // scene position. If they diverge, Xwayland maps surface-local pointer
@@ -432,15 +432,14 @@ pub fn commitSurface(
     {
         xw_cfg_diag += 1;
         if (xw_cfg_diag <= 30 or xw_cfg_diag % 300 == 0) {
-            std.log.warn("XW cfg vx={d} vy={d} vp=({d},{d}) bw={d} tgt=({d},{d},{d},{d}) old=({d},{d}) cur=({d},{d}) moved={d} wrong={d}", .{
-                view.x,                   view.y,
-                context.viewport_x,       context.viewport_y,
-                bw,                       target_x,
-                target_y,                 target_w,
-                target_h,                 xw_surface.x,
-                xw_surface.y,             surface.current.width,
-                surface.current.height,   @intFromBool(moved),
-                @intFromBool(wrong_size),
+            std.log.warn("XW cfg vx={d} vy={d} vp=({d},{d}) tgt=({d},{d},{d},{d}) old=({d},{d}) cur=({d},{d}) moved={d} wrong={d}", .{
+                view.x,                view.y,
+                context.viewport_x,    context.viewport_y,
+                target_x,              target_y,
+                target_w,              target_h,
+                xw_surface.x,          xw_surface.y,
+                surface.current.width, surface.current.height,
+                @intFromBool(moved),   @intFromBool(wrong_size),
             });
         }
     }

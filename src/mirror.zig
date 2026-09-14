@@ -5,6 +5,7 @@ const wlroots = @import("wlroots");
 const pixman = @import("pixman");
 
 const ServerContext = @import("server.zig");
+const Config = @import("config.zig");
 const View = @import("view/view.zig");
 const ViewManager = @import("view/view_manager.zig");
 const Rounding = @import("view/rounding.zig");
@@ -140,7 +141,6 @@ pub fn closeFocusedMirrorCopy(context: *ServerContext) bool {
 /// The tile of `view` on `row` nearest the given anchor slot, or null when the
 /// view has no (placed) mirror there. Used instead of an exact slot match so a
 /// stale keyboard anchor still resolves to the ring's actual tile.
-
 fn closestMirrorAt(context: *ServerContext, view: *View, row: usize, slot_x: i32) ?*ServerContext.Mirror {
     if (row >= ServerContext.max_rows) return null;
     var best: ?*ServerContext.Mirror = null;
@@ -632,7 +632,7 @@ pub fn updateMirrors(view: *View) void {
             if (m.view == view) {
                 if (m.border_rect) |br| {
                     const br_enabled = m.view == context.focused_view;
-                    Border.updateBorderRect(br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)), context.focused_border_color, bw);
+                    Border.updateBorderRect(br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)), m.view.borderColor(br_enabled).sample(0.5), Config.BorderWidths.uniform(bw), 1.0);
                 }
                 m.pushed +|= 1;
                 // Re-place on a surface size change: placeMirror bakes the
@@ -1014,7 +1014,7 @@ fn placeMirror(context: *ServerContext, m: *ServerContext.Mirror, x: i32, y: i32
     // Border ring via the shared view-border renderer, framed on the tile.
     if (m.border_rect) |br| {
         const br_enabled = m.view == context.focused_view;
-        Border.updateBorderRect(br, content_w, content_h, box_w, box_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)), context.focused_border_color, bw);
+        Border.updateBorderRect(br, content_w, content_h, box_w, box_h, br_enabled, @intCast(@max(0, context.corner_radius - 1)), m.view.borderColor(br_enabled).sample(0.5), Config.BorderWidths.uniform(bw), 1.0);
     }
 }
 
@@ -1033,7 +1033,7 @@ pub fn refreshMirrorFocus(context: *ServerContext) void {
                 r == context.kbd_anchor_row and
                 m.slot_x == context.kbd_anchor_slot_x;
             const enabled = if (anchored) on_anchor else is_target;
-            Border.updateBorderRect(br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, enabled, @intCast(@max(0, context.corner_radius - 1)), context.focused_border_color, bw);
+            Border.updateBorderRect(br, @max(1, m.slot_w - 2 * bw), @max(1, m.slot_h - 2 * bw), m.slot_w, m.slot_h, enabled, @intCast(@max(0, context.corner_radius - 1)), m.view.borderColor(enabled).sample(0.5), Config.BorderWidths.uniform(bw), 1.0);
         }
     }
 }
@@ -1150,7 +1150,8 @@ fn activateMirror(context: *ServerContext, view: *View, row_idx: usize, is_self:
     buf_node.setTransform(surf.current.transform);
     // Window-style border rect below the buffer, rendered by the same
     // shared `updateBorderRect` that views use.
-    const border_rect = tree.createSceneRect(0, 0, &context.focused_border_color) catch null;
+    const border_color = context.focused_border_color.sample(0.5);
+    const border_rect = tree.createSceneRect(0, 0, &border_color) catch null;
     if (border_rect) |br| br.node.placeBelow(&buf_node.node);
     // Route input like the source window: every node in the mirror chain
     // carries the source's NodeData{.view}, so a hit on the buffer node

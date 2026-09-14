@@ -165,12 +165,112 @@ pub const BlurConfig = struct {
     saturation: f32 = 1.2,
 };
 
+/// A linear gradient between equal-spaced color stops.
+pub const Gradient = struct {
+    /// Angle in degrees; 0 sweeps left→right, 90 top→bottom.
+    angle: f32 = 0,
+    /// Stop colors, evenly spaced across the gradient (>= 2).
+    colors: []const [4]f32,
+
+    /// Sample the gradient at t in [0,1]. Skips gracefully for
+    /// degenerate (0/1-stop) data.
+    pub fn sample(self: Gradient, t: f32) [4]f32 {
+        const n = self.colors.len;
+        if (n == 0) return .{ 1, 0, 1, 1 };
+        if (n == 1) return self.colors[0];
+        const x = std.math.clamp(t, 0, 1) * @as(f32, @floatFromInt(n - 1));
+        const i: usize = @intFromFloat(@floor(x));
+        const f = x - @floor(x);
+        const a = self.colors[i];
+        const b = self.colors[@min(i + 1, n - 1)];
+        return .{
+            a[0] + (b[0] - a[0]) * f,
+            a[1] + (b[1] - a[1]) * f,
+            a[2] + (b[2] - a[2]) * f,
+            a[3] + (b[3] - a[3]) * f,
+        };
+    }
+};
+
+/// A border color: either one flat color or a linear gradient.
+pub const Color = union(enum) {
+    solid: [4]f32,
+    gradient: Gradient,
+
+    /// The flat color at parameter t (solid ignores t). Mirrors and
+    /// drag ghosts sample the midpoint to keep their single rects.
+    pub fn sample(self: Color, t: f32) [4]f32 {
+        return switch (self) {
+            .solid => |c| c,
+            .gradient => |g| g.sample(t),
+        };
+    }
+};
+
+/// Config-facing gradient spec (strings; compiled to floats in load()).
+pub const GradientSpec = struct {
+    angle: f32 = 0,
+    colors: []const []const u8 = &.{},
+};
+
+/// Config-facing color spec, parsed from ziggy:
+///   .color = .solid("#fd96a9")
+///   .color = .gradient(.{ .angle = 90, .colors = ["#ff0000", "#00ff00"] })
+pub const ColorSpec = union(enum) {
+    solid: []const u8,
+    gradient: GradientSpec,
+};
+
+/// Per-side border widths. `uniform(w)` builds an equal ring; the
+/// renderers use `horizontal()`/`vertical()` for the content-box insets.
+pub const BorderWidths = struct {
+    top: i32 = 0,
+    right: i32 = 0,
+    bottom: i32 = 0,
+    left: i32 = 0,
+
+    pub fn uniform(w: i32) BorderWidths {
+        return .{ .top = w, .right = w, .bottom = w, .left = w };
+    }
+
+    pub fn horizontal(self: @This()) i32 {
+        return self.left + self.right;
+    }
+
+    pub fn vertical(self: @This()) i32 {
+        return self.top + self.bottom;
+    }
+};
+
 pub const DecorationsConfig = struct {
     /// Corner radius in px; 0 disables rounding.
     rounding: i32 = 16,
     border: struct {
+        /// Uniform width; each side falls back to it when `sides` is unset.
         width: i32 = 8,
-        color: []const u8 = "#4d99ff",
+        /// Per-side overrides on top of `width` (null side = use `width`).
+        sides: struct {
+            top: ?i32 = null,
+            right: ?i32 = null,
+            bottom: ?i32 = null,
+            left: ?i32 = null,
+        } = .{},
+        color: ColorSpec = .{ .solid = "#4d99ff" },
+        /// Border ring for unfocused windows. Defaults to a dimmed
+        /// `color` when unset.
+        inactive_color: ?ColorSpec = null,
+        /// Border ring for unfocused floating windows. Defaults to the
+        /// dimmed inactive ring when unset (floating looks like tiled
+        /// until you pick a color).
+        floating_color: ?ColorSpec = null,
+        /// Border ring for a focused floating window. Defaults to `color`.
+        active_floating_color: ?ColorSpec = null,
+        /// Border ring while the pointer is over an unfocused window.
+        /// Defaults to the normal unfocused ring when unset.
+        hover_color: ?ColorSpec = null,
+        /// Breathe the focused ring's brightness over ~2s (animation loop
+        /// stays awake for the focused window).
+        pulse: bool = false,
     } = .{},
     blur: BlurConfig = .{},
 };
@@ -185,7 +285,7 @@ pub const Rule = struct {
     title: ?[]const u8 = null,
     rounding: ?i32 = null,
     border_width: ?i32 = null,
-    border_color: ?[]const u8 = null,
+    border_color: ?ColorSpec = null,
     blur: ?bool = null,
     float: ?bool = null,
 };
@@ -195,7 +295,7 @@ pub const CompiledRule = struct {
     title: ?[]const u8,
     rounding: ?i32,
     border_width: ?i32,
-    border_color: ?[4]f32,
+    border_color: ?Color,
     blur: ?bool,
     float: ?bool,
 };
@@ -424,7 +524,7 @@ pub fn matchRule(rule: CompiledRule, app_id: []const u8, title: []const u8) bool
 pub fn compileRules(a: std.mem.Allocator, rules: []const Rule) ![]CompiledRule {
     var out: std.ArrayListUnmanaged(CompiledRule) = .empty;
     for (rules) |r| {
-        const bc = if (r.border_color) |c| parseColor(c) catch null else null;
+        const bc = if (r.border_color) |c| compileColor(a, c) catch null else null;
         try out.append(a, .{
             .class = r.class,
             .title = r.title,
@@ -438,7 +538,35 @@ pub fn compileRules(a: std.mem.Allocator, rules: []const Rule) ![]CompiledRule {
     return try out.toOwnedSlice(a);
 }
 
-/// "#rgb", "#rrggbb" or "#rrggbbaa" -> straight-alpha RGBA, channels / 255.
+/// Dim a border color for the inactive (unfocused) look: half
+/// strength, slightly muted alpha. Gradients dim every stop.
+fn dimColor(a: std.mem.Allocator, c: Color) !Color {
+    return switch (c) {
+        .solid => |c0| .{ .solid = .{ c0[0] * 0.5, c0[1] * 0.5, c0[2] * 0.5, c0[3] * 0.7 } },
+        .gradient => |g| blk: {
+            var colors: std.ArrayListUnmanaged([4]f32) = .empty;
+            errdefer colors.deinit(a);
+            for (g.colors) |c0| try colors.append(a, .{ c0[0] * 0.5, c0[1] * 0.5, c0[2] * 0.5, c0[3] * 0.7 });
+            break :blk .{ .gradient = .{ .angle = g.angle, .colors = try colors.toOwnedSlice(a) } };
+        },
+    };
+}
+
+/// Compile a config color spec (string hex or gradient of hex strings)
+/// into a runtime Color with float stops allocated from `a`.
+fn compileColor(a: std.mem.Allocator, spec: ColorSpec) !Color {
+    return switch (spec) {
+        .solid => |hex| .{ .solid = try parseColor(hex) },
+        .gradient => |g| blk: {
+            if (g.colors.len < 2) return error.BadColor;
+            var colors: std.ArrayListUnmanaged([4]f32) = .empty;
+            errdefer colors.deinit(a);
+            for (g.colors) |hex| try colors.append(a, try parseColor(hex));
+            break :blk .{ .gradient = .{ .angle = g.angle, .colors = try colors.toOwnedSlice(a) } };
+        },
+    };
+}
+
 pub fn parseColor(s: []const u8) ![4]f32 {
     if (s.len < 4 or s[0] != '#') return error.BadColor;
     const hex = s[1..];
@@ -584,7 +712,12 @@ pub const Loaded = struct {
     switches: []const CompiledSwitch,
     submaps: []const CompiledSubmap,
     rules: []const CompiledRule,
-    border_color: [4]f32,
+    border_color: Color,
+    inactive_border_color: Color,
+    floating_border_color: Color,
+    active_floating_border_color: ?Color,
+    hover_border_color: ?Color,
+    border_widths: BorderWidths,
     xkb_names: xkb.RuleNames,
 };
 
@@ -627,7 +760,12 @@ pub fn load(io: std.Io, a: std.mem.Allocator, log_missing: bool) Loaded {
         .gestures = &.{},
         .switches = &.{},
         .submaps = &.{},
-        .border_color = .{ 0.3, 0.6, 1.0, 1.0 },
+        .border_color = .{ .solid = .{ 0.3, 0.6, 1.0, 1.0 } },
+        .inactive_border_color = .{ .solid = .{ 0.3, 0.6, 1.0, 1.0 } },
+        .floating_border_color = .{ .solid = .{ 0.3, 0.6, 1.0, 1.0 } },
+        .active_floating_border_color = null,
+        .hover_border_color = null,
+        .border_widths = .{ .top = 8, .right = 8, .bottom = 8, .left = 8 },
         .xkb_names = .{ .rules = null, .model = null, .layout = "gb", .variant = null, .options = null },
     };
 
@@ -673,9 +811,43 @@ pub fn load(io: std.Io, a: std.mem.Allocator, log_missing: bool) Loaded {
         break :blk &.{};
     };
 
-    loaded.border_color = parseColor(cfg.decorations.border.color) catch blk: {
-        std.log.err("config: bad border color '{s}', using default", .{cfg.decorations.border.color});
-        break :blk .{ 0.3, 0.6, 1.0, 1.0 };
+    loaded.border_color = compileColor(a, cfg.decorations.border.color) catch blk: {
+        std.log.err("config: bad border color, using default", .{});
+        break :blk .{ .solid = .{ 0.3, 0.6, 1.0, 1.0 } };
+    };
+
+    loaded.inactive_border_color = if (cfg.decorations.border.inactive_color) |c|
+        compileColor(a, c) catch blk: {
+            std.log.err("config: bad inactive border color, using dimmed default", .{});
+            break :blk (dimColor(a, loaded.border_color) catch loaded.border_color);
+        }
+    else
+        (dimColor(a, loaded.border_color) catch loaded.border_color);
+
+    loaded.floating_border_color = if (cfg.decorations.border.floating_color) |c|
+        compileColor(a, c) catch blk: {
+            std.log.err("config: bad floating border color, using dimmed inactive", .{});
+            break :blk loaded.inactive_border_color;
+        }
+    else
+        loaded.inactive_border_color;
+
+    loaded.active_floating_border_color = if (cfg.decorations.border.active_floating_color) |c|
+        compileColor(a, c) catch null
+    else
+        null;
+
+    loaded.hover_border_color = if (cfg.decorations.border.hover_color) |c|
+        compileColor(a, c) catch null
+    else
+        null;
+
+    const bw = cfg.decorations.border;
+    loaded.border_widths = .{
+        .top = bw.sides.top orelse bw.width,
+        .right = bw.sides.right orelse bw.width,
+        .bottom = bw.sides.bottom orelse bw.width,
+        .left = bw.sides.left orelse bw.width,
     };
 
     loaded.rules = compileRules(a, cfg.rules) catch blk: {
@@ -732,6 +904,28 @@ test "parseKey resolves modifiers and named keysyms" {
     try std.testing.expectEqual(@as(u32, 0x7b), sb.sym);
 }
 
+test "dimColor halves rgb and scales alpha" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const c = (try dimColor(arena.allocator(), .{ .solid = .{ 1.0, 0.5, 0.25, 1.0 } })).solid;
+    try std.testing.expectApproxEqAbs(0.5, c[0], 0.001);
+    try std.testing.expectApproxEqAbs(0.25, c[1], 0.001);
+    try std.testing.expectApproxEqAbs(0.125, c[2], 0.001);
+    try std.testing.expectApproxEqAbs(0.7, c[3], 0.001);
+}
+
+test "Gradient.sample interpolates across stops" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const g: Gradient = .{ .angle = 0, .colors = try arena.allocator().dupe([4]f32, &.{ .{ 0, 0, 0, 1 }, .{ 1, 0, 0, 1 }, .{ 0, 1, 0, 1 } }) };
+    const mid = g.sample(0.25);
+    try std.testing.expectApproxEqAbs(0.5, mid[0], 0.001);
+    try std.testing.expectApproxEqAbs(0, mid[1], 0.001);
+    const end = g.sample(1.0);
+    try std.testing.expectApproxEqAbs(0, end[0], 0.001);
+    try std.testing.expectApproxEqAbs(1, end[1], 0.001);
+}
+
 test "parseColor accepts short, long and alpha forms" {
     const rgb3 = try parseColor("#f00");
     try std.testing.expectEqual([4]f32{ 1, 0, 0, 1 }, rgb3);
@@ -750,7 +944,7 @@ test "ziggy document deserializes into Config" {
     const doc =
         \\.{
         \\    .keyboard = .custom(.{ .layout = "de", .variant = "nodeadkeys" }),
-        \\    .decorations = .{ .rounding = 4, .border = .{ .width = 2, .color = "#ff0000" } },
+        \\    .decorations = .{ .rounding = 4, .border = .{ .width = 2, .sides = .{ .top = 4, .right = 6 }, .color = .solid("#ff0000"), .inactive_color = .solid("#884422aa"), .floating_color = .solid("#00ff00"), .active_floating_color = .solid("#ff00ff"), .hover_color = .solid("#00ffff"), .pulse = true } },
         \\    .windows = .{ .gaps_out = 4 },
         \\    .autostart = [],
         \\    .keybinds = [
@@ -775,8 +969,17 @@ test "ziggy document deserializes into Config" {
     try std.testing.expectEqualStrings("alacritty", kb.binds[0].args[0]);
     try std.testing.expectEqual(@as(usize, 0), kb.submaps.len);
 
-    const color = try parseColor(cfg.decorations.border.color);
+    const color = switch (cfg.decorations.border.color) {
+        .solid => |hex| try parseColor(hex),
+        else => unreachable,
+    };
     try std.testing.expectEqual(@as(f32, 1), color[0]);
+
+    try std.testing.expectEqual(@as(i32, 4), cfg.decorations.border.sides.top.?);
+    try std.testing.expectEqual(@as(i32, 6), cfg.decorations.border.sides.right.?);
+    try std.testing.expectEqual(@as(i32, 0), cfg.decorations.border.sides.bottom orelse 0);
+    try std.testing.expectEqual(@as(i32, 0), cfg.decorations.border.sides.left orelse 0);
+    try std.testing.expect(cfg.decorations.border.pulse);
 
     const gestures = try compileGestures(a, cfg.gestures.binds);
     try std.testing.expectEqual(@as(usize, 0), gestures.len);

@@ -29,13 +29,13 @@ node_data: NodeData = undefined,
 context: *ServerContext,
 border: ?Border = null,
 blur_node: ?*Blur.SceneBlur = null,
-    /// Rule-derived appearance overrides.  -1 / null = use global default.
-    rule_border_width: i32 = -1,
-    rule_corner_radius: i32 = -1,
-    rule_border_color: ?[4]f32 = null,
-    rule_blur_enabled: ?bool = null,
-    /// Pattern string of the last matching rule (for the inspect OSD).
-    rule_note: []const u8 = &.{},
+/// Rule-derived appearance overrides.  -1 / null = use global default.
+rule_border_width: i32 = -1,
+rule_corner_radius: i32 = -1,
+rule_border_color: ?Config.Color = null,
+rule_blur_enabled: ?bool = null,
+/// Pattern string of the last matching rule (for the inspect OSD).
+rule_note: []const u8 = &.{},
 
 x: i32 = 0,
 y: i32 = 0,
@@ -85,10 +85,10 @@ animated_y: f32 = 0,
 /// Open fade-in in flight: opacity animates 0 -> 1 after map.
 fading_in: bool = false,
 fade_started: u64 = 0,
-    /// Rules were applied before the first configure, so a float rule
-    /// wins the initial layout instead of being tiled first. Reload
-    /// re-derives appearance but never re-floats (set once per map).
-    rules_applied_once: bool = false,
+/// Rules were applied before the first configure, so a float rule
+/// wins the initial layout instead of being tiled first. Reload
+/// re-derives appearance but never re-floats (set once per map).
+rules_applied_once: bool = false,
 /// Close fade-out in flight: opacity animates 1 -> 0, then doClose() fires.
 fading_out: bool = false,
 fade_out_started: u64 = 0,
@@ -179,9 +179,13 @@ pub fn isOrWindow(view: *View) bool {
     };
 }
 
-/// Per-view border width: rule override or global default.
-pub fn borderWidth(self: *View) i32 {
-    return if (self.rule_border_width >= 0) self.rule_border_width else self.context.border_width;
+/// Per-side border widths: a rule override applies to all sides, else the
+/// global per-side config.
+pub fn borderWidths(self: *View) Config.BorderWidths {
+    return if (self.rule_border_width >= 0)
+        Config.BorderWidths.uniform(self.rule_border_width)
+    else
+        self.context.border_widths;
 }
 
 /// Per-view corner radius: rule override or global default.
@@ -189,9 +193,24 @@ pub fn cornerRadius(self: *View) i32 {
     return if (self.rule_corner_radius >= 0) self.rule_corner_radius else self.context.corner_radius;
 }
 
-/// Per-view border color: rule override or global default.
-pub fn borderColor(self: *View) [4]f32 {
-    return self.rule_border_color orelse self.context.focused_border_color;
+/// Per-view border color: rule override wins, else the active ring when
+/// focused; when unfocused, a floating view takes the floating color and
+/// a tiled view the dimmed inactive ring. Hovering an unfocused window
+/// shows the hover ring, and a focused floating window can take its own
+/// active-floating color.
+pub fn borderColor(self: *View, focused: bool) Config.Color {
+    if (self.rule_border_color) |c| return c;
+    const context = self.context;
+    if (focused) {
+        if (self.floating) {
+            if (context.active_floating_border_color) |c| return c;
+        }
+        return context.focused_border_color;
+    }
+    if (context.hover_border_color != null and context.hovered_view == self)
+        return context.hover_border_color.?;
+    if (self.floating) return context.floating_border_color;
+    return context.inactive_border_color;
 }
 
 /// Per-view blur enabled: rule override or global default.
@@ -548,6 +567,12 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
         context.previous_focused_view = null;
     }
 
+    // A dangling hovered_view would keep a hover ring painting over the
+    // freed view's neighbours.
+    if (context.hovered_view == view) {
+        context.hovered_view = null;
+    }
+
     // Remove it from the WM's live view list BEFORE freeing it.
     ViewManager.removeView(context, view);
 
@@ -570,7 +595,10 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
     view.node_data = .{ .layer = undefined };
     if (view.backend == .xwayland) {
         view.scene_tree.node.data = null;
-        if (view.border) |*b| b.rect.node.data = null;
+        if (view.border) |*b| {
+            b.rect.node.data = null;
+            for (b.strips.items) |strip| strip.node.data = null;
+        }
     }
 
     // Free the blur node. For XDG the scene tree (and blender) is freed
@@ -586,6 +614,10 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
     // Undo snapshots still hold this View; drop them so undo can't touch
     // freed memory after we destroy it.
     context.discardUndoFor(view);
+
+    // Free the gradient-strip backing slice (the strip scene nodes are
+    // children of scene_tree/scenefx and die with it).
+    if (view.border) |*b| b.deinit();
 
     std.heap.c_allocator.destroy(view);
 }

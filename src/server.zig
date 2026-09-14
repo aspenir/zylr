@@ -187,8 +187,8 @@ animation_w: std.ArrayListUnmanaged(f32) = .empty,
 animation_y: std.ArrayListUnmanaged(f32) = .empty,
 animation_active: bool = false,
 animation_timer: ?*wl.EventSource = null,
-    /// Row-switch slide/fade in flight; null when no switch is animating.
-    row_anim: ?RowAnim = null,
+/// Row-switch slide/fade in flight; null when no switch is animating.
+row_anim: ?RowAnim = null,
 // Tiled-column slot lefts (absolute), cached for the cursor's
 // resize-edge binary search. Rebuilt only when a layout pass bumps
 // layout_seq; read only up to resize_len.
@@ -200,22 +200,38 @@ resize_seq: u32 = 0,
 
 // config
 border_width: i32 = 8,
+/// Per-side border widths (resolved from config `width` + `sides`).
+border_widths: Config.BorderWidths = .{ .top = 8, .right = 8, .bottom = 8, .left = 8 },
 // Outer gap: inset between the screen edge and the outermost windows.
 gaps_out: i32 = 16,
 // Inner gap: spacing between adjacent windows in the column.
 gaps_in: i32 = 8,
 view_scale: f32 = 0,
-focused_border_color: [4]f32 = .{ 0.3, 0.6, 1.0, 1.0 },
+focused_border_color: Config.Color = .{ .solid = .{ 0.3, 0.6, 1.0, 1.0 } },
+/// Dimmed focused color; ring for unfocused windows.
+inactive_border_color: Config.Color = .{ .solid = .{ 0.3, 0.6, 1.0, 1.0 } },
+/// Ring color for unfocused floating windows (falls back to inactive).
+floating_border_color: Config.Color = .{ .solid = .{ 0.3, 0.6, 1.0, 1.0 } },
+/// Ring color for a focused floating window (falls back to focused).
+active_floating_border_color: ?Config.Color = null,
+/// Ring color while the pointer hovers an unfocused window.
+hover_border_color: ?Config.Color = null,
+/// Breathe the focused ring's brightness over ~2s.
+pulse_enabled: bool = false,
+/// 0..1 brightness multiplier written each animation tick while pulsing.
+pulse_dim: f32 = 1.0,
+/// View currently under the cursor (drives the hover ring).
+hovered_view: ?*View = null,
 /// Corner radius (logical px) for rounded window corners; 0 disables.
 corner_radius: i32 = 16,
 /// Compiled keybind table (see config.zig); matched on every keypress.
 keybinds: []const Config.CompiledBind = &.{},
-    /// Compiled submap bind sets (see config `submaps`).
-    submaps: []const Config.CompiledSubmap = &.{},
+/// Compiled submap bind sets (see config `submaps`).
+submaps: []const Config.CompiledSubmap = &.{},
 /// Compiled window rules (see config `rules`); matched per-view at map/reload.
 rules: []const Config.CompiledRule = &.{},
-    /// Name of the currently active submap (mode); null = root bind set.
-    active_submap: ?[]const u8 = null,
+/// Name of the currently active submap (mode); null = root bind set.
+active_submap: ?[]const u8 = null,
 /// Compiled gesture table; matched at swipe/pinch/hold end.
 gestures: []const Config.CompiledGesture = &.{},
 /// Compiled switch table; matched on lid/tablet-mode toggle.
@@ -420,7 +436,13 @@ pub fn applyConfig(self: *@This(), loaded: Config.Loaded) void {
     self.xkb_names = loaded.xkb_names;
     self.corner_radius = loaded.cfg.decorations.rounding;
     self.border_width = loaded.cfg.decorations.border.width;
+    self.border_widths = loaded.border_widths;
     self.focused_border_color = loaded.border_color;
+    self.inactive_border_color = loaded.inactive_border_color;
+    self.floating_border_color = loaded.floating_border_color;
+    self.active_floating_border_color = loaded.active_floating_border_color;
+    self.hover_border_color = loaded.hover_border_color;
+    self.pulse_enabled = loaded.cfg.decorations.border.pulse;
     self.gaps_out = loaded.cfg.windows.gaps_out;
     self.gaps_in = loaded.cfg.windows.gaps_in;
     self.view_width_ratio = loaded.cfg.width_ratio;

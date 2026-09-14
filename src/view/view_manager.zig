@@ -269,7 +269,7 @@ fn positionDragGhost(context: *ServerContext, anchor: *View) void {
     const h = @max(1, height);
     ghost.node.setPosition(slot_x, top);
     ghost.setSize(w, h);
-    const col = context.focused_border_color;
+    const col = context.focused_border_color.sample(0.5);
     ghost.setColor(&.{ col[0], col[1], col[2], 0.35 });
     Rounding.setRectCorners(ghost, @intCast(@max(0, context.corner_radius)));
     ghost.node.setEnabled(true);
@@ -304,7 +304,7 @@ fn positionGutterGhost(context: *ServerContext, view: *View, target: usize) void
 
     ghost.node.setPosition(x, col_top);
     ghost.setSize(@max(1, w), @max(1, inner_h));
-    const col = context.focused_border_color;
+    const col = context.focused_border_color.sample(0.5);
     ghost.setColor(&.{ col[0], col[1], col[2], 0.35 });
     Rounding.setRectCorners(ghost, @intCast(@max(0, context.corner_radius)));
     ghost.node.setEnabled(true);
@@ -628,7 +628,6 @@ pub fn updateViewPositions(context: *ServerContext) void {
 /// pending configure. Send each surface an explicit frame-done so idle clients
 /// repaint at the new size too.
 pub fn refreshTiledSizes(context: *ServerContext) void {
-    const bw: i32 = @intCast(context.border_width);
     const eh = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
     var now: std.c.timespec = undefined;
     _ = clock_gettime(CLOCK_MONOTONIC, &now);
@@ -640,7 +639,8 @@ pub fn refreshTiledSizes(context: *ServerContext) void {
         } else {
             view.slot_h = eh;
         }
-        view.setSize(@max(1, view.slot_w - 2 * bw), @max(1, view.slot_h - 2 * bw));
+        const ws = view.borderWidths();
+        view.setSize(@max(1, view.slot_w - ws.horizontal()), @max(1, view.slot_h - ws.vertical()));
         if (view.surfaceOrNull()) |surf| {
             surf.sendFrameDone(&now);
         }
@@ -782,9 +782,9 @@ pub fn centerFloating(
         view.slot_h = fs[1];
     } else if (view.surfaceOrNull()) |surf| {
         if (surf.current.width > 0 and surf.current.height > 0) {
-            const bw: c_int = @intCast(view.borderWidth());
-            view.slot_w = surf.current.width + 2 * bw;
-            view.slot_h = surf.current.height + 2 * bw;
+            const ws = view.borderWidths();
+            view.slot_w = surf.current.width + ws.horizontal();
+            view.slot_h = surf.current.height + ws.vertical();
         }
     }
     const vw: f32 = @floatFromInt(@max(1, context.usable_area.width));
@@ -1000,12 +1000,12 @@ pub fn adjustPileShare(context: *ServerContext, view: *View, delta: f32) void {
 pub fn syncPile(context: *ServerContext, anchor: *View) void {
     updateViewPositions(context);
     if (anchor.pile_id != 0) {
-        const bw: i32 = @intCast(@max(0, context.border_width));
         for (context.views.items) |v| {
             if (v.pile_id != anchor.pile_id) continue;
             const slot = pileSlot(context, v) orelse continue;
             v.slot_h = slot.height;
-            v.setSize(@max(1, v.slot_w - 2 * bw), @max(1, slot.height - 2 * bw));
+            const ws = v.borderWidths();
+            v.setSize(@max(1, v.slot_w - ws.horizontal()), @max(1, slot.height - ws.vertical()));
         }
     }
     for (context.views.items) |v| {

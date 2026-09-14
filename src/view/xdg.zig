@@ -644,20 +644,20 @@ pub fn commitToplevel(
     // must send a configure or the client never maps).
     if (view.floating or view.fullscreen) {
         if (view.floating) {
-            const bw: c_int = @intCast(view.borderWidth());
+            const ws = view.borderWidths();
             // Size the ring from the client's real content box (the XDG
             // geometry), not the buffer, which can carry CSD shadow margins.
-            // Using the buffer makes the right/bottom border band bw+margin
-            // instead of bw (the "border too big on right/bottom" bug).
+            // Using the buffer makes the right/bottom border band side+margin
+            // instead of side (the "border too big on right/bottom" bug).
             // Fall back to the buffer before the first commit announces a
             // geometry.
             const g = xdg_toplevel.base.geometry;
             if (g.width > 0 and g.height > 0) {
-                view.slot_w = g.width + 2 * bw;
-                view.slot_h = g.height + 2 * bw;
+                view.slot_w = g.width + ws.horizontal();
+                view.slot_h = g.height + ws.vertical();
             } else {
-                view.slot_w = @max(1, surface.current.width + 2 * bw);
-                view.slot_h = @max(1, surface.current.height + 2 * bw);
+                view.slot_w = @max(1, surface.current.width + ws.horizontal());
+                view.slot_h = @max(1, surface.current.height + ws.vertical());
             }
             // A float rule can run before the toplevel's first commit, so
             // the initial configure must still be sent or the client
@@ -677,11 +677,11 @@ pub fn commitToplevel(
     view.slot_h = eh;
 
     // the toplevel's content box is the slot inset by the
-    // border width. The scene surface sits at +bw inside the slot, so a
+    // border widths. The scene surface sits at +(left,top) inside the slot, so a
     // slot-sized ring can wrap it without spilling into neighbours.
-    const bw: c_int = @intCast(view.borderWidth());
-    const content_w = @max(1, ew - 2 * bw);
-    const content_h = @max(1, eh - 2 * bw);
+    const ws = view.borderWidths();
+    const content_w = @max(1, ew - ws.horizontal());
+    const content_h = @max(1, eh - ws.vertical());
 
     const wrong_size = surface.current.width != content_w or surface.current.height != content_h;
 

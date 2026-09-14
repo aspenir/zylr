@@ -6,6 +6,7 @@ const std = @import("std");
 const ServerContext = @import("../server.zig");
 const NodeData = @import("../view/utils/node_data.zig");
 const FocusManager = @import("../view/focus.zig");
+const Border = @import("../view/border.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const LayerView = @import("../view/layer.zig");
 const View = @import("../view/view.zig");
@@ -99,12 +100,14 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
         context.seat.pointerClearFocus();
         context.focused_surface = null;
         PointerConstraints.onPointerFocus(context, null);
+        setHoveredView(context, null);
         return;
     };
 
     switch (hit.data.*) {
         .view => |view| {
             const view_ptr: *View = @ptrCast(@alignCast(view));
+            setHoveredView(context, view_ptr);
             // Pointer focus is position-explicit: drop any keyboard-cycle
             // anchor(s) so the ring follows the pointed tile again and the
             // next cycle re-anchors on the focused view's home.
@@ -166,6 +169,7 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
         .layer => |layer| {
             const layer_ptr: *LayerView = @ptrCast(@alignCast(layer));
             const surface = layer_ptr.layer_surface.surface;
+            setHoveredView(context, null);
             if (context.focused_surface != surface) {
                 context.seat.pointerNotifyEnter(
                     surface,
@@ -182,6 +186,7 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
             context.seat.pointerNotifyMotion(time_msec, hit.sx, hit.sy);
         },
         .im_popup => |popup_raw| {
+            setHoveredView(context, null);
             const popup: *wlroots.InputPopupSurfaceV2 = @ptrCast(@alignCast(popup_raw));
             const surface = popup.surface;
             if (context.focused_surface != surface) {
@@ -193,6 +198,7 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
         .popup => |popup_raw| {
             const popup: *wlroots.XdgPopup = @ptrCast(@alignCast(popup_raw));
             const surface = popup.base.surface;
+            setHoveredView(context, null);
             if (context.focused_surface != surface) {
                 context.seat.pointerNotifyEnter(surface, hit.sx, hit.sy);
                 context.focused_surface = surface;
@@ -205,6 +211,21 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
     // an 'confined'/'locked' event before the matching pointer enter.
     PointerConstraints.onPointerFocus(context, hit.node);
 }
+/// Track which view the pointer sits over for the hover ring. Repaints the
+/// affected borders so the ring follows the pointer without a full relayout,
+/// and skipping unchanged views keeps pointer motion cheap.
+fn setHoveredView(context: *ServerContext, view: ?*View) void {
+    if (context.hovered_view == view) return;
+    if (context.hover_border_color == null) {
+        context.hovered_view = view;
+        return;
+    }
+    const old = context.hovered_view;
+    context.hovered_view = view;
+    if (old) |v| Border.updateViewBorder(v, @floatFromInt(v.x), null);
+    if (view) |v| Border.updateViewBorder(v, @floatFromInt(v.x), null);
+}
+
 fn superHeld(context: *ServerContext) bool {
     // Mod key on ANY keyboard: keyboards[0] can be a non-input ACPI device
     // (Video Bus) whose modifiers never update.
