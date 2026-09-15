@@ -96,26 +96,14 @@ fn setBufferOpacity(buffer: *wlroots.SceneBuffer, sx: c_int, sy: c_int, data: *f
 }
 
 pub fn wake(context: *ServerContext) void {
-    // A wake means an animation was just (re)armed: force the tick out of
-    // its early return, or a fade started against a stable layout never
-    // runs and the close request it ends with never fires.
+    // A wake means an animation was just (re)armed: schedule one output
+    // frame. The frame callback runs tick, whose geometry/opacity/color
+    // changes damage the output, so frames keep self-scheduling while
+    // anything moves — and when it settles no frame is requested and the
+    // GPU parks. There is no animation timer anymore: an idle desktop
+    // runs no compositor code at all.
     context.animation_active = true;
-    if (context.animation_timer) |timer| {
-        timer.timerUpdate(16) catch {};
-    }
-}
-
-pub fn onTimerTick(context: *ServerContext) c_int {
-    tick(context);
-
     if (context.output) |output| output.scheduleFrame();
-
-    if (context.animation_active) {
-        if (context.animation_timer) |timer| {
-            timer.timerUpdate(16) catch {};
-        }
-    }
-    return 1;
 }
 
 pub fn tick(context: *ServerContext) void {

@@ -192,12 +192,10 @@ pub const Gradient = struct {
         const f = x - @floor(x);
         const a = self.colors[i];
         const b = self.colors[@min(i + 1, n - 1)];
-        return .{
-            a[0] + (b[0] - a[0]) * f,
-            a[1] + (b[1] - a[1]) * f,
-            a[2] + (b[2] - a[2]) * f,
-            a[3] + (b[3] - a[3]) * f,
-        };
+        const av: @Vector(4, f32) = a;
+        const bv: @Vector(4, f32) = b;
+        const out: @Vector(4, f32) = av + (bv - av) * @as(@Vector(4, f32), @splat(f));
+        return out;
     }
 };
 

@@ -207,7 +207,6 @@ vel_x: std.ArrayListUnmanaged(f32) = .empty,
 vel_w: std.ArrayListUnmanaged(f32) = .empty,
 vel_y: std.ArrayListUnmanaged(f32) = .empty,
 animation_active: bool = false,
-animation_timer: ?*wl.EventSource = null,
 /// Monotonic ms when the layout tween (swap) was last re-armed.
 layout_anim_started: u64 = 0,
 /// Monotonic ms when the viewport tween (focus) was last re-armed.

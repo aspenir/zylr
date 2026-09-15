@@ -12,7 +12,6 @@ const LayerView = @import("view/layer.zig");
 const KeyboardContext = @import("input/keyboard.zig");
 const ServerContext = @import("server.zig");
 const NodeData = @import("view/utils/node_data.zig");
-const AnimationManager = @import("view/animation.zig");
 const XCursor = @import("view/xcursor.zig");
 const Cursor = @import("input/cursor.zig");
 const Output = @import("output/output.zig");
@@ -335,13 +334,6 @@ pub fn main(init: std.process.Init) !void {
     // or lock the cursor. Enforced in cursor.zig's motion paths.
     _ = try PointerConstraints.init(server, seat, &context);
 
-    context.animation_timer = try wl.EventLoop.addTimer(
-        loop,
-        *ServerContext,
-        AnimationManager.onTimerTick,
-        &context,
-    );
-
     context.request_set_selection_listener = wl.Listener(
         *wlroots.Seat.event.RequestSetSelection,
     ).init(ServerContext.onRequestSetSelection);
@@ -537,9 +529,6 @@ pub fn main(init: std.process.Init) !void {
     }
     context.output_contexts.clearRetainingCapacity();
     context.output_contexts.deinit(std.heap.c_allocator);
-    if (context.animation_timer) |timer| {
-        timer.remove();
-    }
     context.animation_x.deinit(std.heap.c_allocator);
     context.animation_w.deinit(std.heap.c_allocator);
     context.from_x.deinit(std.heap.c_allocator);

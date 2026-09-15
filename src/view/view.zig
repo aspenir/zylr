@@ -75,8 +75,7 @@ slot_w: i32 = 0,
 slot_h: i32 = 0,
 
 /// The client's natural size (content box) recorded at map time, before
-/// tiling stretched it. toggle_floating restores this, like Mango: a
-/// tiled window pops back to its own size when floated.
+/// tiling stretched it. toggle_floating restores this
 float_size: [2]i32 = .{ 0, 0 },
 
 /// hsplit pile: non-zero when this view is stacked vertically inside a

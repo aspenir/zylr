@@ -469,10 +469,9 @@ pub fn tintGradientChase(strips: []*wlroots.SceneRect, from: Config.Gradient, to
         // the strip's index across the gradient's stop range is close
         // enough for a 100-200ms color blend.
         const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(@max(1, n - 1)));
-        const fa = from.sample(t);
-        const ta = to.sample(t);
-        var col: [4]f32 = undefined;
-        for (&col, 0..) |*c, j| c.* = fa[j] + (ta[j] - fa[j]) * e;
+        const fav: @Vector(4, f32) = from.sample(t);
+        const tav: @Vector(4, f32) = to.sample(t);
+        const col: [4]f32 = fav + (tav - fav) * @as(@Vector(4, f32), @splat(e));
         strip.setColor(&col);
     }
 }
