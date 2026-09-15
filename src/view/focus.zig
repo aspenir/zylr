@@ -9,6 +9,7 @@ const BorderManager = @import("border.zig");
 const InputRelay = @import("../input/input_relay.zig");
 const ViewManager = @import("view_manager.zig");
 const Mirror = @import("../mirror.zig");
+const AnimationManager = @import("animation.zig");
 const FocusTarget = union(enum) {
     none,
     view: struct {
@@ -204,6 +205,7 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             context.focused_view = null;
             context.focused_layer = null;
             BorderManager.updateBorders(context);
+            AnimationManager.wake(context);
             Mirror.layoutMirrorsAll(context);
             Mirror.refreshMirrorFocus(context);
             InputRelay.notifyFocus(null);
@@ -285,6 +287,7 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             if (view.floating) view.scene_tree.node.raiseToTop();
 
             BorderManager.updateBorders(context);
+            AnimationManager.wake(context);
             Mirror.layoutMirrorsAll(context);
             Mirror.refreshMirrorFocus(context);
             InputRelay.notifyFocus(context.focused_surface);
@@ -334,6 +337,7 @@ pub fn setFocus(context: *ServerContext, target: FocusTarget) void {
             }
 
             BorderManager.updateBorders(context);
+            AnimationManager.wake(context);
             Mirror.layoutMirrorsAll(context);
             Mirror.refreshMirrorFocus(context);
             InputRelay.notifyFocus(surface);

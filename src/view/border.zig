@@ -60,8 +60,19 @@ pub fn createViewBorder(view: *View) void {
     const context = view.context; // The rect lives INSIDE the view tree, below the surface, so it
     // moves and scrolls with the window; sibling order keeps the client
     // and any popups/sub-surfaces above it (and above its input region).
-    const color = view.borderColor(context.focused_view == view).sample(0.5);
-    const rect = view.scene_tree.createSceneRect(0, 0, &color) catch return;
+    const color = view.borderColor(context.focused_view == view);
+    const color_sample = color.sample(0.5);
+    view.border_color_now = color_sample;
+    view.border_color_from = color_sample;
+    view.border_color_target = color_sample;
+    switch (color) {
+        .gradient => |g| {
+            view.border_grad_from = g;
+            view.border_grad_target = g;
+        },
+        else => {},
+    }
+    const rect = view.scene_tree.createSceneRect(0, 0, &color_sample) catch return;
     rect.node.data = &view.node_data;
 
     const border: Border = .{ .rect = rect };
@@ -438,6 +449,31 @@ fn updateGradientBorder(
         // appears on the client's first commit).
         if (surfaceNode(view)) |node| strip.node.placeBelow(node);
         strip.node.setEnabled(true);
+    }
+}
+
+/// Focus-switch chase for gradient rings: re-tint the EXISTING strips
+/// (geometry already laid out by the last updateGradientBorder) so the
+/// ring eases from `from` toward `to`. `e` is the chase progress in
+/// [0,1]. Only colors change; strips keep their positions/sizes.
+pub fn tintGradientChase(strips: []*wlroots.SceneRect, from: Config.Gradient, to: Config.Gradient, e: f32) void {
+    if (from.colors.len < 2 or to.colors.len < 2) return;
+    const n = @min(strips.len, Border.num_strips);
+    // Re-sync each enabled strip to the lerped color. Half the strips
+    // may be disabled (unused tail); leave them.
+    for (strips, 0..) |strip, i| {
+        if (i >= n) break;
+        if (!strip.node.enabled) continue;
+        // Sample both gradients at the strip's own center. Getting the
+        // exact center would need the slot geometry again; sampling at
+        // the strip's index across the gradient's stop range is close
+        // enough for a 100-200ms color blend.
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(@max(1, n - 1)));
+        const fa = from.sample(t);
+        const ta = to.sample(t);
+        var col: [4]f32 = undefined;
+        for (&col, 0..) |*c, j| c.* = fa[j] + (ta[j] - fa[j]) * e;
+        strip.setColor(&col);
     }
 }
 

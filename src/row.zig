@@ -37,8 +37,15 @@ pub fn switchTo(context: *ServerContext, new_row: usize) void {
         .animation_x = context.animation_x,
         .animation_w = context.animation_w,
         .animation_y = context.animation_y,
+        .from_x = context.from_x,
+        .from_w = context.from_w,
+        .from_y = context.from_y,
+        .vel_x = context.vel_x,
+        .vel_w = context.vel_w,
+        .vel_y = context.vel_y,
         .scroll_x = context.viewport_x,
         .target_x = context.viewport_target,
+        .vp_vel = context.viewport_vel,
     };
 
     context.active_row = new_row;
@@ -50,15 +57,29 @@ pub fn switchTo(context: *ServerContext, new_row: usize) void {
         context.animation_x = loaded.animation_x;
         context.animation_w = loaded.animation_w;
         context.animation_y = loaded.animation_y;
+        context.from_x = loaded.from_x;
+        context.from_w = loaded.from_w;
+        context.from_y = loaded.from_y;
+        context.vel_x = loaded.vel_x;
+        context.vel_w = loaded.vel_w;
+        context.vel_y = loaded.vel_y;
         context.viewport_x = loaded.scroll_x;
         context.viewport_target = loaded.target_x;
+        context.viewport_vel = loaded.vp_vel;
     } else {
         context.views = .empty;
         context.animation_x = .empty;
         context.animation_w = .empty;
         context.animation_y = .empty;
+        context.from_x = .empty;
+        context.from_w = .empty;
+        context.from_y = .empty;
+        context.vel_x = .empty;
+        context.vel_w = .empty;
+        context.vel_y = .empty;
         context.viewport_x = 0;
         context.viewport_target = 0;
+        context.viewport_vel = 0;
     }
 
     setRowVisible(context, new_row, true);

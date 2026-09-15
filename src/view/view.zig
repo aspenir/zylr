@@ -15,6 +15,22 @@ const Config = @import("../config.zig");
 
 const View = @This();
 
+/// A fullscreen enter/exit tween in flight. Armed by `applyFullscreen`
+/// (via `applyFullscreenTween` below) with the view's pre-fullscreen
+/// slot geometry; the tick eases scale+translate toward the output rect
+/// and only at settle calls reparent + `setFullscreen`. Exiting tweens
+/// the same fields back toward the slot before re-parenting home.
+pub const FsTween = struct {
+    /// Slot geometry (x, y, w, h, scene px) captured at arming.
+    from: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Output rect (x, y, w, h) to tween toward on enter.
+    to: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Entering (true) or exiting (false) fullscreen.
+    entering: bool = true,
+    /// ServerContext.nowMs() when armed.
+    started: u64 = 0,
+};
+
 /// Which protocol produced this toplevel. Everything below (tiling,
 /// focus, borders, drag/resize) is backend-agnostic and only touches
 /// the shared fields + these accessors.
@@ -85,6 +101,17 @@ animated_y: f32 = 0,
 /// Open fade-in in flight: opacity animates 0 -> 1 after map.
 fading_in: bool = false,
 fade_started: u64 = 0,
+/// Open/close style layered over the opacity fade, folded into the tick:
+/// `.slide` accumulates a vertical slot offset (scene px, + = below the
+/// ring = entered from below / drifts away while closing). 0 = neutral so
+/// a settled fade cancels cleanly. (Scale-based `.pop` is not wired: scene
+/// nodes have no scale API, so pop folds into the plain fade.)
+fade_slide_off: i32 = 0,
+/// Fullscreen enter/exit tween in flight (others keyed off
+/// `fullscreen`). Reparent + setFullscreen fire only at settle.
+/// The tick drives scale+translate toward the output rect and only
+/// at settle (progress >= 1) calls reparent + `setFullscreen`.
+fs_tween: ?FsTween = null,
 /// Rules were applied before the first configure, so a float rule
 /// wins the initial layout instead of being tiled first. Reload
 /// re-derives appearance but never re-floats (set once per map).
@@ -92,6 +119,21 @@ rules_applied_once: bool = false,
 /// Close fade-out in flight: opacity animates 1 -> 0, then doClose() fires.
 fading_out: bool = false,
 fade_out_started: u64 = 0,
+/// Focus-ring colour chase state: `now` eases toward `target` over
+/// `animation.border_color` on focus switches; started=0 when settled.
+/// Seeded to the initial ring colour in createViewBorder.
+border_color_now: [4]f32 = .{ 0, 0, 0, 1 },
+border_color_from: [4]f32 = .{ 0, 0, 0, 1 },
+border_color_target: [4]f32 = .{ 0, 0, 0, 1 },
+border_color_started: u64 = 0,
+/// Gradient ring chase state: the strips ease from `border_grad_from`
+/// toward `border_grad_target` over `animation.border_color` on focus
+/// switches. Seeded to the initial gradient in createViewBorder.
+/// Started=0 when settled (shares nothing with the solid chase fields:
+/// a ring is one or the other).
+border_grad_from: Config.Gradient = .{ .angle = 0, .colors = &.{} },
+border_grad_target: Config.Gradient = .{ .angle = 0, .colors = &.{} },
+border_grad_started: u64 = 0,
 
 map_listener: wl.Listener(void) = undefined,
 unmap_listener: wl.Listener(void) = undefined,
@@ -652,9 +694,17 @@ pub fn onViewCommit(
         view.rules_applied_once = true;
     }
 
-    switch (view.backend) {
-        .xdg => |t| xdg_mod.commitToplevel(view, t, wlr_surface),
-        .xwayland => |x| xw_mod.commitSurface(view, x, wlr_surface),
+    // Geometry reconfiguration runs against the ACTIVE row's working set
+    // (pileSlot/activeTiledCount read context.views). A parked row's
+    // windows keep committing during a row-switch slide (cursor blink,
+    // video); reconfiguring them resizes the outgoing row incorrectly
+    // (a parked pile member snaps to full height). Freeze their geometry:
+    // the row is re-tiled on reactivation (switchTo -> layoutViews).
+    if (std.mem.indexOfScalar(*View, view.context.views.items, view) != null) {
+        switch (view.backend) {
+            .xdg => |t| xdg_mod.commitToplevel(view, t, wlr_surface),
+            .xwayland => |x| xw_mod.commitSurface(view, x, wlr_surface),
+        }
     }
 
     mirror_mod.updateMirrors(view);

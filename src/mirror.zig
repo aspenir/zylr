@@ -294,6 +294,8 @@ fn dissolveCollapse(context: *ServerContext, view: *View) bool {
                 const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
                 if (idx < context.animation_x.items.len) {
                     context.animation_x.items[idx] = @floatFromInt(s.x);
+                    if (idx < context.vel_x.items.len) context.vel_x.items[idx] = 0;
+                    if (idx < context.from_x.items.len) context.from_x.items[idx] = @floatFromInt(s.x);
                 }
             }
         }

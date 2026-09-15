@@ -6,7 +6,7 @@ const std = @import("std");
 const ServerContext = @import("../server.zig");
 const NodeData = @import("../view/utils/node_data.zig");
 const FocusManager = @import("../view/focus.zig");
-const Border = @import("../view/border.zig");
+const AnimationManager = @import("../view/animation.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const LayerView = @import("../view/layer.zig");
 const View = @import("../view/view.zig");
@@ -220,10 +220,11 @@ fn setHoveredView(context: *ServerContext, view: ?*View) void {
         context.hovered_view = view;
         return;
     }
-    const old = context.hovered_view;
     context.hovered_view = view;
-    if (old) |v| Border.updateViewBorder(v, @floatFromInt(v.x), null);
-    if (view) |v| Border.updateViewBorder(v, @floatFromInt(v.x), null);
+    // The border chase fold repaints the old/new rings' colours toward
+    // the hover ring (it reads hover_color via borderColor); just wake it
+    // instead of snapping updateViewBorder here.
+    AnimationManager.wake(context);
 }
 
 fn superHeld(context: *ServerContext) bool {

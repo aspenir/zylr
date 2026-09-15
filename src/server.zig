@@ -81,8 +81,17 @@ pub const Row = struct {
     animation_x: std.ArrayListUnmanaged(f32) = .empty,
     animation_w: std.ArrayListUnmanaged(f32) = .empty,
     animation_y: std.ArrayListUnmanaged(f32) = .empty,
+    /// Tween origins: where each view was when the swap was armed.
+    from_x: std.ArrayListUnmanaged(f32) = .empty,
+    from_w: std.ArrayListUnmanaged(f32) = .empty,
+    from_y: std.ArrayListUnmanaged(f32) = .empty,
+    /// Spring velocities for the swap physics path.
+    vel_x: std.ArrayListUnmanaged(f32) = .empty,
+    vel_w: std.ArrayListUnmanaged(f32) = .empty,
+    vel_y: std.ArrayListUnmanaged(f32) = .empty,
     scroll_x: i32 = 0,
     target_x: i32 = 0,
+    vp_vel: f32 = 0,
 };
 /// A row-switch slide/fade in flight. The outgoing row's windows stay
 /// rendered (parked in `rows[]`) while the incoming row slides in over
@@ -97,6 +106,10 @@ pub const RowAnim = struct {
     slide: f32,
     /// Monotonic ms at which the transition started.
     started: u64,
+    /// Spring progress (0 = start, 1 = landed) + velocity, for the
+    /// physics-based row spring. Re-armed to 0 on every switch.
+    progress: f32 = 0,
+    vel: f32 = 0,
 };
 
 pub const Mirror = struct {
@@ -185,8 +198,26 @@ environ_map: *std.process.Environ.Map,
 animation_x: std.ArrayListUnmanaged(f32) = .empty,
 animation_w: std.ArrayListUnmanaged(f32) = .empty,
 animation_y: std.ArrayListUnmanaged(f32) = .empty,
+/// Tween origins for the active row (snapshotted when re-armed).
+from_x: std.ArrayListUnmanaged(f32) = .empty,
+from_w: std.ArrayListUnmanaged(f32) = .empty,
+from_y: std.ArrayListUnmanaged(f32) = .empty,
+/// Spring velocities for the swap physics path.
+vel_x: std.ArrayListUnmanaged(f32) = .empty,
+vel_w: std.ArrayListUnmanaged(f32) = .empty,
+vel_y: std.ArrayListUnmanaged(f32) = .empty,
 animation_active: bool = false,
 animation_timer: ?*wl.EventSource = null,
+/// Monotonic ms when the layout tween (swap) was last re-armed.
+layout_anim_started: u64 = 0,
+/// Monotonic ms when the viewport tween (focus) was last re-armed.
+viewport_anim_started: u64 = 0,
+/// Viewport scroll at viewport_anim_started (tween origin).
+viewport_from: f32 = 0,
+/// Viewport velocity for the spring (focus) path.
+viewport_vel: f32 = 0,
+/// Monotonic ms of the previous tick, for the spring integrator's dt.
+last_tick_ms: u64 = 0,
 /// Row-switch slide/fade in flight; null when no switch is animating.
 row_anim: ?RowAnim = null,
 // Tiled-column slot lefts (absolute), cached for the cursor's
@@ -220,6 +251,13 @@ hover_border_color: ?Config.Color = null,
 pulse_enabled: bool = false,
 /// 0..1 brightness multiplier written each animation tick while pulsing.
 pulse_dim: f32 = 1.0,
+/// Last breathes that actually repainted the ring: pulse repaints are
+/// threshold-gated so an idle desktop (ticking for the breathe alone)
+/// skips identical frames.
+pulse_last_dim: f32 = 1.0,
+/// Blur is currently active (not relaxed): idle-relax drops the global
+/// blur passes/radius to 0 and restores them when animation resumes.
+blur_active: bool = true,
 /// View currently under the cursor (drives the hover ring).
 hovered_view: ?*View = null,
 /// Corner radius (logical px) for rounded window corners; 0 disables.

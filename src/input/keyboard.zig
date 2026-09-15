@@ -64,7 +64,7 @@ pub fn swapColumnRuns(context: *ServerContext, start: usize, len_a: usize, len_b
     if (len_a == 0 or len_b == 0) return;
     const end = start + len_a + len_b;
     if (end > context.views.items.len) return;
-    inline for (.{ context.views.items, context.animation_x.items, context.animation_w.items, context.animation_y.items }) |list| {
+    inline for (.{ context.views.items, context.animation_x.items, context.animation_w.items, context.animation_y.items, context.from_x.items, context.from_w.items, context.from_y.items, context.vel_x.items, context.vel_w.items, context.vel_y.items }) |list| {
         const T = std.meta.Elem(@TypeOf(list));
         reverseRange(T, list[start .. start + len_a]);
         reverseRange(T, list[start + len_a .. end]);
@@ -478,6 +478,10 @@ pub fn runAction(
                 if (tw > 0) {
                     context.animation_x.items[ridx] = @floatFromInt(view.x);
                     context.animation_w.items[ridx] = @floatFromInt(tw);
+                    context.vel_x.items[ridx] = 0;
+                    context.vel_w.items[ridx] = 0;
+                    context.from_x.items[ridx] = @floatFromInt(view.x);
+                    context.from_w.items[ridx] = @floatFromInt(tw);
                 }
                 const bw: i32 = @intCast(@max(0, context.border_width));
                 view.setSize(@max(1, tw - 2 * bw), @max(1, view.slot_h - 2 * bw));
@@ -501,6 +505,12 @@ pub fn runAction(
             std.mem.swap(f32, &context.animation_x.items[idx], &context.animation_x.items[j]);
             std.mem.swap(f32, &context.animation_w.items[idx], &context.animation_w.items[j]);
             std.mem.swap(f32, &context.animation_y.items[idx], &context.animation_y.items[j]);
+            std.mem.swap(f32, &context.from_x.items[idx], &context.from_x.items[j]);
+            std.mem.swap(f32, &context.from_w.items[idx], &context.from_w.items[j]);
+            std.mem.swap(f32, &context.from_y.items[idx], &context.from_y.items[j]);
+            std.mem.swap(f32, &context.vel_x.items[idx], &context.vel_x.items[j]);
+            std.mem.swap(f32, &context.vel_w.items[idx], &context.vel_w.items[j]);
+            std.mem.swap(f32, &context.vel_y.items[idx], &context.vel_y.items[j]);
             // Shares ride with the moved window; re-slot and re-size.
             ViewManager.updateViewPositionsFrom(context, @min(idx, j));
             ViewManager.syncPile(context, view);

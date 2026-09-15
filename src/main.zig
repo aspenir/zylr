@@ -542,12 +542,24 @@ pub fn main(init: std.process.Init) !void {
     }
     context.animation_x.deinit(std.heap.c_allocator);
     context.animation_w.deinit(std.heap.c_allocator);
+    context.from_x.deinit(std.heap.c_allocator);
+    context.from_w.deinit(std.heap.c_allocator);
+    context.from_y.deinit(std.heap.c_allocator);
+    context.vel_x.deinit(std.heap.c_allocator);
+    context.vel_w.deinit(std.heap.c_allocator);
+    context.vel_y.deinit(std.heap.c_allocator);
     context.views.deinit(std.heap.c_allocator);
     for (&context.rows) |*maybe_row| {
         if (maybe_row.*) |*r| {
             r.views.deinit(std.heap.c_allocator);
             r.animation_x.deinit(std.heap.c_allocator);
             r.animation_w.deinit(std.heap.c_allocator);
+            r.from_x.deinit(std.heap.c_allocator);
+            r.from_w.deinit(std.heap.c_allocator);
+            r.from_y.deinit(std.heap.c_allocator);
+            r.vel_x.deinit(std.heap.c_allocator);
+            r.vel_w.deinit(std.heap.c_allocator);
+            r.vel_y.deinit(std.heap.c_allocator);
             maybe_row.* = null;
         }
     }

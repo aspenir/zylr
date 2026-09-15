@@ -11,6 +11,36 @@ const Mirror = @import("../mirror.zig");
 const Row = @import("../row.zig");
 const PileMath = @import("pile_math.zig");
 
+
+/// Insert a newly-created view at `ins` in the active row's working set,
+/// keeping the lockstep tween arrays (indexed by view slot) in sync.
+/// Slots derive from list order, so inserting right after the focused
+/// window opens the new tile directly to its right instead of at row end.
+/// On OOM it rolls back every array and returns false so the caller can
+/// free `view`.
+pub fn insertView(context: *ServerContext, view: *View, ins: usize) bool {
+    const clamped = @min(ins, context.views.items.len);
+    const fv: f32 = @floatFromInt(view.x);
+    const fw: f32 = @floatFromInt(tiledWidth(context, view));
+    context.views.insert(std.heap.c_allocator, clamped, view) catch return false;
+    const tw = [_]*std.ArrayListUnmanaged(f32){
+        &context.animation_x, &context.from_x,
+        &context.animation_w, &context.from_w,
+        &context.animation_y, &context.from_y,
+        &context.vel_x,       &context.vel_w,
+        &context.vel_y,
+    };
+    for (tw, 0..) |arr, i| {
+        const val = if (i == 2 or i == 3) fw else if (i >= 6) 0 else fv;
+        arr.insert(std.heap.c_allocator, clamped, val) catch {
+            for (tw[0..i]) |done| _ = done.orderedRemove(clamped);
+            _ = context.views.orderedRemove(clamped);
+            return false;
+        };
+    }
+    return true;
+}
+
 pub fn removeView(
     context: *ServerContext,
     view: *View,
@@ -30,13 +60,24 @@ pub fn removeView(
     };
     const i = std.mem.indexOfScalar(*View, arr.items, view) orelse return;
 
-    // animation_x/w are appended in lockstep with views, but guard the
-    // remove anyway: if its append failed (OOM) the lists diverge and
-    // indexing it by the views index would read out of bounds.
-    const ax = if (row == context.active_row) &context.animation_x else &context.rows[row].?.animation_x;
-    const aw = if (row == context.active_row) &context.animation_w else &context.rows[row].?.animation_w;
-    if (i < ax.items.len) _ = ax.orderedRemove(i);
-    if (i < aw.items.len) _ = aw.orderedRemove(i);
+    // The animation/tween arrays are appended in lockstep with views, but
+    // guard the remove anyway: if an append failed (OOM) the lists diverge
+    // and indexing them by the views index would read out of bounds.
+    const base = if (row == context.active_row) null else &context.rows[row].?;
+    const ax = if (base) |b| &b.animation_x else &context.animation_x;
+    const aw = if (base) |b| &b.animation_w else &context.animation_w;
+    const ay = if (base) |b| &b.animation_y else &context.animation_y;
+    const fxs = if (base) |b| &b.from_x else &context.from_x;
+    const fws = if (base) |b| &b.from_w else &context.from_w;
+    const fys = if (base) |b| &b.from_y else &context.from_y;
+    const vxs = if (base) |b| &b.vel_x else &context.vel_x;
+    const vws = if (base) |b| &b.vel_w else &context.vel_w;
+    const vys = if (base) |b| &b.vel_y else &context.vel_y;
+    for ([_]?*std.ArrayListUnmanaged(f32){ ax, aw, ay, fxs, fws, fys, vxs, vws, vys }) |arr_| {
+        if (arr_) |a| {
+            if (i < a.items.len) _ = a.orderedRemove(i);
+        }
+    }
     _ = arr.orderedRemove(i);
 
     // A pile that just lost a member must re-split its remaining height:
@@ -429,38 +470,43 @@ pub fn applyFullscreen(context: *ServerContext, view: *View) void {
         var ow: c_int = 0;
         var oh: c_int = 0;
         output.effectiveResolution(&ow, &oh);
-        view.setSize(@intCast(ow), @intCast(oh));
+        // Fullscreen enters through a tween rather than a snap: keep the
+        // scene geometry articulated (x,y,w,h explicit) so the tick can
+        // ease scale+translate toward the output rect, then reparent +
+        // setFullscreen at settle (see `View.fs_tween` and the tick).
+        view.fs_tween = .{
+            .from = .{ @floatFromInt(view.x), @floatFromInt(view.y), @floatFromInt(view.slot_w), @floatFromInt(view.slot_h) },
+            .to = .{ 0, 0, @floatFromInt(ow), @floatFromInt(oh) },
+            .entering = true,
+            .started = context.nowMs(),
+        };
         view.setActivated(true);
-        switch (view.backend) {
-            .xdg => |t| _ = t.setFullscreen(true),
-            .xwayland => |x| x.setFullscreen(true),
-        }
+        // The reparent + setFullscreen snap moves to the tick settle.
     } else {
-        if (view.border) |*b| b.rect.node.setEnabled(true);
-        switch (view.backend) {
-            .xdg => |t| _ = t.setFullscreen(false),
-            .xwayland => |x| x.setFullscreen(false),
-        }
-        // Reparent back into the views tree.
-        if (context.views_tree) |vt| {
-            view.scene_tree.node.reparent(vt);
-        }
-        // Floating views re-center; tiled views rejoin the layout.
+        // Exit fullscreen through a tween too: shrink from the output rect
+        // back toward the slot. The tick's fs_tween fold fires the deferred
+        // setFullscreen(false) + reparent-home + border re-enable + layout
+        // rejoin at settle (the fold calls scrollToViewNoLayout / reflows).
+        const output = context.output.?;
+        var ow: c_int = 0;
+        var oh: c_int = 0;
+        output.effectiveResolution(&ow, &oh);
         if (view.floating) {
+            // Re-centre the floating window while we are here: the settle
+            // rejoin uses these as the shrink target.
             const vw: f32 = @floatFromInt(@max(1, context.usable_area.width));
             const vh: f32 = @floatFromInt(@max(1, context.usable_area.height));
             view.x = context.usable_area.x + @as(i32, @intFromFloat((vw - @as(f32, @floatFromInt(view.slot_w))) / 2));
             view.y = context.usable_area.y + @as(i32, @intFromFloat((vh - @as(f32, @floatFromInt(view.slot_h))) / 2));
-            view.scene_tree.node.setPosition(view.x, view.y);
-            view.scene_tree.node.raiseToTop();
-            const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
-            updateViewPositionsFrom(context, idx);
-        } else {
-            const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
-            updateViewPositionsFrom(context, idx);
-            scrollToViewNoLayout(context, view);
         }
+        view.fs_tween = .{
+            .from = .{ 0, 0, @floatFromInt(ow), @floatFromInt(oh) },
+            .to = .{ @floatFromInt(view.x), @floatFromInt(view.y), @floatFromInt(view.slot_w), @floatFromInt(view.slot_h) },
+            .entering = false,
+            .started = context.nowMs(),
+        };
     }
+    AnimationManager.wake(context);
 }
 
 pub fn getViewWidth(view: *View) i32 {
@@ -691,7 +737,21 @@ pub fn updateViewPositionsFrom(context: *ServerContext, start_idx: usize) void {
         }
     }
     Mirror.layoutMirrorsAll(context);
+    // Freeze the tween origin: each view's current position becomes the
+    // start of the swap tween, so a spring can overshoot the full travel.
+    const n = @min(@min(context.views.items.len, context.animation_x.items.len), @min(context.from_x.items.len, context.from_w.items.len));
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        context.from_x.items[i] = context.animation_x.items[i];
+        context.from_w.items[i] = context.animation_w.items[i];
+    }
+    i = 0;
+    const ny = @min(context.animation_y.items.len, context.from_y.items.len);
+    while (i < ny) : (i += 1) {
+        context.from_y.items[i] = context.animation_y.items[i];
+    }
     context.animation_active = true;
+    context.layout_anim_started = context.nowMs();
     AnimationManager.wake(context);
     context.layout_seq +|= 1;
 }
@@ -720,7 +780,11 @@ pub fn layoutViews(context: *ServerContext) void {
             view.y - context.viewport_y,
         );
         context.animation_x.items[i] = @floatFromInt(view.x);
+        context.from_x.items[i] = @floatFromInt(view.x);
         if (i < context.animation_y.items.len) context.animation_y.items[i] = @floatFromInt(view.y);
+        if (i < context.from_y.items.len) context.from_y.items[i] = @floatFromInt(view.y);
+        if (i < context.vel_x.items.len) context.vel_x.items[i] = 0;
+        if (i < context.vel_y.items.len) context.vel_y.items[i] = 0;
         Border.updateViewBorder(view, @floatFromInt(view.x), null);
 
         // Same-row mirror copies are real tiles: advance past them too so the
@@ -807,6 +871,8 @@ pub fn scrollToX(context: *ServerContext, x: i32, tile_w: i32) void {
     output.effectiveResolution(&out_w, &out_h);
     context.viewport_target = @max(0, x + @divTrunc(tile_w, 2) - @divTrunc(out_w, 2));
     context.viewport_anim = @floatFromInt(context.viewport_x);
+    context.viewport_from = context.viewport_anim;
+    context.viewport_anim_started = context.nowMs();
     context.animation_active = true;
     AnimationManager.wake(context);
 }
@@ -839,6 +905,8 @@ pub fn scrollToViewNoLayout(
     const max_vp = view.x - context.usable_area.x - @as(i32, @intCast(context.gaps_out));
 
     context.viewport_target = @max(0, @min(target, max_vp));
+    context.viewport_from = @floatFromInt(context.viewport_x);
+    context.viewport_anim_started = context.nowMs();
 }
 
 /// hsplit piles cap at this many members stacked in one column.
@@ -937,6 +1005,12 @@ pub fn joinPileNear(context: *ServerContext, view: *View, anchor: *View) void {
             std.mem.swap(f32, &ax.items[i], &ax.items[i + 1]);
             std.mem.swap(f32, &aw.items[i], &aw.items[i + 1]);
             std.mem.swap(f32, &ay.items[i], &ay.items[i + 1]);
+            std.mem.swap(f32, &context.from_x.items[i], &context.from_x.items[i + 1]);
+            std.mem.swap(f32, &context.from_w.items[i], &context.from_w.items[i + 1]);
+            std.mem.swap(f32, &context.from_y.items[i], &context.from_y.items[i + 1]);
+            std.mem.swap(f32, &context.vel_x.items[i], &context.vel_x.items[i + 1]);
+            std.mem.swap(f32, &context.vel_w.items[i], &context.vel_w.items[i + 1]);
+            std.mem.swap(f32, &context.vel_y.items[i], &context.vel_y.items[i + 1]);
         }
     } else {
         while (i > anchor_idx + 1) : (i -= 1) {
@@ -944,6 +1018,12 @@ pub fn joinPileNear(context: *ServerContext, view: *View, anchor: *View) void {
             std.mem.swap(f32, &ax.items[i], &ax.items[i - 1]);
             std.mem.swap(f32, &aw.items[i], &aw.items[i - 1]);
             std.mem.swap(f32, &ay.items[i], &ay.items[i - 1]);
+            std.mem.swap(f32, &context.from_x.items[i], &context.from_x.items[i - 1]);
+            std.mem.swap(f32, &context.from_w.items[i], &context.from_w.items[i - 1]);
+            std.mem.swap(f32, &context.from_y.items[i], &context.from_y.items[i - 1]);
+            std.mem.swap(f32, &context.vel_x.items[i], &context.vel_x.items[i - 1]);
+            std.mem.swap(f32, &context.vel_w.items[i], &context.vel_w.items[i - 1]);
+            std.mem.swap(f32, &context.vel_y.items[i], &context.vel_y.items[i - 1]);
         }
     }
 

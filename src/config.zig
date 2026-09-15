@@ -308,10 +308,181 @@ pub const CompiledRule = struct {
     blur: ?bool,
     float: ?bool,
 };
+
+/// CSS-style cubic-bezier easing: control points (x1,y1) and (x2,y2), with
+/// implicit anchors P0=(0,0) and P3=(1,1).
+pub const Bezier = struct {
+    x1: f32 = 0.33,
+    y1: f32 = 0,
+    x2: f32 = 0.67,
+    y2: f32 = 1,
+
+    fn at(p1: f32, p2: f32, t: f32) f32 {
+        const u = 1 - t;
+        return 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t;
+    }
+
+    pub fn sample(self: Bezier, input: f32) f32 {
+        const q = std.math.clamp(input, 0, 1);
+        var t = q;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const x = at(self.x1, self.x2, t) - q;
+            const d = 3 * (1 - t) * (1 - t) * self.x1 +
+                6 * (1 - t) * t * (self.x2 - self.x1) +
+                3 * t * t * (1 - self.x2);
+            if (@abs(d) < 1e-6) break;
+            const step = x / d;
+            t = std.math.clamp(t - step, 0, 1);
+            if (@abs(step) < 1e-5) break;
+        }
+        return at(self.y1, self.y2, t);
+    }
+};
+
+/// Damped-spring easing: chases value 1 like a mass on a spring.
+/// Underdamped springs overshoot and bounce; higher damping = less bounce.
+pub const Spring = struct {
+    stiffness: f32 = 180,
+    damping: f32 = 26,
+
+    pub fn sample(self: Spring, input: f32) f32 {
+        const q = std.math.clamp(input, 0, 1);
+        if (self.stiffness <= 0) return q;
+        const w = @sqrt(self.stiffness);
+        const z = self.damping / (2 * w);
+        // Critical/overdamped settle by ~p=1; underdamped by when the
+        // amplitude term has decayed ~50x.
+        const settle = if (z < 1) @log(50 / @sqrt(1 - z * z)) / (z * w) else 6 / w;
+        const t = q * settle;
+        if (z < 1) {
+            const wd = w * @sqrt(1 - z * z);
+            const amp = 1 / @sqrt(1 - z * z);
+            const e = @exp(-z * w * t);
+            return 1 - e * (@cos(wd * t) + amp * @sin(wd * t));
+        }
+        const r1 = w * (z - @sqrt(z * z - 1));
+        const r2 = w * (z + @sqrt(z * z - 1));
+        return 1 - (r2 * @exp(-r1 * t) - r1 * @exp(-r2 * t)) / (r2 - r1);
+    }
+};
+
+/// Named one-shot easing curves (unit step responses, 0 -> 1). `back` and
+/// `elastic` overshoot past 1, so they only suit position/viewport tweens
+/// (opacity callers clamp).
+pub const EasingPreset = enum {
+    linear,
+    ease_in,
+    ease_out,
+    ease_in_out,
+    back,
+    expo,
+    elastic,
+    bounce,
+
+    pub fn sample(self: EasingPreset, input: f32) f32 {
+        const q = std.math.clamp(input, 0, 1);
+        const u = 1 - q;
+        switch (self) {
+            .linear => return q,
+            .ease_in => return q * q * q,
+            .ease_out => return 1 - u * u * u,
+            .ease_in_out => return if (q < 0.5) 4 * q * q * q else 1 - @as(f32, -2 * q + 2) * @as(f32, -2 * q + 2) * @as(f32, -2 * q + 2) / 2,
+            .back => {
+                // Overshoots ~10% past 1 then settles (easeOutBack).
+                const c1: f32 = 1.70158;
+                const c3 = c1 + 1;
+                return 1 - c3 * u * u * u + c1 * u * u;
+            },
+            .expo => {
+                if (q <= 0) return 0;
+                if (q >= 1) return 1;
+                return 1 - std.math.pow(f32, 2, -10 * q);
+            },
+            .elastic => {
+                // easeOutElastic: several decaying overshoots.
+                if (q <= 0) return 0;
+                if (q >= 1) return 1;
+                const c4: f32 = (2.0 * @as(f32, std.math.pi)) / 3.0;
+                return std.math.pow(f32, 2, -10 * q) * @sin((q * 10 - 0.75) * c4) + 1;
+            },
+            .bounce => {
+                // easeOutBounce: discrete floor-hit rebounds.
+                const n1: f32 = 7.5625;
+                const d1: f32 = 2.75;
+                var x = q;
+                if (x < 1 / d1) return n1 * x * x;
+                if (x < 2 / d1) {
+                    x -= 1.5 / d1;
+                    return n1 * x * x + 0.75;
+                }
+                if (x < 2.5 / d1) {
+                    x -= 2.25 / d1;
+                    return n1 * x * x + 0.9375;
+                }
+                x -= 2.625 / d1;
+                return n1 * x * x + 0.984375;
+            },
+        }
+    }
+};
+
+/// How a window enters/leaves the screen, layered on top of the opacity
+/// fade. `slide` also translates the surface vertically into/out of its
+/// slot; `pop` scales the content gently over the first/last 20% of the
+/// duration instead of fading the whole way.
+pub const OpenCloseStyle = enum {
+    fade,
+    slide,
+    pop,
+};
+
+pub const Easing = union(enum) {
+    spring: Spring,
+    bezier: Bezier,
+    preset: EasingPreset,
+
+    pub fn sample(self: Easing, p: f32) f32 {
+        return switch (self) {
+            .spring => |s| s.sample(p),
+            .bezier => |b| b.sample(p),
+            .preset => |e| e.sample(p),
+        };
+    }
+};
+
+/// One animation's timing: easing curve + duration in ms.
+pub const AnimationSpec = struct {
+    easing: Easing = .{ .bezier = .{} },
+    /// Animation length in ms.
+    ms: u64 = 200,
+};
+
+/// Per-animation timing. Each animation type has its own easing + duration.
+pub const AnimationConfig = struct {
+    /// Row-switch slide/fade.
+    row: AnimationSpec = .{ .ms = 220 },
+    /// Tile x/y/w slide when windows swap or the layout reflows.
+    swap: AnimationSpec = .{ .ms = 200 },
+    /// Viewport scroll when keyboard focus moves to a window.
+    focus: AnimationSpec = .{ .ms = 200 },
+    /// Window open fade-in.
+    open: AnimationSpec = .{ .ms = 180 },
+    /// Window close fade-out.
+    close: AnimationSpec = .{ .ms = 180 },
+    /// Window enter style (layered over the open fade).
+    open_style: OpenCloseStyle = .fade,
+    /// Window leave style (layered over the close fade).
+    close_style: OpenCloseStyle = .fade,
+    /// Focus-ring border colour transition on focus switches.
+    border_color: AnimationSpec = .{ .ms = 150 },
+};
+
 pub const Config = struct {
     keyboard: KeyboardConfig = .{ .preset = "gb" },
     decorations: DecorationsConfig = .{},
     windows: WindowsConfig = .{},
+    animation: AnimationConfig = .{},
     autostart: []const []const u8 = &.{},
     rules: []const Rule = &.{},
     keybinds: []const Bind = &default_keybinds,
@@ -997,6 +1168,38 @@ test "ziggy document deserializes into Config" {
 
     const gestures = try compileGestures(a, cfg.gestures.binds);
     try std.testing.expectEqual(@as(usize, 0), gestures.len);
+}
+
+test "Easing.sample bounds and endpoints" {
+    // Bezier and spring both start at 0 and reach ~1 by p=1.
+    const b = Bezier{};
+    try std.testing.expectApproxEqAbs(@as(f32, 0), b.sample(0), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), b.sample(1), 1e-3);
+
+    const sp = Spring{};
+    try std.testing.expectApproxEqAbs(@as(f32, 0), sp.sample(0), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), sp.sample(1), 3e-2);
+
+    // Monotonic bezier in the middle.
+    const mid = b.sample(0.5);
+    try std.testing.expect(mid > 0 and mid < 1);
+}
+
+test "EasingPreset endpoints and overshoots" {
+    // All presets start at 0 and end at 1.
+    const presets = [_]EasingPreset{ .linear, .ease_in, .ease_out, .ease_in_out, .back, .expo, .elastic, .bounce };
+    for (presets) |e| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0), e.sample(0), 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1), e.sample(1), 1e-6);
+    }
+    // Overshooting presets exceed 1 in the middle; monotonic ones don't.
+    try std.testing.expect(EasingPreset.back.sample(0.7) > 1);
+    try std.testing.expect(EasingPreset.elastic.sample(0.5) > 1);
+    try std.testing.expect(EasingPreset.bounce.sample(0.6) < 1 and EasingPreset.bounce.sample(0.6) > 0);
+    const mid_linear = EasingPreset.linear.sample(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mid_linear, 1e-6);
+    try std.testing.expect(EasingPreset.ease_in.sample(0.3) < 0.3);
+    try std.testing.expect(EasingPreset.ease_out.sample(0.3) > 0.3);
 }
 
 test "compileGestures rejects direction/kind mismatches" {

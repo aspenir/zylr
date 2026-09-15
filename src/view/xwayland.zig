@@ -189,39 +189,14 @@ fn onAssociate(listener: *wl.Listener(void)) void {
     xw_surface.events.request_fullscreen.add(&view.request_fullscreen_listener);
     view.request_fullscreen_active = true;
 
-    view.context.views.append(
-        std.heap.c_allocator,
-        view,
-    ) catch |err| {
-        std.log.err("Failed to add view: {}", .{err});
+    const ins = if (view.context.focused_view) |fv|
+        (std.mem.indexOfScalar(*View, view.context.views.items, fv) orelse view.context.views.items.len) + 1
+    else
+        view.context.views.items.len;
+    if (!ViewManager.insertView(view.context, view, ins)) {
+        std.log.err("Failed to add view", .{});
         return;
-    };
-    view.context.animation_x.append(
-        std.heap.c_allocator,
-        @floatFromInt(view.x),
-    ) catch |err| {
-        std.log.err("Failed to add animation_x: {}", .{err});
-        _ = view.context.views.orderedRemove(view.context.views.items.len - 1);
-        return;
-    };
-    view.context.animation_w.append(
-        std.heap.c_allocator,
-        @floatFromInt(ViewManager.tiledWidth(view.context, view)),
-    ) catch |err| {
-        std.log.err("Failed to add animation_w: {}", .{err});
-        _ = view.context.animation_x.orderedRemove(view.context.animation_x.items.len - 1);
-        _ = view.context.views.orderedRemove(view.context.views.items.len - 1);
-        return;
-    };
-    view.context.animation_y.append(
-        std.heap.c_allocator,
-        @floatFromInt(view.y),
-    ) catch {
-        _ = view.context.animation_w.orderedRemove(view.context.animation_w.items.len - 1);
-        _ = view.context.animation_x.orderedRemove(view.context.animation_x.items.len - 1);
-        _ = view.context.views.orderedRemove(view.context.views.items.len - 1);
-        return;
-    };
+    }
 }
 
 /// Client wants to map: honor it (XWayland surfaces stay withdrawn

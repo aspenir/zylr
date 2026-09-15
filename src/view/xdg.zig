@@ -66,42 +66,18 @@ pub fn onNewXdgTopLevel(
     xdg_surface.surface.events.commit.add(&view.commit_listener);
 
     view.scene_tree.node.data = &view.node_data;
-    context.views.append(std.heap.c_allocator, view) catch |err| {
-        std.log.err("Failed to add view: {}", .{err});
+    // Open beside the focused window, not at the end of the row: slots
+    // follow list order, so inserting after the focused window lands the
+    // new tile directly to its right. Row end when nothing is focused.
+    const ins = if (context.focused_view) |fv|
+        (std.mem.indexOfScalar(*View, context.views.items, fv) orelse context.views.items.len) + 1
+    else
+        context.views.items.len;
+    if (!ViewManager.insertView(context, view, ins)) {
+        std.log.err("Failed to add view", .{});
         std.heap.c_allocator.destroy(view);
         return;
-    };
-    context.animation_x.append(
-        std.heap.c_allocator,
-        @floatFromInt(view.x),
-    ) catch |err| {
-        std.log.err("Failed to add animation_x: {}", .{err});
-        _ = context.views.orderedRemove(context.views.items.len - 1);
-        std.heap.c_allocator.destroy(view);
-        return;
-    };
-    context.animation_w.append(
-        std.heap.c_allocator,
-        @floatFromInt(ViewManager.tiledWidth(context, view)),
-    ) catch |err| {
-        std.log.err("Failed to add animation_w: {}", .{err});
-        _ = context.animation_x.orderedRemove(context.animation_x.items.len - 1);
-        _ = context.views.orderedRemove(context.views.items.len - 1);
-        std.heap.c_allocator.destroy(view);
-        return;
-    };
-    context.animation_y.append(
-        std.heap.c_allocator,
-        @floatFromInt(view.y),
-    ) catch {
-        _ = context.animation_w.orderedRemove(context.animation_w.items.len - 1);
-        _ = context.animation_x.orderedRemove(context.animation_x.items.len - 1);
-        _ = context.views.orderedRemove(context.views.items.len - 1);
-        std.heap.c_allocator.destroy(view);
-        return;
-    };
-
-    xdg_surface.data = view.scene_tree;
+    }
 
     view.map_listener =
         wl.Listener(void).init(View.onSurfaceMap);

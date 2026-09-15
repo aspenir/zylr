@@ -25,6 +25,18 @@ pub const BlurParams = struct {
     saturation: f32,
 };
 
+/// Un/blur the whole scene when the desktop settles: with nothing
+/// animating, drop the global blur passes/radius to 0 so the static frame
+/// composite is cheap and the GPU can park. Restored on activity.
+pub fn setActive(context: *ServerContext, active: bool) void {
+    const bc = context.cfg.decorations.blur;
+    if (!bc.enabled) return;
+    if (context.blur_active == active) return;
+    context.blur_active = active;
+    wlr_scene_set_blur_num_passes(context.scene, if (active) bc.passes else 0);
+    wlr_scene_set_blur_radius(context.scene, if (active) bc.radius else 0);
+}
+
 pub fn initGlobal(scene: *wlroots.Scene, p: BlurParams) void {
     wlr_scene_set_blur_num_passes(scene, p.passes);
     wlr_scene_set_blur_radius(scene, p.radius);
