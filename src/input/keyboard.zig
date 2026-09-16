@@ -433,6 +433,7 @@ pub fn runAction(
             const view = target_view orelse context.focused_view orelse return;
             pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_pile_width = view.pile_width, .prev_floating = view.floating } });
             view.floating = !view.floating;
+            view.auto_float_done = true;
             if (view.floating) {
                 // Float at the window's remembered (formerly natural)
                 // size so a stretched tile takes less space when floated,

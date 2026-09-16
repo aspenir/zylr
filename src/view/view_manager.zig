@@ -3,6 +3,7 @@ const wlroots = @import("wlroots");
 
 const ServerContext = @import("../server.zig");
 const View = @import("view.zig");
+const Config = @import("../config.zig");
 const Border = @import("border.zig");
 const Rounding = @import("rounding.zig");
 const AnimationManager = @import("animation.zig");
@@ -18,33 +19,143 @@ const PileMath = @import("pile_math.zig");
 /// window opens the new tile directly to its right instead of at row end.
 /// On OOM it rolls back every array and returns false so the caller can
 /// free `view`.
-pub fn insertView(context: *ServerContext, view: *View, ins: usize) bool {
-    const clamped = @min(ins, context.views.items.len);
+/// Swallow: a newly-mapped window that was spawned by the focused one (a
+/// terminal running a program; the child's process descends from the
+/// focused window's process) hides the focused tiled window and takes over
+/// its slot, handing it back on close. A matching rule with `swallow:
+/// false` opts the window out. The child carries `swallows_host` so
+/// removeView hands the slot back on close.
+pub fn trySwallow(context: *ServerContext, child: *View) void {
+    if (child.swallows_host != null or child.is_swallowed) return;
+    if (child.floating or child.fullscreen or child.isOrWindow()) return;
+    if (Row.rowOf(context, child) != context.active_row) return;
+
+    for (context.rules) |rule| {
+        if (!Config.matchRule(rule, std.mem.span(child.appId()), std.mem.span(child.title()))) continue;
+        if (rule.swallow == false) return;
+    }
+
+    const f = context.focused_view orelse return;
+    if (f == child or !f.isMapped() or f.floating or f.fullscreen or f.isOrWindow()) return;
+    if (f.is_swallowed or f.swallows_host != null) return;
+
+    const child_pid = child.clientPid() orelse return;
+    const host_pid = f.clientPid() orelse return;
+    if (isProcessDescendantOf(context, child_pid, host_pid) == false) return;
+
+    // `child` is already in the list (inserted at create), so take it
+    // back out before re-slotting it at the host's position.
+    var ci: ?usize = null;
+    if (std.mem.indexOfScalar(*View, context.views.items, child)) |found| {
+        ci = found;
+        removeView(context, child);
+    }
+    const hi = std.mem.indexOfScalar(*View, context.views.items, f) orelse {
+        if (ci) |i| _ = insertView(context, child, @min(i, context.views.items.len));
+        return;
+    };
+    removeView(context, f);
+    if (insertView(context, child, @min(hi, context.views.items.len))) {
+        f.is_swallowed = true;
+        child.swallows_host = f;
+        f.scene_tree.node.setEnabled(false);
+        AnimationManager.wake(context);
+    } else {
+        _ = insertView(context, f, @min(hi, context.views.items.len));
+        if (ci) |i| _ = insertView(context, child, @min(i, context.views.items.len));
+    }
+}
+
+/// True if `child` descends from `ancestor` in the process tree, walking
+/// /proc/<pid>/stat's ppid chain (depth-capped for stray PID cycles).
+fn isProcessDescendantOf(context: *ServerContext, child: i32, ancestor: i32) bool {
+    var p: i32 = child;
+    var depth: u8 = 0;
+    while (depth < 32) : (depth += 1) {
+        if (p == ancestor) return true;
+        if (p <= 1) return false;
+        var buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "/proc/{d}/stat", .{p}) catch return false;
+        const txt = std.Io.Dir.cwd().readFileAlloc(context.io, path, std.heap.page_allocator, .limited(4096)) catch return false;
+        defer std.heap.page_allocator.free(txt);
+        // Format: "pid (comm) state ppid ..." with comm free to contain
+        // spaces and parens, so cut at the LAST ')' before the fields.
+        const close = std.mem.lastIndexOfScalar(u8, txt, ')') orelse return false;
+        var it = std.mem.tokenizeAny(u8, txt[close + 1 ..], " \t");
+        _ = it.next() orelse return false; // state
+        const ppid = it.next() orelse return false; // ppid
+        p = std.fmt.parseInt(i32, ppid, 10) catch return false;
+    }
+    return false;
+}
+
+fn insertViewInRow(context: *ServerContext, view: *View, ins: usize, row: usize) bool {
+    const is_active = row == context.active_row;
+    const views = if (is_active) &context.views else &context.rows[row].?.views;
+    const ax = if (is_active) &context.animation_x else &context.rows[row].?.animation_x;
+    const fxs = if (is_active) &context.from_x else &context.rows[row].?.from_x;
+    const aw = if (is_active) &context.animation_w else &context.rows[row].?.animation_w;
+    const fws = if (is_active) &context.from_w else &context.rows[row].?.from_w;
+    const ay = if (is_active) &context.animation_y else &context.rows[row].?.animation_y;
+    const fys = if (is_active) &context.from_y else &context.rows[row].?.from_y;
+    const vxs = if (is_active) &context.vel_x else &context.rows[row].?.vel_x;
+    const vws = if (is_active) &context.vel_w else &context.rows[row].?.vel_w;
+    const vys = if (is_active) &context.vel_y else &context.rows[row].?.vel_y;
+    const clamped = @min(ins, views.items.len);
     const fv: f32 = @floatFromInt(view.x);
     const fw: f32 = @floatFromInt(tiledWidth(context, view));
-    context.views.insert(std.heap.c_allocator, clamped, view) catch return false;
-    const tw = [_]*std.ArrayListUnmanaged(f32){
-        &context.animation_x, &context.from_x,
-        &context.animation_w, &context.from_w,
-        &context.animation_y, &context.from_y,
-        &context.vel_x,       &context.vel_w,
-        &context.vel_y,
-    };
+    views.insert(std.heap.c_allocator, clamped, view) catch return false;
+    const tw = [_]*std.ArrayListUnmanaged(f32){ ax, fxs, aw, fws, ay, fys, vxs, vws, vys };
     for (tw, 0..) |arr, i| {
         const val = if (i == 2 or i == 3) fw else if (i >= 6) 0 else fv;
         arr.insert(std.heap.c_allocator, clamped, val) catch {
             for (tw[0..i]) |done| _ = done.orderedRemove(clamped);
-            _ = context.views.orderedRemove(clamped);
+            _ = views.orderedRemove(clamped);
             return false;
         };
     }
     return true;
 }
 
+pub fn insertView(context: *ServerContext, view: *View, ins: usize) bool {
+    return insertViewInRow(context, view, ins, context.active_row);
+}
+
 pub fn removeView(
     context: *ServerContext,
     view: *View,
 ) void {
+    // Swallow bookkeeping: a swallowed child that closes must hand its
+    // slot back to the hidden host, and a host that dies while swallowed
+    // must orphan the child so it closes normally without restoring.
+    if (view.swallows_host) |host| {
+        if (host.is_swallowed and host.isMapped() and host != view) {
+            const vrow = Row.rowOf(context, view) orelse return;
+            const varr = if (vrow == context.active_row) &context.views
+                else &context.rows[vrow].?.views;
+            const ci = if (std.mem.indexOfScalar(*View, varr.items, view)) |ii| ii else varr.items.len;
+            host.is_swallowed = false;
+            host.scene_tree.node.setEnabled(true);
+            if (insertViewInRow(context, host, ci, vrow)) {
+                context.focused_view = host;
+                AnimationManager.wake(context);
+            }
+        }
+        view.swallows_host = null;
+    }
+    if (view.is_swallowed) {
+        for (context.views.items, 0..) |v, i| {
+            if (v.swallows_host == view) context.views.items[i].swallows_host = null;
+        }
+        for (context.rows) |maybe_row| {
+            if (maybe_row) |*parked| {
+                for (parked.views.items, 0..) |v, i| {
+                    if (v.swallows_host == view) parked.views.items[i].swallows_host = null;
+                }
+            }
+        }
+    }
+
     // A closing window may live on an inactive row: each workspace row
     // parks its own window list, so remove it from whichever row owns it.
     const row = Row.rowOf(context, view) orelse {

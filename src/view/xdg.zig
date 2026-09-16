@@ -98,6 +98,10 @@ pub fn onNewXdgTopLevel(
     xdg_toplevel.events.request_fullscreen.add(&view.request_fullscreen_listener);
     view.request_fullscreen_active = true;
 
+    view.set_parent_listener = wl.Listener(void).init(View.onSetParent);
+    xdg_toplevel.events.set_parent.add(&view.set_parent_listener);
+    view.set_parent_active = true;
+
     // Foreign-toplevel handle for the xdg-desktop-portal (window pickers,
     // task bars). Created on map so title/app_id are available.
     const handle = wlroots.ForeignToplevelHandleV1.create(
@@ -628,12 +632,26 @@ pub fn commitToplevel(
             // Fall back to the buffer before the first commit announces a
             // geometry.
             const g = xdg_toplevel.base.geometry;
-            if (g.width > 0 and g.height > 0) {
-                view.slot_w = g.width + ws.horizontal();
-                view.slot_h = g.height + ws.vertical();
+            const new_w = if (g.width > 0 and g.height > 0)
+                g.width + ws.horizontal()
+            else
+                @max(1, surface.current.width + ws.horizontal());
+            const new_h = if (g.width > 0 and g.height > 0)
+                g.height + ws.vertical()
+            else
+                @max(1, surface.current.height + ws.vertical());
+            // A freshly-mapped float was centered from its first (often
+            // still empty) buffer; once the client commits its real
+            // geometry, re-center so the window doesn't stay anchored at
+            // the small-box center and spill off to the bottom/right.
+            // Never fight an in-flight drag or resize.
+            if (context.drag_view != view and context.resize_view != view and
+                (new_w != view.slot_w or new_h != view.slot_h))
+            {
+                ViewManager.centerFloating(context, view, .{ new_w, new_h });
             } else {
-                view.slot_w = @max(1, surface.current.width + ws.horizontal());
-                view.slot_h = @max(1, surface.current.height + ws.vertical());
+                view.slot_w = new_w;
+                view.slot_h = new_h;
             }
             // A float rule can run before the toplevel's first commit, so
             // the initial configure must still be sent or the client

@@ -15,7 +15,7 @@ const View = @import("view.zig");
 /// Append a line to /tmp/zylr_xw.log (the diagnostic that survives the
 /// desktop-file launch) so window-creation events can be correlated
 /// with user tests.
-fn logToFile(msg: []const u8) void {
+pub fn logToFile(msg: []const u8) void {
     const f = std.c.fopen("/tmp/zylr_xw.log", "a") orelse return;
     _ = std.c.fwrite(msg.ptr, 1, msg.len, f);
     _ = std.c.fclose(f);
@@ -24,6 +24,66 @@ fn logToFile(msg: []const u8) void {
 /// Throttled counter for the commitSurface diagnostic (first 30 calls,
 /// then every 300th) so a high-rate client does not flood the log.
 var xw_cfg_diag: u32 = 0;
+
+const float_type_atom_names = [_][]const u8{
+    "_NET_WM_WINDOW_TYPE_DIALOG",
+    "_NET_WM_WINDOW_TYPE_SPLASH",
+    "_NET_WM_WINDOW_TYPE_UTILITY",
+    "_NET_WM_WINDOW_TYPE_TOOLTIP",
+    "_NET_WM_WINDOW_TYPE_MENU",
+    "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+};
+var float_type_atoms: [float_type_atom_names.len]u32 = undefined;
+var float_type_atoms_ready: bool = false;
+
+/// Whether an XWayland surface carries a transient float-type window.
+pub fn isFloatTypeSurface(context: *ServerContext, xw: *wlroots.XwaylandSurface) bool {
+    if (xw.window_type == null or xw.window_type_len == 0) return false;
+    const xwayland = context.xwayland orelse return false;
+    if (!float_type_atoms_ready)
+        internFloatTypeAtoms(xwayland) catch return false;
+    for (xw.window_type.?[0..xw.window_type_len]) |atom| {
+        for (float_type_atoms) |want| if (atom == want) return true;
+    }
+    return false;
+}
+
+fn internFloatTypeAtoms(xwayland: *wlroots.Xwayland) !void {
+    const conn = wlr_xwayland_get_xwm_connection(xwayland) orelse return error.NotReady;
+    var names: [256]u8 = undefined;
+    var n: usize = 0;
+    for (float_type_atom_names, 0..) |name, i| {
+        const cookie = xcb.xcb_intern_atom(conn, 0, @intCast(name.len), name.ptr);
+        const reply = xcb.xcb_intern_atom_reply(conn, cookie, null) orelse return error.NotReady;
+        float_type_atoms[i] = reply.*.atom;
+        const part = std.fmt.bufPrint(names[n..], " {s}=0x{x}", .{ name, reply.*.atom }) catch break;
+        n += part.len;
+        std.c.free(reply);
+    }
+    float_type_atoms_ready = true;
+    std.log.info("float-type atoms:{s}", .{names[0..n]});
+}
+
+/// Debug: dump a surface's window-type atoms as names, into the xwayland
+/// diagnostic log, so a "splash didn't float" report can be diagnosed.
+pub fn logWindowType(context: *ServerContext, xw: *wlroots.XwaylandSurface) void {
+    if (xw.window_type == null or xw.window_type_len == 0) return;
+    const xwayland = context.xwayland orelse return;
+    const conn = wlr_xwayland_get_xwm_connection(xwayland) orelse return;
+    var buf: [512]u8 = undefined;
+    var n: usize = 0;
+    for (xw.window_type.?[0..xw.window_type_len]) |atom| {
+        const cookie = xcb.xcb_get_atom_name(conn, atom);
+        const reply = xcb.xcb_get_atom_name_reply(conn, cookie, null) orelse continue;
+        const name = xcb.xcb_get_atom_name_name(reply)[0..@intCast(xcb.xcb_get_atom_name_name_length(reply))];
+        const part = std.fmt.bufPrint(buf[n..], " {s}=0x{x}", .{ name, atom }) catch break;
+        n += part.len;
+        std.c.free(reply);
+    }
+    std.log.info("xwayland surface window_type:{s}", .{buf[0..n]});
+    logToFile(buf[0..n]);
+}
 
 extern fn wlr_xwayland_get_xwm_connection(xwayland: *wlroots.Xwayland) ?*xcb.xcb_connection_t;
 
@@ -58,6 +118,7 @@ pub fn onNewXwaylandSurface(
         xw_surface.height,
         xw_surface.parent,
     });
+    logWindowType(context, xw_surface);
     {
         const line = std.fmt.allocPrint(
             std.heap.c_allocator,
@@ -347,8 +408,19 @@ pub fn commitSurface(
     if (view.floating or view.fullscreen) {
         if (view.floating) {
             const ws = view.borderWidths();
-            view.slot_w = @max(1, surface.current.width + ws.horizontal());
-            view.slot_h = @max(1, surface.current.height + ws.vertical());
+            const new_w = @max(1, surface.current.width + ws.horizontal());
+            const new_h = @max(1, surface.current.height + ws.vertical());
+            // Same re-center as the XDG path: a float mapped from an
+            // empty/small first buffer must recenter once geometry lands,
+            // without fighting a drag or resize.
+            if (view.context.drag_view != view and view.context.resize_view != view and
+                (new_w != view.slot_w or new_h != view.slot_h))
+            {
+                ViewManager.centerFloating(view.context, view, .{ new_w, new_h });
+            } else {
+                view.slot_w = new_w;
+                view.slot_h = new_h;
+            }
             if (view.surface_tree) |wrap| {
                 wrap.node.setPosition(ws.left, ws.top);
             }

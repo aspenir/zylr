@@ -97,6 +97,11 @@ scene_buffer_node: ?*wlroots.SceneNode = null,
 animated_x: f32 = 0,
 animated_y: f32 = 0,
 
+/// True while this view is hidden inside another window (swallowed).
+is_swallowed: bool = false,
+/// When this window has swallowed the focused view, this is the hidden
+/// host that should reclaim the slot when this window closes.
+swallows_host: ?*View = null,
 /// Open fade-in in flight: opacity animates 0 -> 1 after map.
 fading_in: bool = false,
 fade_started: u64 = 0,
@@ -171,6 +176,12 @@ associated: bool = false,
 inner_destroy_listener: wl.Listener(*wlroots.Surface) = undefined,
 request_fullscreen_listener: wl.Listener(void) = undefined,
 request_fullscreen_active: bool = false,
+set_parent_listener: wl.Listener(void) = undefined,
+set_parent_active: bool = false,
+/// Set once auto-float has decided this window (map or later commit), so a
+/// window whose float-type appears after map floats, but a window the user
+/// manually re-tiled never bounces back.
+auto_float_done: bool = false,
 
 backend: Backend,
 
@@ -217,6 +228,31 @@ pub fn isOrWindow(view: *View) bool {
     return switch (view.backend) {
         .xdg => false,
         .xwayland => |x| x.override_redirect,
+    };
+}
+
+/// Transient windows float instead of taking a tiling slot, mirroring Sway's
+/// wants_floating (sway/desktop/xdg_shell.c): an XDG toplevel with a parent or
+/// a fixed size (min == max in one dimension) — the only two transient
+/// signals xdg-shell provides — or an XWayland window whose window-type atom
+/// is dialog/splash/utility/tooltip/menu/notification.
+/// Transient windows float instead of taking a tiling slot, mirroring Sway's
+/// wants_floating (sway/desktop/xdg_shell.c): an XDG toplevel with a parent or
+/// a fixed size (min == max in one dimension), a minimum height that covers
+/// most of the committed height (splash-like startup windows), or an XWayland
+/// window whose window-type atom is dialog/splash/utility/tooltip/menu/notification.
+/// Transient windows float instead of taking a tiling slot, mirroring Sway's
+/// wants_floating (sway/desktop/xdg_shell.c): an XDG toplevel with a parent or
+/// a fixed size (min == max in one dimension) — the only two transient
+/// signals xdg-shell provides — or an XWayland window whose window-type atom
+/// is dialog/splash/utility/tooltip/menu/notification.
+pub fn isFloatType(self: *View) bool {
+    return switch (self.backend) {
+        .xdg => |t| t.parent != null or
+            (t.current.min_width != 0 and t.current.min_height != 0 and
+                (t.current.min_width == t.current.max_width or
+                    t.current.min_height == t.current.max_height)),
+        .xwayland => |x| xw_mod.isFloatTypeSurface(self.context, x),
     };
 }
 
@@ -269,6 +305,16 @@ pub fn surfaceOrNull(self: *View) ?*wlroots.Surface {
     return switch (self.backend) {
         .xdg => |t| t.base.surface,
         .xwayland => |x| x.surface,
+    };
+}
+
+/// Process id backing this view's client, used for swallow: a newly-mapped
+/// window only swallows the focused one when its process descends from it
+/// (a terminal running a program).
+pub fn clientPid(self: *View) ?i32 {
+    return switch (self.backend) {
+        .xdg => |t| @intCast(t.base.client.client.getCredentials().pid),
+        .xwayland => |x| if (x.pid > 0) @intCast(x.pid) else null,
     };
 }
 
@@ -367,6 +413,36 @@ pub fn onRequestFullscreen(listener: *wl.Listener(void)) void {
     ViewManager.applyFullscreen(view.context, view);
 }
 
+/// The client set a parent on this xdg toplevel (xdg_toplevel.set_parent):
+/// it is now a transient child (dialog/splash) even though it mapped
+/// before its parent window existed. Sway floats any parented toplevel,
+/// so re-run the float check here — the map-time check saw no parent yet.
+pub fn onSetParent(listener: *wl.Listener(void)) void {
+    const view: *View = @fieldParentPtr("set_parent_listener", listener);
+    const context = view.context;
+    const t = switch (view.backend) {
+        .xdg => |x| x,
+        else => return,
+    };
+    if (t.parent == null) return;
+    if (view.floating or view.fullscreen or view.isOrWindow()) return;
+    view.floating = true;
+    ViewManager.centerFloating(context, view, null);
+    ViewManager.refreshTiledSizes(context);
+    std.log.info("xdg set_parent -> float title={s} parent={?*}", .{ std.mem.span(t.title orelse ""), t.parent });
+    {
+        const line = std.fmt.allocPrint(
+            std.heap.c_allocator,
+            "xdg set_parent title={s} class={s}\n",
+            .{ std.mem.span(t.title orelse ""), std.mem.span(view.appId()) },
+        ) catch null;
+        if (line) |l| {
+            defer std.heap.c_allocator.free(l);
+            xw_mod.logToFile(l);
+        }
+    }
+}
+
 pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
     const view: *View =
         @fieldParentPtr("map_listener", listener);
@@ -407,6 +483,36 @@ pub fn onSurfaceMap(listener: *wl.Listener(void)) void {
     // configure); re-run here so a rule that floats the window today
     // also wins on the map path.
     view.rulesApplyToLive(true);
+    const do_float = !view.floating and !view.isOrWindow() and View.isFloatType(view);
+    if (do_float) {
+        view.floating = true;
+        view.auto_float_done = true;
+    }
+    {
+        const cid = view.clientPid() orelse -1;
+        const geom: struct { w: c_int, h: c_int, mw: c_int, mh: c_int, p: bool, t: []const u8 } = switch (view.backend) {
+            .xdg => |t| .{ .w = @intCast(t.current.width), .h = @intCast(t.current.height), .mw = t.current.min_width, .mh = t.current.min_height, .p = t.parent != null, .t = std.mem.span(t.title orelse "") },
+            .xwayland => |x| .{ .w = @intCast(x.width), .h = @intCast(x.height), .mw = 0, .mh = 0, .p = x.parent != null, .t = std.mem.span(x.title orelse "") },
+        };
+        const line = std.fmt.allocPrint(
+            std.heap.c_allocator,
+            "MAP float_check backend={s} pid={d} class={s} title={s} geom={d}x{d} min={d}x{d} parent={} is_float_type={} result={}\n",
+            .{ @tagName(view.backend), cid, view.appId(), geom.t, geom.w, geom.h, geom.mw, geom.mh, geom.p, View.isFloatType(view), do_float },
+        ) catch null;
+        if (line) |l| {
+            defer std.heap.c_allocator.free(l);
+            xw_mod.logToFile(l);
+        }
+        if (view.backend == .xwayland) blk: {
+            const xw = switch (view.backend) {
+                .xwayland => |x| x,
+                else => break :blk,
+            };
+            xw_mod.logWindowType(view.context, xw);
+        }
+        std.log.info("MAP float_check backend={s} result={}", .{ @tagName(view.backend), do_float });
+    }
+    ViewManager.trySwallow(view.context, view);
 
     if (!view.isOrWindow()) {
         FocusManager.setFocus(context, .{
@@ -556,6 +662,10 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
         view.request_fullscreen_listener.link.remove();
         view.request_fullscreen_active = false;
     }
+    if (view.set_parent_active) {
+        view.set_parent_listener.link.remove();
+        view.set_parent_active = false;
+    }
     if (view.associated) {
         view.commit_listener.link.remove();
         view.map_listener.link.remove();
@@ -635,16 +745,19 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
     // persists until explicit cleanup, so null its data.
     view.node_data = .{ .layer = undefined };
     if (view.backend == .xwayland) {
-        view.scene_tree.node.data = null;
+        // XWayland's scene tree is manually created and wlroots never
+        // frees it. Null the border's node data while the nodes are
+        // still alive (tree destroy would make those pointers dangling),
+        // destroy the blur child explicitly, then remove the whole tree
+        // so the border doesn't stay painted on screen after the backing
+        // X window is killed.
         if (view.border) |*b| {
             b.rect.node.data = null;
             for (b.strips.items) |strip| strip.node.data = null;
         }
+        Blur.destroyForView(view);
+        view.scene_tree.node.destroy();
     }
-
-    // Free the blur node. For XDG the scene tree (and blender) is freed
-    // by wlroots before ours; XWayland's tree persists, so destroy it.
-    if (view.backend == .xwayland) Blur.destroyForView(view);
 
     // Clear drag/resize state that may reference this view.
     if (context.drag_view == view) context.drag_view = null;
@@ -688,9 +801,43 @@ pub fn onViewCommit(
     // toplevel, or a float rule is overridden by a tiled initial
     // configure (the slot computed as a full-width tile). Apply once
     // per map; every view sends an initial commit before its first map.
+    const is_first_commit = !view.rules_applied_once;
     if (!view.rules_applied_once) {
         view.rulesApplyToLive(true);
         view.rules_applied_once = true;
+    }
+
+    // A toplevel can report its float-type only after mapping — e.g. an
+    // app that first maps as a plain window then commits a fixed size or
+    // a parent. Map-time checked once; re-check every commit so such
+    // windows still float (mirrors sway's re-evaluation on commit).
+    //
+    // XWayland surfaces commit BEFORE mapping, and the pre-map commit
+    // runs commitSurface's tiled branch — which CONFIGURES the X window
+    // to the full-width tile slot. A float decided only at map is too
+    // late: the window has already been resized full-screen and the float
+    // branch never sends a configure, so LO's splash renders at
+    // workspace size. Decide the float on the first (hence pre-map)
+    // commit for XWayland, before any configure reaches the client.
+    if ((view.isMapped() or (is_first_commit and view.backend == .xwayland)) and
+        !view.auto_float_done and !view.floating and !view.fullscreen and
+        !view.isOrWindow() and View.isFloatType(view))
+    {
+        view.floating = true;
+        view.auto_float_done = true;
+        ViewManager.centerFloating(view.context, view, null);
+        ViewManager.refreshTiledSizes(view.context);
+        const cid = view.clientPid() orelse -1;
+        const line = std.fmt.allocPrint(
+            std.heap.c_allocator,
+            "COMMIT float_check backend={s} pid={d} class={s} title={s} floated_late\n",
+            .{ @tagName(view.backend), cid, view.appId(), view.title() },
+        ) catch null;
+        if (line) |l| {
+            defer std.heap.c_allocator.free(l);
+            xw_mod.logToFile(l);
+        }
+        std.log.info("COMMIT float_check backend={s} floated_late", .{@tagName(view.backend)});
     }
 
     // Geometry reconfiguration runs against the ACTIVE row's working set

@@ -294,6 +294,7 @@ pub const Rule = struct {
     border_width: ?i32 = null,
     border_color: ?ColorSpec = null,
     blur: ?bool = null,
+    swallow: ?bool = null,
     float: ?bool = null,
 };
 
@@ -304,6 +305,7 @@ pub const CompiledRule = struct {
     border_width: ?i32,
     border_color: ?Color,
     blur: ?bool,
+    swallow: ?bool,
     float: ?bool,
 };
 
@@ -713,6 +715,7 @@ pub fn compileRules(a: std.mem.Allocator, rules: []const Rule) ![]CompiledRule {
             .border_width = r.border_width,
             .border_color = bc,
             .blur = r.blur,
+            .swallow = r.swallow,
             .float = r.float,
         });
     }

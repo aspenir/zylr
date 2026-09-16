@@ -50,13 +50,22 @@ matching rule's fields take effect. Apply on map and on `reload_config`.
     // Blur only terminals, rounded further, with a fat magenta border.
     .{ .class = "org.wez*", .blur = true, .rounding = 24,
        .border_width = 4, .border_color = "#ff00aa" },
+    // A window only swallows when its process descends from the focused
+    // one (a terminal running a program). Opt a spawned class out with
+    // false if it shouldn't hide its parent.
+    .{ .class = "org.chromium*", .swallow = false },
 ]
 ```
 
 Fields: `class`, `title` (globs), `rounding` (i32), `border_width` (i32),
-`border_color` (color string), `blur` (bool), `float` (bool).
+`border_color` (color string), `blur` (bool), `float` (bool), `swallow` (bool).
 All optional — omit what you don't want to override. `float` only applies at
-map time (reloads keep your manual toggle).
+map time (reloads keep your manual toggle). Transient windows (dialogs,
+splashes, tooltips, utility/menu/notification windows) float automatically
+regardless of rules, like Sway. Swallow applies at map time only:
+a new window whose process descends from the focused window's process (a
+terminal running a program) hides the focused tiled window, takes its slot,
+and hands it back when it closes; `swallow: false` opts a class out.
 
 ## autostart
 
