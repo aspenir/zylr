@@ -812,8 +812,8 @@ pub fn onViewCommit(
     // a parent. Map-time checked once; re-check every commit so such
     // windows still float (mirrors sway's re-evaluation on commit).
     //
-    // XWayland surfaces commit BEFORE mapping, and the pre-map commit
-    // runs commitSurface's tiled branch — which CONFIGURES the X window
+    // XWayland surfaces commit before mapping, and the pre-map commit
+    // runs commitSurface's tiled branch — which configures the X window
     // to the full-width tile slot. A float decided only at map is too
     // late: the window has already been resized full-screen and the float
     // branch never sends a configure, so LO's splash renders at
@@ -840,7 +840,7 @@ pub fn onViewCommit(
         std.log.info("COMMIT float_check backend={s} floated_late", .{@tagName(view.backend)});
     }
 
-    // Geometry reconfiguration runs against the ACTIVE row's working set
+    // Geometry reconfiguration runs against the active row's working set
     // (pileSlot/activeTiledCount read context.views). A parked row's
     // windows keep committing during a row-switch slide (cursor blink,
     // video); reconfiguring them resizes the outgoing row incorrectly
@@ -849,7 +849,14 @@ pub fn onViewCommit(
     if (std.mem.indexOfScalar(*View, view.context.views.items, view) != null) {
         switch (view.backend) {
             .xdg => |t| xdg_mod.commitToplevel(view, t, wlr_surface),
-            .xwayland => |x| xw_mod.commitSurface(view, x, wlr_surface),
+            // The tiled branch of commitSurface configures the X window to
+            // the tile slot. Deciding that on a pre-map commit sizes a
+            // float-type window (splash/dialog) full-screen before map can
+            // float it — and the float branch trusts the client's size, so
+            // it stays full-screen forever. Never touch an unmapped
+            // XWayland window; the window sizes itself at map
+            // (commitSurface runs there for the tiled case).
+            .xwayland => |x| if (view.isMapped()) xw_mod.commitSurface(view, x, wlr_surface),
         }
     }
 
