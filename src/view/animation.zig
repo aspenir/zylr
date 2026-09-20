@@ -275,7 +275,7 @@ pub fn tick(context: *ServerContext) void {
             // Slide complete: retire the outgoing row, restore full
             // opacity, then centre the viewport on the focused window.
             Row.settleTransition(context);
-            if (context.focused_view) |fv| ViewManager.scrollToView(context, fv);
+            if (context.focused_view) |fv| Mirror.scrollToFocused(context, fv);
         } else {
             const clamped = std.math.clamp(curve, 0, 1);
             const dir: f32 = @floatFromInt(t.dir);

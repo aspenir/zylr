@@ -191,6 +191,13 @@ pub fn focusActiveRow(context: *ServerContext) void {
             return;
         }
     }
+    // No history candidate lives on this row (e.g. the row holds only mirror
+    // copies): focus its first tile so keyboard focus actually lands there.
+    var tiles: [128]FocusTile = undefined;
+    if (buildRowTiles(context, &tiles) > 0) {
+        focusTile(context, tiles[0]);
+        return;
+    }
     setFocus(context, .none);
 }
 pub fn setFocus(context: *ServerContext, target: FocusTarget) void {

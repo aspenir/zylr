@@ -12,7 +12,6 @@ const Mirror = @import("../mirror.zig");
 const Row = @import("../row.zig");
 const PileMath = @import("pile_math.zig");
 
-
 /// Insert a newly-created view at `ins` in the active row's working set,
 /// keeping the lockstep tween arrays (indexed by view slot) in sync.
 /// Slots derive from list order, so inserting right after the focused
@@ -131,8 +130,7 @@ pub fn removeView(
     if (view.swallows_host) |host| {
         if (host.is_swallowed and host.isMapped() and host != view) {
             const vrow = Row.rowOf(context, view) orelse return;
-            const varr = if (vrow == context.active_row) &context.views
-                else &context.rows[vrow].?.views;
+            const varr = if (vrow == context.active_row) &context.views else &context.rows[vrow].?.views;
             const ci = if (std.mem.indexOfScalar(*View, varr.items, view)) |ii| ii else varr.items.len;
             host.is_swallowed = false;
             host.scene_tree.node.setEnabled(true);
@@ -643,12 +641,16 @@ pub fn tiledWidth(context: *ServerContext, view: *View) i32 {
 }
 
 /// Number of tiled (mapped, non-floating, non-fullscreen) windows on the
-/// active row.
+/// active row, plus copy-mirror tiles laid out there: a lone window sharing
+/// its row with a copy must shrink like it would for a second window.
 pub fn activeTiledCount(context: *ServerContext) usize {
     var n: usize = 0;
     for (context.views.items) |v| {
         if (!v.isMapped() or v.floating or v.fullscreen) continue;
         n += 1;
+    }
+    for (context.row_mirrors[context.active_row].items) |*m| {
+        if (m.active and !m.is_self) n += 1;
     }
     return n;
 }
@@ -974,13 +976,18 @@ pub fn centerFloating(
 
 /// Center the viewport on an arbitrary tile (e.g. a mirrored copy mirror tile
 /// that isn't a window's home slot): the tile's center lands on the screen
-/// center, matching scrollToView's behaviour for windows. Clamped to 0.
+/// center, matching scrollToView's behaviour for windows. Clamped so the
+/// tile's left edge never slides under a reserved layer-shell strip (e.g.
+/// waybar on the left): a full-width lone mirror would otherwise
+/// self-center its left edge off screen, underneath the bar.
 pub fn scrollToX(context: *ServerContext, x: i32, tile_w: i32) void {
     const output = context.output orelse return;
     var out_w: c_int = 0;
     var out_h: c_int = 0;
     output.effectiveResolution(&out_w, &out_h);
-    context.viewport_target = @max(0, x + @divTrunc(tile_w, 2) - @divTrunc(out_w, 2));
+    const target = x + @divTrunc(tile_w, 2) - @divTrunc(out_w, 2);
+    const max_vp = x - context.usable_area.x - @as(i32, @intCast(context.gaps_out));
+    context.viewport_target = @max(0, @min(target, max_vp));
     context.viewport_anim = @floatFromInt(context.viewport_x);
     context.viewport_from = context.viewport_anim;
     context.viewport_anim_started = context.nowMs();

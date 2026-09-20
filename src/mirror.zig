@@ -121,7 +121,6 @@ pub fn closeFocusedMirrorCopy(context: *ServerContext) bool {
         if (deleteMirrorFromRow(context, view, row)) {
             context.kbd_anchor_slot_x = -1;
             context.kbd_cycle_slot = -1;
-            killIfLastCopyOnHiddenRow(context, view);
             return dissolveCollapse(context, view);
         }
     }
@@ -260,11 +259,9 @@ fn survivingCopy(context: *ServerContext, view: *View) ?SurvivingCopy {
 /// Collapse rule: after a mirror tile was removed, when only ONE mirror tile
 /// remains, dissolve the whole mirror set and turn the source back into a real
 /// window in the survivor's slot - the mirrored window keeps existing instead
-/// of a phantom copy later resurrecting it. `killIfLastCopyOnHiddenRow`
-/// already ran, so a survivor can only be on the active row or an active-row
-/// copy; a lone surviving self-mirror therefore means the source simply flows
-/// at its home slot. Re-focuses the active row so keyboard focus leaves the
-/// removed tile.
+/// of a phantom copy later resurrecting it. A lone surviving self-mirror means
+/// the source simply flows at its home slot. Re-focuses the active row so
+/// keyboard focus leaves the removed tile.
 fn dissolveCollapse(context: *ServerContext, view: *View) bool {
     if (countMirrors(context, view) != 1) {
         FocusManager.focusActiveRow(context);
@@ -302,28 +299,6 @@ fn dissolveCollapse(context: *ServerContext, view: *View) bool {
     }
     FocusManager.focusActiveRow(context);
     return true;
-}
-
-/// After deleting a copy: when the source no longer has ANY mirrors and it
-/// lives on a hidden (parked) row, its real surface would be re-enabled off-
-/// screen — a zombie. Kill it so closing the last copy does close the source.
-/// A source that lives on the active row survives: it reverts to a normal
-/// window (its real surface re-enables in place).
-fn killIfLastCopyOnHiddenRow(context: *ServerContext, view: *View) void {
-    if (hasAnyMirrors(context, view)) return;
-    const home = homeRowOf(context, view) orelse return;
-    if (home != context.active_row) view.sendClose();
-}
-
-/// The row this window lives on (active working set or a parked row).
-fn homeRowOf(context: *ServerContext, view: *View) ?usize {
-    if (std.mem.indexOfScalar(*View, context.views.items, view) != null) return context.active_row;
-    for (context.rows, 0..) |maybe_row, i| {
-        if (maybe_row) |r| {
-            if (std.mem.indexOfScalar(*View, r.views.items, view) != null) return i;
-        }
-    }
-    return null;
 }
 
 /// One scene buffer of the source's real (hidden) scene tree, with its
@@ -668,20 +643,37 @@ pub fn onOutputFrame(context: *ServerContext, now: *const std.posix.timespec) vo
     const now_ns: i128 = @as(i128, now.sec) * std.time.ns_per_s + now.nsec;
     if (now_ns - last_mirror_kick_ns < std.time.ns_per_ms * 7) return;
     last_mirror_kick_ns = now_ns;
-    for (context.views.items) |view| {
-        if (!isHiddenSource(context, view)) continue;
-        const surf = view.surfaceOrNull() orelse continue;
-        surf.sendFrameDone(now);
-        var kick: std.ArrayListUnmanaged(*wlroots.Surface) = .empty;
-        defer kick.deinit(allocator);
-        collectKickSurfaces(&kick, surf);
-        for (context.popups.items) |pn| {
-            if (pn.view != view) continue;
-            collectKickSurfaces(&kick, pn.popup.base.surface);
+    // Hidden sources live wherever their home row parks them (a cross-row
+    // mirror parks its source on the source's own row), so walk the active
+    // working set plus every parked row - a kick loop scoped to the active
+    // row starves cross-row mirrors: the source never repaints the copy.
+    for (0..ServerContext.max_rows) |r| {
+        const views = if (r == context.active_row) blk: {
+            break :blk context.views.items;
+        } else if (context.rows[r]) |*parked| blk: {
+            break :blk parked.views.items;
+        } else continue;
+        for (views) |view| {
+            if (!isHiddenSource(context, view)) continue;
+            kickHiddenSource(context, view, now);
         }
-        for (kick.items) |kf| {
-            if (kf != surf) kf.sendFrameDone(now);
-        }
+    }
+}
+
+/// Send frame-done to one hidden source and every surface in its tree so it
+/// keeps repainting while its real tree is disabled.
+fn kickHiddenSource(context: *ServerContext, view: *View, now: *const std.posix.timespec) void {
+    const surf = view.surfaceOrNull() orelse return;
+    surf.sendFrameDone(now);
+    var kick: std.ArrayListUnmanaged(*wlroots.Surface) = .empty;
+    defer kick.deinit(allocator);
+    collectKickSurfaces(&kick, surf);
+    for (context.popups.items) |pn| {
+        if (pn.view != view) continue;
+        collectKickSurfaces(&kick, pn.popup.base.surface);
+    }
+    for (kick.items) |kf| {
+        if (kf != surf) kf.sendFrameDone(now);
     }
 }
 
@@ -746,6 +738,9 @@ pub fn syncActiveTile(view: *View, cur_x_row: f32, cur_w: f32) void {
 
 /// Animate the active row's lead copies (docked to no window) at the row
 /// start each frame, so they scroll with the viewport like real tiles.
+/// Positions come from the cached slot_x (set by layoutRow, which centres a
+/// row that holds no windows); recomputing from the row start here would
+/// un-centre them every frame.
 pub fn syncLeadTiles(context: *ServerContext) void {
     if (context.active_row >= ServerContext.max_rows) return;
     const vp: i32 = context.viewport_x;
@@ -753,11 +748,10 @@ pub fn syncLeadTiles(context: *ServerContext) void {
     const mirrors = &context.row_mirrors[context.active_row];
     var idxs: [64]usize = undefined;
     const cnt = sortedDocked(context, mirrors, null, &idxs);
-    var x: i32 = context.usable_area.x + context.gaps_out;
     for (idxs[0..cnt]) |i| {
         const m = &mirrors.items[i];
-        m.tree.node.setPosition(x - vp, y);
-        x += renderedWidth(context, m.view) + context.gaps_in;
+        if (m.slot_x == std.math.minInt(i32)) continue;
+        m.tree.node.setPosition(m.slot_x - vp, y);
     }
 }
 
@@ -855,12 +849,37 @@ fn layoutRow(context: *ServerContext, target_row: usize) void {
         if (m.active) m.slot_x = std.math.minInt(i32);
     }
 
-    // Lead copies (docked to no window) sit before the first window.
+    // Lead copies (docked to no window) sit before the first window. When the
+    // row holds no tiled windows the lead copies ARE its whole content: center
+    // the run in the usable area instead of hugging the left edge.
     var lead_idx: [64]usize = undefined;
     const lead_cnt = sortedDocked(context, mirrors, null, &lead_idx);
+    var has_tiled = false;
+    for (views) |view| {
+        if (isTiledCandidate(view)) {
+            has_tiled = true;
+            break;
+        }
+    }
+    const inner_w = context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2));
+    const lone_fill: bool = lead_cnt == 1 and !has_tiled;
+    if (lead_cnt > 0 and !has_tiled) {
+        var run_w: i32 = 0;
+        if (lone_fill) {
+            // A lone mirror on a windowless row fills it like a lone window
+            // would (tiledWidth): full width, not its natural footprint.
+            run_w = inner_w;
+        } else {
+            for (lead_idx[0..lead_cnt], 0..) |i, k| {
+                run_w += renderedWidth(context, mirrors.items[i].view);
+                if (k + 1 < lead_cnt) run_w += @as(i32, @intCast(context.gaps_in));
+            }
+        }
+        x = context.usable_area.x + @as(i32, @intCast(context.gaps_out)) + @max(0, @divTrunc(inner_w - run_w, 2));
+    }
     for (lead_idx[0..lead_cnt]) |i| {
         const m = &mirrors.items[i];
-        const w = renderedWidth(context, m.view);
+        const w = if (lone_fill) inner_w else renderedWidth(context, m.view);
         const h: i32 = if (m.view.slot_h > 0) m.view.slot_h else context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
         placeMirror(context, m, x, y, w, h);
         x += w + context.gaps_in;
@@ -984,13 +1003,19 @@ fn placeMirror(context: *ServerContext, m: *ServerContext.Mirror, x: i32, y: i32
         content_w = @max(1, slot_w - 2 * bw);
         content_h = @max(1, slot_h - 2 * bw);
     } else {
-        // Copy mirror: content-based box (min(surface, geometry) for xdg).
-        content_w = if (sw > 0) sw else @max(1, slot_w - 2 * bw);
-        content_h = if (sh > 0) sh else @max(1, slot_h - 2 * bw);
+        // Copy mirror: the tile box is exactly the caller's slot box (layoutRow
+        // passes the natural footprint for docked copies and the full row
+        // width for a lone mirror filling a windowless row). The fed buffer
+        // scales to fill it via its dest size, like a real window resizing;
+        // using the source's natural surface width here would let a
+        // full-width source overflow the row and cover a docked bar/column.
+        content_w = @max(1, slot_w - 2 * bw);
+        content_h = @max(1, slot_h - 2 * bw);
         box_w = content_w + 2 * bw;
         box_h = content_h + 2 * bw;
     }
     const first_place = m.slot_x == std.math.minInt(i32);
+    const sized = m.slot_w != box_w or m.slot_h != box_h;
     m.slot_x = x;
     m.slot_y = y;
     m.slot_w = box_w;
@@ -1012,6 +1037,15 @@ fn placeMirror(context: *ServerContext, m: *ServerContext.Mirror, x: i32, y: i32
     // to the slot content box.
     if (m.buf_node) |bn| {
         bn.node.setPosition(bw, bw);
+    }
+    // Re-feed the buffer so its dest size tracks the new slot box: without
+    // this a widened tile (lone mirror filling a windowless row) renders its
+    // content at the stale natural width until the source happens to commit
+    // again, leaving the visible content off-centre inside the wide tile.
+    // Only re-feed on a size change so layout passes that just re-place
+    // mirrors at the same box don't re-upload every buffer.
+    if (first_place or (sized and m.view.isMapped())) {
+        feedMirrorTree(m);
     }
     // Border ring via the shared view-border renderer, framed on the tile.
     if (m.border_rect) |br| {
@@ -1049,6 +1083,23 @@ pub fn layoutMirrors(context: *ServerContext, target_row: usize) void {
 /// layout changes no matter which row is active.
 pub fn layoutMirrorsAll(context: *ServerContext) void {
     for (0..ServerContext.max_rows) |row| layoutRow(context, row);
+}
+
+/// Centre the viewport on the focused view's *visible* tile. For ordinary
+/// windows that's the view's home slot. For a mirror source whose copy lives
+/// on the active row and whose home slot may be parked on another row,
+/// centring on the home slot would yank the viewport away from the copy the
+/// user is actually looking at -- so centre on the copy's slot_x instead
+/// (mirrors set slot_x through layoutRow, so it is always current). Falls
+/// through to scrollToView when the view isn't rendered as a copy on the
+/// active row.
+pub fn scrollToFocused(context: *ServerContext, view: *View) void {
+    for (context.row_mirrors[context.active_row].items) |*m| {
+        if (m.view != view or !m.active or m.slot_x == std.math.minInt(i32)) continue;
+        ViewManager.scrollToX(context, m.slot_x, m.slot_w);
+        return;
+    }
+    ViewManager.scrollToView(context, view);
 }
 
 /// A mirror hit translated back into source-surface space, plus the mirror
