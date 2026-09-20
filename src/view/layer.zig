@@ -88,7 +88,7 @@ fn recomputeUsableAreaChanged(context: *ServerContext) bool {
         prev.height != context.usable_area.height;
     if (changed) {
         std.log.debug("usabox: x={d} y={d} w={d} h={d}", .{
-            context.usable_area.x, context.usable_area.y,
+            context.usable_area.x,     context.usable_area.y,
             context.usable_area.width, context.usable_area.height,
         });
     }
@@ -164,6 +164,8 @@ pub fn onLayerSurfaceCommit(
 ) void {
     const layer: *LayerView =
         @fieldParentPtr("commit_listener", listener);
+
+    if (surface.current.committed.buffer) layer.context.markPixelChange();
 
     const layer_surface = layer.layer_surface;
 
@@ -290,7 +292,6 @@ pub fn onLayerSurfaceCommit(
     if (area_changed) {
         ViewManager.updateViewPositions(layer.context);
     }
-
 }
 pub fn onNewLayerSurface(
     listener: *wl.Listener(*wlroots.LayerSurfaceV1),

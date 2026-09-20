@@ -20,6 +20,17 @@ destroyed: bool = false,
 context: *ServerContext,
 last_frame_ns: u64 = 0,
 last_way_commits: u64 = 0,
+/// Client buffer attaches since boot (mirrors ServerContext.buffer_pixel_commits
+/// per-output) and the value at the last real present. Equal while only
+/// damage-only commits have arrived — the latch signal.
+buffer_pixel_commits: u64 = 0,
+presented_buffer_pixel_commits: u64 = 0,
+/// Idle-loop diagnostics (2s window, drop after root-cause): frame events,
+/// damage-backed frames, and per-view commit totals — the numbers that say
+/// whether a client commit storm or a present loop is burning power.
+diag_frames: u32 = 0,
+diag_damaged: u32 = 0,
+diag_last_log_ms: u64 = 0,
 
 pub fn onNewOutput(
     listener: *wl.Listener(*wlroots.Output),
@@ -260,6 +271,33 @@ pub fn onOutputFrame(listener: *wl.Listener(*wlroots.Output), output: *wlroots.O
 
     AnimationManager.tick(context);
 
+    const now_ms = context.nowMs();
+    output_ctx.diag_frames +%= 1;
+    if (output_ctx.scene_output.private.pending_commit_damage.notEmpty()) output_ctx.diag_damaged +%= 1;
+    if (now_ms - output_ctx.diag_last_log_ms >= 2000) {
+        output_ctx.diag_last_log_ms = now_ms;
+        var note: [384]u8 = undefined;
+        var note_len: usize = 0;
+        for (context.views.items) |v| {
+            if (v.commit_count == 0) continue;
+            const tail = std.fmt.bufPrint(
+                note[note_len..],
+                " {s}:{d}",
+                .{ @tagName(v.backend), v.commit_count },
+            ) catch break;
+            note_len += tail.len;
+            v.commit_count = 0;
+        }
+        std.log.info("FRAME DIAG: 2s frames={d} damaged={d} px={d} commits=[{s}]", .{
+            output_ctx.diag_frames,
+            output_ctx.diag_damaged,
+            output_ctx.buffer_pixel_commits,
+            note[0..note_len],
+        });
+        output_ctx.diag_frames = 0;
+        output_ctx.diag_damaged = 0;
+    }
+
     // Stock present path: wlr_scene_output_commit() -> wlr_output_commit_state
     // -> drm_connector_commit, which REFUSES to queue a page flip while one is
     // still pending (single-flip pacing — the behavior of every compositor).
@@ -273,6 +311,8 @@ pub fn onOutputFrame(listener: *wl.Listener(*wlroots.Output), output: *wlroots.O
         std.log.err("Failed to commit scene output", .{});
         return;
     }
+    // (The pixel-budget bookkeeping was reverted with the static latch; the
+    // frame loop is stock-present for this test rig.)
 
     var now: std.c.timespec = undefined;
     _ = clock_gettime(CLOCK_MONOTONIC, &now);

@@ -677,9 +677,18 @@ pub fn commitToplevel(
     const content_w = @max(1, ew - ws.horizontal());
     const content_h = @max(1, eh - ws.vertical());
 
-    const wrong_size = surface.current.width != content_w or surface.current.height != content_h;
+    // Send a new configure only when the target geometry actually changed
+    // from the last one sent. Comparing against the client's committed size
+    // (the old gate) is wrong for tiled windows whose content box differs
+    // from the surface size by the client's own chrome — the client always
+    // "differs", so the identical configure was re-sent every commit and
+    // every ack spawned another commit: a self-sustaining 9k/s ping-pong on
+    // the wire (the Electron idle storm). Track what we announced instead.
+    const size_changed = content_w != view.last_sent_w or content_h != view.last_sent_h;
 
-    if (xdg_toplevel.base.initial_commit or wrong_size) {
+    if (xdg_toplevel.base.initial_commit or size_changed) {
+        view.last_sent_w = content_w;
+        view.last_sent_h = content_h;
         _ = xdg_toplevel.setBounds(content_w, content_h);
         _ = xdg_toplevel.setSize(content_w, content_h);
         _ = xdg_toplevel.setWmCapabilities(.{

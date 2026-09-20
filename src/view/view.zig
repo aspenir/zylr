@@ -141,6 +141,17 @@ border_grad_started: u64 = 0,
 
 map_listener: wl.Listener(void) = undefined,
 unmap_listener: wl.Listener(void) = undefined,
+/// Diag census: commits in the current 2s window (zeroed by the log).
+commit_count: u32 = 0,
+/// Last xdg configure size sent to this toplevel. commitToplevel only
+/// re-sends configure/setBounds/wm_capabilities when the target actually
+/// changes: an Electron toplevel whose committed surface size never equals
+/// the border-adjusted content box would otherwise be re-configured with
+/// the IDENTICAL geometry on every commit, and the ack+commit loop spins
+/// both sides at event-loop speed (~9k configure/ack exchanges per second,
+/// the 1.4W idle storm).
+last_sent_w: i32 = 0,
+last_sent_h: i32 = 0,
 destroy_listener: wl.Listener(void) = undefined,
 commit_listener: wl.Listener(*wlroots.Surface) = undefined,
 new_popup_listener: wl.Listener(*wlroots.XdgPopup) = undefined,
@@ -579,6 +590,11 @@ pub fn onSurfaceUnmap(listener: *wl.Listener(void)) void {
 
     std.log.info("SURFACE UNMAPPED", .{});
 
+    // An unmapped view's region must be repainted once (its spot is now
+    // empty); no client buffer attaches on unmap, so bump the flip budget
+    // explicitly or the frame latch would leave a ghost on screen.
+    view.context.markPixelChange();
+
     view.fading_in = false;
     view.fading_out = false;
     view.scene_tree.node.setEnabled(false);
@@ -796,6 +812,15 @@ pub fn onViewCommit(
 ) void {
     const view: *View =
         @fieldParentPtr("commit_listener", listener);
+
+    view.commit_count +%= 1;
+
+    // A commit that attaches a buffer is the only commit that can change
+    // pixels; damage-only commits (same buffer, stale damage) cannot. The
+    // frame loop keys presents off this so a damage-only commit storm
+    // (idle Electron/Chromium repainting its estimated-vsync loop) is not
+    // answered with a flip + frame_done.
+    if (wlr_surface.current.committed.buffer) view.context.markPixelChange();
 
     // Rules must land before the first commit sizes/configures the
     // toplevel, or a float rule is overridden by a tiled initial

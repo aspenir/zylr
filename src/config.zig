@@ -509,7 +509,7 @@ pub const Config = struct {
     /// Adaptive sync (VRR/Freesync) on the main output. Some laptop panels
     /// flicker under the erratic frame rates caused by bursty pen/mouse
     /// input; set false to force the panel to its fixed refresh rate.
-    vrr: bool = true,
+    vrr: bool = false,
 };
 
 /// The bind set that used to be hardcoded in onKeyboardKey.

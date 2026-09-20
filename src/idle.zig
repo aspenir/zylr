@@ -78,7 +78,9 @@ fn startPoll(self: *Idle, loop: *wl.EventLoop) void {
         onPoll,
         self.context,
     ) catch return;
-    self.poll_source.?.timerUpdate(self.poll_ms) catch |err| { std.log.warn("failed to update idle timer: {}", .{err}); };
+    self.poll_source.?.timerUpdate(self.poll_ms) catch |err| {
+        std.log.warn("failed to update idle timer: {}", .{err});
+    };
 }
 
 pub fn reloadTimers(self: *Idle, context: *ServerContext) void {
@@ -109,6 +111,7 @@ pub fn notifyKeyRelease(self: *Idle) void {
 
 pub fn notifyActivity(self: *Idle) void {
     self.notifier.notifyActivity(self.context.seat);
+    self.context.last_input_ms = self.context.nowMs();
 
     // Wake outputs if they were turned off by idle.
     if (self.outputs_off) {
@@ -178,7 +181,9 @@ fn onPoll(context: *ServerContext) c_int {
     const self = context.idle orelse return 1;
 
     if (self.hasActiveInhibitors()) {
-        self.poll_source.?.timerUpdate(self.poll_ms) catch |err| { std.log.warn("failed to update idle timer: {}", .{err}); };
+        self.poll_source.?.timerUpdate(self.poll_ms) catch |err| {
+            std.log.warn("failed to update idle timer: {}", .{err});
+        };
         return 1;
     }
 
@@ -202,6 +207,8 @@ fn onPoll(context: *ServerContext) c_int {
         }
     }
 
-    self.poll_source.?.timerUpdate(self.poll_ms) catch |err| { std.log.warn("failed to update idle timer: {}", .{err}); };
+    self.poll_source.?.timerUpdate(self.poll_ms) catch |err| {
+        std.log.warn("failed to update idle timer: {}", .{err});
+    };
     return 1;
 }

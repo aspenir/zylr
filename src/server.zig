@@ -207,6 +207,13 @@ vel_x: std.ArrayListUnmanaged(f32) = .empty,
 vel_w: std.ArrayListUnmanaged(f32) = .empty,
 vel_y: std.ArrayListUnmanaged(f32) = .empty,
 animation_active: bool = false,
+/// Monotonic ms of the last input-activity wake (idle.zig notifyActivity);
+/// the frame loop uses it to keep presenting briefly around interaction.
+last_input_ms: u64 = 0,
+/// Number of client wl_buffer attaches since boot — a real-content-change
+/// probe: damage can be spurious (a client re-commits stale damage with no
+/// new buffer), but a buffer attach is never fake.
+buffer_pixel_commits: u64 = 0,
 /// Monotonic ms when the layout tween (swap) was last re-armed.
 layout_anim_started: u64 = 0,
 /// Monotonic ms when the viewport tween (focus) was last re-armed.
@@ -505,6 +512,14 @@ pub fn discardUndoFor(self: *@This(), view: *View) void {
             else => {},
         }
     }
+}
+
+/// A client attached a fresh wl_buffer somewhere — the only authoritative
+/// "the screen content will change" signal. Called from the surface commit
+/// paths; the frame loop compares it against the last-presented count to
+/// skip presents for damage-only commit storms.
+pub fn markPixelChange(self: *@This()) void {
+    for (self.output_contexts.items) |o| o.buffer_pixel_commits +|= 1;
 }
 
 /// Monotonic milliseconds, for bind/gesture repeat cooldowns.
