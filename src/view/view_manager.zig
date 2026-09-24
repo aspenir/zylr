@@ -843,7 +843,10 @@ pub fn updateViewPositionsFrom(context: *ServerContext, start_idx: usize) void {
             view.slot_h = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
         }
 
-        Border.updateViewBorder(view, @floatFromInt(view.x), null);
+        // During an animated resize the ring is pinned to the committed
+        // content in onViewCommit; leave it alone here so it can't jump
+        // ahead of the client's actual size.
+        if (!view.resize_anim) Border.updateViewBorder(view, @floatFromInt(view.x), null);
 
         if (advanceSlotAfter(context, view, i)) {
             x += width + context.gaps_in + Mirror.extraTilesWidth(context, view);
@@ -1204,7 +1207,8 @@ pub fn syncPile(context: *ServerContext, anchor: *View) void {
             const slot = pileSlot(context, v) orelse continue;
             v.slot_h = slot.height;
             const ws = v.borderWidths();
-            v.setSize(@max(1, v.slot_w - ws.horizontal()), @max(1, slot.height - ws.vertical()));
+            // An animated resize lets the tick drive the size instead.
+            if (!v.resize_anim) v.setSize(@max(1, v.slot_w - ws.horizontal()), @max(1, slot.height - ws.vertical()));
         }
     }
     for (context.views.items) |v| {

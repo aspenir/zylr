@@ -30,6 +30,14 @@ destroy_listener: wl.Listener(*wlroots.InputDevice) = undefined,
 // Keybind repeat/cooldown state (see config.keybind_repeat).
 bind_hold_sym: u32 = 0,
 last_fire_ms: u64 = 0,
+// Held-key auto-repeat timer: wlroots only repeats keys to clients
+// (repeat_info), never to the compositor's own listener, so zylr drives
+// bind repeats with its own timer (sway does the same).
+repeat_source: ?*wl.EventSource = null,
+repeat_sym: u32 = 0,
+repeat_mods: u32 = 0,
+repeat_delay_ms: c_int = 600,
+repeat_interval_ms: c_int = 40,
 // xkb_keymap: ?*xkb.Keymap = null,
 fn getKeySym(keyboard: *wlroots.Keyboard, keycode: u32) xkb.Keysym {
     const state = keyboard.xkb_state orelse {
@@ -212,7 +220,9 @@ fn relayoutView(context: *ServerContext, view: *View, start_idx: usize) void {
     ViewManager.updateViewPositionsFrom(context, start_idx);
     const bw: i32 = @intCast(@max(0, context.border_width));
     const w = view.custom_width orelse ViewManager.tiledWidth(context, view);
-    view.setSize(@max(1, w - 2 * bw), @max(1, view.slot_h - 2 * bw));
+    // An animated resize drives the client size from the tick instead, so
+    // repeated steps don't snap the content ahead of the curve.
+    if (!view.resize_anim) view.setSize(@max(1, w - 2 * bw), @max(1, view.slot_h - 2 * bw));
     ViewManager.scrollToViewNoLayout(context, view);
 }
 
@@ -337,14 +347,21 @@ pub fn runAction(
             pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_pile_width = view.pile_width, .prev_floating = view.floating } });
             const base: f32 = @floatFromInt(@max(1, context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2))));
             const step: f32 = base * 0.05;
+            // A window may fill the usable area but never spill past it.
+            const max_w: i32 = @intFromFloat(base);
             if (view.pile_id != 0) {
                 // grow/shrink resizes the WHOLE pile column: every member
                 // shares pile_width, so widen/narrow it for all of them.
                 const cur: f32 = @floatFromInt(view.pile_width orelse ViewManager.tiledWidth(context, view));
                 const new_w: f32 = if (action == .grow) cur + step else cur - step;
-                const w: i32 = @max(200, @as(i32, @intFromFloat(new_w)));
+                const w: i32 = @max(200, @min(max_w, @as(i32, @intFromFloat(new_w))));
                 for (context.views.items) |v| {
-                    if (v.pile_id == view.pile_id) v.pile_width = w;
+                    if (v.pile_id == view.pile_id) {
+                        v.pile_width = w;
+                        // Let the tick drive the content size along the
+                        // animation curve; a repeat just retargets it.
+                        v.resize_anim = true;
+                    }
                 }
                 ViewManager.updateViewPositions(context);
                 ViewManager.syncPile(context, view);
@@ -353,7 +370,9 @@ pub fn runAction(
             }
             const cur: f32 = @floatFromInt(ViewManager.tiledWidth(context, view));
             const new_w: f32 = if (action == .grow) cur + step else cur - step;
-            view.custom_width = @max(200, @as(i32, @intFromFloat(new_w)));
+            const tiled = !view.floating and !view.fullscreen;
+            view.resize_anim = tiled;
+            view.custom_width = @max(200, @min(max_w, @as(i32, @intFromFloat(new_w))));
             const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
             relayoutView(context, view, idx);
         },
@@ -431,6 +450,11 @@ pub fn runAction(
         },
         .toggle_floating => {
             const view = target_view orelse context.focused_view orelse return;
+            // Fullscreen is exclusive: floating a fullscreen window would leave
+            // it half-fullscreen (fs_tween still owns the scene tree). Sway
+            // just no-ops the float toggle while fullscreen; exit fullscreen
+            // first if you really want it floating.
+            if (view.fullscreen) return;
             pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_pile_width = view.pile_width, .prev_floating = view.floating } });
             view.floating = !view.floating;
             view.auto_float_done = true;
@@ -621,14 +645,14 @@ fn dispatchKey(
         if (context.locked and !bind.through_lock) continue;
 
         if (!context.locked) {
-            const rep = context.keybind_repeat;
             const now = context.nowMs();
             const is_hold = keyboard_context.bind_hold_sym == norm_sym;
-            const within_cooldown = rep.cooldown_ms > 0 and
+            // Only binds marked `repeat` auto-repeat while held; the rest
+            // fire once on press and swallow all held-key events.
+            const rep = context.keybind_repeat;
+            const within_cooldown = bind.repeat and rep.cooldown_ms > 0 and
                 (now - keyboard_context.last_fire_ms) < rep.cooldown_ms;
-            // A held key only re-fires if repeats are enabled;
-            // otherwise the first press is the only one.
-            const suppressed = (!rep.enabled and is_hold) or within_cooldown;
+            const suppressed = (!bind.repeat and is_hold) or within_cooldown;
             keyboard_context.bind_hold_sym = norm_sym;
             if (suppressed) return true; // consumed; keep any active submap
             keyboard_context.last_fire_ms = now;
@@ -638,9 +662,71 @@ fn dispatchKey(
         runAction(context, bind.action, bind.args, null);
         // Entering a mode keeps it; any other action ends the mode.
         if (!entering) context.active_submap = null;
+        // Held-key auto-repeat starts here (wlroots doesn't repeat to us).
+        keyboard_context.repeat_sym = norm_sym;
+        keyboard_context.repeat_mods = depressed;
+        if (bind.repeat) armRepeat(keyboard_context);
         return true;
     }
     return false;
+}
+
+/// Re-arm the held-key repeat timer after a bind fires. Uses wlroots'
+/// advertised repeat info (set in input_manager) for delay/rate when the
+/// values are sane; otherwise falls back to the config cooldown.
+fn armRepeat(keyboard_context: *KeyboardContext) void {
+    if (keyboard_context.repeat_source != null) return;
+
+    const rate = keyboard_context.keyboard.repeat_info.rate;
+    const delay = keyboard_context.keyboard.repeat_info.delay;
+    if (rate > 0) {
+        keyboard_context.repeat_delay_ms = @max(delay, 1);
+        keyboard_context.repeat_interval_ms = @intCast(@max(@divTrunc(1000, @as(c_int, rate)), 1));
+    }
+
+    // `delay_ms` in config overrides the OS key-repeat delay (the 600ms
+    // wait before a held bind starts repeating). Default 150ms keeps a tap
+    // a single fire but makes a held resize continuous instead of stalling;
+    // 0 in config keeps the OS value.
+    const cfg_delay = keyboard_context.context.keybind_repeat.delay_ms;
+    if (cfg_delay > 0) keyboard_context.repeat_delay_ms = @intCast(cfg_delay);
+
+    keyboard_context.repeat_source = keyboard_context.context.server.getEventLoop().addTimer(
+        *KeyboardContext,
+        onRepeat,
+        keyboard_context,
+    ) catch return;
+    keyboard_context.repeat_source.?.timerUpdate(keyboard_context.repeat_delay_ms) catch {};
+}
+
+fn cancelRepeat(keyboard_context: *KeyboardContext) void {
+    if (keyboard_context.repeat_source) |src| src.remove();
+    keyboard_context.repeat_source = null;
+    keyboard_context.repeat_sym = 0;
+}
+
+fn onRepeat(keyboard_context: *KeyboardContext) c_int {
+    const context = keyboard_context.context;
+    if (context.locked) {
+        cancelRepeat(keyboard_context);
+        return 0;
+    }
+    // Re-fire the held bind the same way a fresh press would, so the
+    // match/cooldown/through_lock gating all still apply.
+    if (context.active_submap) |name| {
+        if (submapBinds(context, name)) |sbinds| {
+            _ = dispatchKey(keyboard_context, context, sbinds, keyboard_context.repeat_sym, keyboard_context.repeat_mods);
+        }
+    }
+    _ = dispatchKey(
+        keyboard_context,
+        context,
+        context.keybinds,
+        keyboard_context.repeat_sym,
+        keyboard_context.repeat_mods,
+    );
+    keyboard_context.repeat_source.?.timerUpdate(keyboard_context.repeat_interval_ms) catch {};
+    return 0;
 }
 
 pub fn onKeyboardKey(
@@ -668,6 +754,7 @@ pub fn onKeyboardKey(
         const rsym_int: u32 = @intFromEnum(rsym);
         const rnorm: u32 = if (rsym_int >= 'A' and rsym_int <= 'Z') rsym_int + 32 else rsym_int;
         if (keyboard_context.bind_hold_sym == rnorm) keyboard_context.bind_hold_sym = 0;
+        if (keyboard_context.repeat_sym == rnorm) cancelRepeat(keyboard_context);
     }
 
     if (event.state == .pressed) {
@@ -733,6 +820,7 @@ pub fn onKeyboardDestroy(
         @fieldParentPtr("destroy_listener", listener);
 
     const context = keyboard_context.context;
+    cancelRepeat(keyboard_context);
 
     keyboard_context.key_listener.link.remove();
     keyboard_context.modifiers_listener.link.remove();

@@ -96,14 +96,22 @@ default set is in the [README](../README.md); actions in
 `.through_lock = true` still fires while the screen is locked, which is
 how you keep volume and brightness keys alive.
 
-Repeats control how often held binds/gestures re-fire:
+Keybind auto-repeat:
 
 ```ziggy
-.keybind_repeat = .{ .enabled = true, .cooldown_ms = 0 }   # key auto-repeat
-.gesture_repeat = .{ .enabled = false, .cooldown_ms = 0 }  # fire once, on completion
+.keybind_repeat = .{ .cooldown_ms = 0, .delay_ms = 150 }   # cadence for repeatable keybinds
 ```
 
-`cooldown_ms` (0 = none) floors the gap between firings.
+`cooldown_ms` (0 = none) floors the gap between firings. `delay_ms` (default
+150) is how long a held bind waits before its first repeat: short enough for
+a held grow/shrink to keep moving without the OS key-repeat stall, long
+enough that a quick tap is still a single step. 0 uses the OS key-repeat
+delay.
+
+Auto-repeat is **per bind**: a keybind/gesture without `.repeat` fires
+once (on press / on gesture completion); one labelled `.repeat = true`
+keeps firing while the key is held or the gesture continues (a swipe every
+`swipe_min_px`, a pinch every `pinch_scale`, a hold on a fixed interval).
 
 ## gestures
 

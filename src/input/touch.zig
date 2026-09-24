@@ -19,6 +19,9 @@ const TouchContext = @This();
 
 const max_points = 5;
 
+/// Fixed interval between hold repeats (see gesture.zig HOLD_REPEAT_MS).
+const HOLD_REPEAT_MS: c_int = 100;
+
 const Point = struct { id: i32 = -1, x: f64 = 0, y: f64 = 0, down_at: u32 = 0 };
 
 touch: *wlroots.Touch,
@@ -29,6 +32,10 @@ gesture_fingers: u32 = 0, // max simultaneous fingers this gesture
 blip_lifts: u32 = 0, // fingers that tapped & lifted mid-gesture
 swipe_dx: f64 = 0, // centroid displacement in output px
 swipe_dy: f64 = 0,
+/// Sum of per-finger displacement in output px. Unlike the centroid,
+/// this does not cancel outward radial motion, so it tells a pinch
+/// (span change ≈ travel) from a swipe (travel with ~no span change).
+travel_px: f64 = 0,
 swipe_started: bool = false, // a 1-finger flick in progress
 last_cx: f64 = 0,
 last_cy: f64 = 0,
@@ -43,6 +50,7 @@ baselines: [max_points]Point = @splat(.{}),
 pinch_active: bool = false,
 scale_start: f64 = 0, // mean finger distance at pinch start (normalized)
 pinch_fired: bool = false,
+swipe_fired: bool = false,
 hold_pending: bool = false,
 hold_timer: ?*wl.EventSource = null,
 
@@ -143,6 +151,21 @@ fn spanChangePx(self: *TouchContext, ratio: f64) f64 {
     return @abs(ratio - 1) * self.scale_start * self.minDimPx();
 }
 
+/// Pinch vs swipe: the span change is compared against per-finger
+/// travel, because a pure pinch *is* radial travel while a swipe is
+/// translation that hardly changes span. A gesture whose span changed by
+/// at least a quarter of its travel is a pinch. Calibrated against
+/// sim'd trajectories: bunched pinch-outs sit ~0.3, clean swipes ~0.01,
+/// swipes with accidental spread ~0.05.
+fn pinchDominates(span_px: f64, travel_px: f64) bool {
+    return span_px >= travel_px * 0.25;
+}
+
+fn dominantDir(dx: f64, dy: f64) Config.GestureDir {
+    if (@abs(dx) > @abs(dy)) return if (dx < 0) .left else .right;
+    return if (dy < 0) .up else .down;
+}
+
 fn countPoints(self: *TouchContext) u32 {
     var n: u32 = 0;
     for (&self.points) |*p| {
@@ -209,8 +232,16 @@ fn cancelHold(self: *TouchContext) void {
 }
 
 fn onHoldTimer(data: *TouchContext) c_int {
+    const fingers = data.countPoints();
+    _ = GestureContext.fire(data.context, data.device_kind, fingers, .hold, null, null);
+    if (GestureContext.gestureRepeat(data.context, data.device_kind, fingers, .hold, null)) {
+        // Re-arm on a fixed interval while the hold continues. onMotion
+        // still cancels on drift (hold_pending stays true), so a moving
+        // hand stops the repeat like it stops the first hold.
+        if (data.hold_timer) |timer| timer.timerUpdate(HOLD_REPEAT_MS) catch {};
+        return 0;
+    }
     data.hold_pending = false;
-    GestureContext.fire(data.context, data.device_kind, data.countPoints(), .hold, null, null);
     return 0;
 }
 
@@ -360,8 +391,10 @@ pub fn onDown(
             self.pinch_active = true;
             self.scale_start = self.meanDist();
             self.pinch_fired = false;
+            self.swipe_fired = false;
             self.swipe_dx = 0;
             self.swipe_dy = 0;
+            self.travel_px = 0;
             self.last_cx = pos.ox;
             self.last_cy = pos.oy;
         } else {
@@ -369,6 +402,17 @@ pub fn onDown(
             // the finger count that settles (3rd/4th arriving late)
             // defines the pinch, not the interim 2-finger span.
             self.scale_start = self.meanDist();
+            self.swipe_fired = false;
+            // Placing a new finger shifts the centroid, but that jump is
+            // not pan motion — reset the accumulated swipe deltas or a
+            // pure 3+/2-finger pinch reads as a swipe.
+            self.swipe_dx = 0;
+            self.swipe_dy = 0;
+            self.travel_px = 0;
+            const cc = self.centroid();
+            const npos = self.position(cc.x, cc.y);
+            self.last_cx = npos.ox;
+            self.last_cy = npos.oy;
         }
     }
     self.armHold();
@@ -417,34 +461,23 @@ pub fn onUp(
             // a slower drag already moved the window live in onMotion.
             const elapsed = event.time_msec - self.down_time;
             if (elapsed < touch_cfg.flick_max_ms and move_px > threshold) {
-                const dir: ?Config.GestureDir = blk: {
-                    if (@abs(self.swipe_dx) > @abs(self.swipe_dy)) {
-                        break :blk if (self.swipe_dx < 0) .left else .right;
-                    }
-                    break :blk if (self.swipe_dy < 0) .up else .down;
-                };
-                GestureContext.fire(self.context, self.device_kind, 1, .swipe, dir, null);
+                _ = GestureContext.fire(self.context, self.device_kind, 1, .swipe, dominantDir(self.swipe_dx, self.swipe_dy), null);
             }
         } else if (self.pinch_active) {
             // Swipe vs pinch: whichever signal dominates wins. A pinch
             // that stayed below the fire threshold still counts if its
-            // span change dominates centroid motion.
-            if (!self.pinch_fired and (ratio >= touch_cfg.pinch_ratio or ratio <= 1 / touch_cfg.pinch_ratio) and span_px >= move_px) {
-                GestureContext.fire(self.context, self.device_kind, fingers, .pinch, if (ratio > 1) .out else .in, null);
-            } else if (move_px > threshold and move_px > span_px) {
+            // span change dominates the fingers' travel.
+            if (!self.pinch_fired and (ratio >= touch_cfg.pinch_ratio or ratio <= 1 / touch_cfg.pinch_ratio) and pinchDominates(span_px, self.travel_px)) {
+                _ = GestureContext.fire(self.context, self.device_kind, fingers, .pinch, if (ratio > 1) .out else .in, null);
+            } else if (!self.pinch_fired and !self.swipe_fired and move_px > threshold and move_px > span_px) {
                 // Multi-finger swipe that never became a pinch.
-                const dir: ?Config.GestureDir = blk: {
-                    if (@abs(self.swipe_dx) > @abs(self.swipe_dy)) {
-                        break :blk if (self.swipe_dx < 0) .left else .right;
-                    }
-                    break :blk if (self.swipe_dy < 0) .up else .down;
-                };
-                GestureContext.fire(self.context, self.device_kind, fingers, .swipe, dir, null);
+                _ = GestureContext.fire(self.context, self.device_kind, fingers, .swipe, dominantDir(self.swipe_dx, self.swipe_dy), null);
             }
         }
 
         self.pinch_active = false;
         self.swipe_started = false;
+        self.swipe_fired = false;
         self.gesture_fingers = 0;
         self.blip_lifts = 0;
     } else if (remaining >= 1) {
@@ -469,6 +502,13 @@ pub fn onMotion(
 
     if (self.pointIndex(event.touch_id)) |i| {
         const p = &self.points[i];
+        // Per-finger travel in output px, summed. This is the pinch/swipe
+        // discriminator: pure translation makes travel large and span ~0;
+        // a pinch spends most of travel changing the span.
+        self.travel_px += @sqrt(
+            (event.x - p.x) * (event.x - p.x) * self.minDimPx() * self.minDimPx() +
+                (event.y - p.y) * (event.y - p.y) * self.minDimPx() * self.minDimPx(),
+        );
         p.x = event.x;
         p.y = event.y;
 
@@ -523,14 +563,42 @@ pub fn onMotion(
         // A translation must not read as a pinch: only fire when the span
         // change dominates the centroid motion.
         const span_px = self.spanChangePx(ratio);
-        if (span_px >= self.swipeMagPx() and (ratio >= touch_cfg.pinch_ratio or ratio <= 1 / touch_cfg.pinch_ratio)) {
-            if (!self.pinch_fired or self.context.gesture_repeat.enabled) {
-                const rep = self.context.gesture_repeat;
-                const now = self.context.nowMs();
-                if (rep.cooldown_ms == 0 or (now - self.context.last_gesture_fire_ms) >= rep.cooldown_ms) {
+        const is_pinch = !self.swipe_fired and pinchDominates(span_px, self.travel_px) and
+            (ratio >= touch_cfg.pinch_ratio or ratio <= 1 / touch_cfg.pinch_ratio);
+        if (is_pinch) {
+            // fire() owns the cooldown gate; don't pre-check it here or the
+            // timestamp we set is the one fire() then rejects. Repeat only
+            // if this pinch's bind is labelled `repeat`.
+            const dir: Config.GestureDir = if (ratio > 1) .out else .in;
+            const rep = GestureContext.gestureRepeat(self.context, self.device_kind, self.activeFingers(), .pinch, dir);
+            if (!self.pinch_fired or rep) {
+                if (GestureContext.fire(self.context, self.device_kind, self.activeFingers(), .pinch, dir, null)) {
                     self.pinch_fired = true;
-                    self.context.last_gesture_fire_ms = now;
-                    GestureContext.fire(self.context, self.device_kind, self.activeFingers(), .pinch, if (ratio > 1) .out else .in, null);
+                    // Re-baseline the span so each repeat needs fresh
+                    // pinch_ratio growth instead of firing every motion
+                    // event: the fire rate now tracks the hand, not the
+                    // touch report rate.
+                    self.scale_start = self.meanDist();
+                }
+            }
+        } else if (!self.pinch_fired) {
+            // Multi-finger swipe: re-fire every swipe_min_px of travel so a
+            // continued swipe scrubs instead of firing once on lift. Only
+            // once travel clearly beats span, so a developing pinch isn't
+            // mistaken for a swipe before its span crosses the ratio, and
+            // only if this swipe's bind is labelled `repeat`.
+            const step = touch_cfg.swipe_min_px;
+            const mag = self.swipeMagPx();
+            if (mag > step and mag > span_px) {
+                const dir = dominantDir(self.swipe_dx, self.swipe_dy);
+                const rep = GestureContext.gestureRepeat(self.context, self.device_kind, self.activeFingers(), .swipe, dir);
+                if (rep and GestureContext.fire(self.context, self.device_kind, self.activeFingers(), .swipe, dir, null)) {
+                    self.swipe_fired = true;
+                    if (@abs(self.swipe_dx) > @abs(self.swipe_dy)) {
+                        self.swipe_dx -= if (self.swipe_dx < 0) -step else step;
+                    } else {
+                        self.swipe_dy -= if (self.swipe_dy < 0) -step else step;
+                    }
                 }
             }
         }
@@ -560,10 +628,12 @@ pub fn onCancel(
     self.cancelHold();
     self.pinch_active = false;
     self.swipe_started = false;
+    self.swipe_fired = false;
     self.gesture_fingers = 0;
     self.blip_lifts = 0;
     self.swipe_dx = 0;
     self.swipe_dy = 0;
+    self.travel_px = 0;
 }
 
 pub fn onFrame(
@@ -572,4 +642,16 @@ pub fn onFrame(
     const self: *TouchContext = @fieldParentPtr("frame_listener", listener);
 
     self.context.seat.touchNotifyFrame();
+}
+
+test "pinchDominates calibrated for pinch-out" {
+    // Sim'd trajectories (screen min dim 960):
+    // bunched pinch-out span=356 travel=1105 → ~0.32
+    // spread pinch-in   span=128 travel=384  → ~0.33
+    // clean swipe       span=4  travel=586   → ~0.007
+    // swipe+spread      span=31 travel=622   → ~0.05
+    try std.testing.expect(pinchDominates(356, 1105));
+    try std.testing.expect(pinchDominates(128, 384));
+    try std.testing.expect(!pinchDominates(4, 586));
+    try std.testing.expect(!pinchDominates(31, 622));
 }

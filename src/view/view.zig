@@ -97,6 +97,11 @@ scene_buffer_node: ?*wlroots.SceneNode = null,
 animated_x: f32 = 0,
 animated_y: f32 = 0,
 
+/// Grow/shrink in flight: the tick drives the client's size from the
+/// animated width so repeated resize steps (pinch/keybind) render as one
+/// smooth curve instead of snapping to each step. Cleared at settle.
+resize_anim: bool = false,
+
 /// True while this view is hidden inside another window (swallowed).
 is_swallowed: bool = false,
 /// When this window has swallowed the focused view, this is the hidden
@@ -890,7 +895,14 @@ pub fn onViewCommit(
     // Re-sync the border/rounding now that surface.current.width/height
     // have caught up with the client's buffer, so the ring matches the
     // window immediately on resize instead of on the next animation tick.
-    Border.updateViewBorder(view, @floatFromInt(view.x), null);
+    // During an animated resize the ring is pinned to the committed
+    // content (not the spring target) so border and content resize as one
+    // entity instead of the ring running ahead of the client's size.
+    const ring: ?f32 = if (view.resize_anim)
+        @floatFromInt(wlr_surface.current.width + view.borderWidths().horizontal())
+    else
+        null;
+    Border.updateViewBorder(view, @floatFromInt(view.x), ring);
     Blur.updateForView(view);
 }
 

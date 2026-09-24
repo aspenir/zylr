@@ -67,6 +67,9 @@ pub const Bind = struct {
     action: Action,
     args: ?[]const []const u8 = null,
     through_lock: bool = false,
+    /// Re-run this bind while the key is held (auto-repeat). Off by default:
+    /// spawns and other one-shot actions fire once on press.
+    repeat: bool = false,
     /// The submap (mode) this bind belongs to; null = the always-active root
     /// bind set. Submaps are entered by an action=.submap bind (arg = name).
     submap: ?[]const u8 = null,
@@ -88,6 +91,10 @@ pub const GestureBind = struct {
     target: ?GestureTarget = null,
     action: Action,
     args: ?[]const []const u8 = null,
+    /// Re-fire this gesture while it continues: a swipe every
+    /// `swipe_min_px`, a pinch every `pinch_scale`, a hold on a fixed
+    /// interval. Unlabelled gestures fire once, on completion.
+    repeat: bool = false,
 };
 
 pub const GestureTarget = enum { focus, under_gesture };
@@ -137,19 +144,18 @@ pub const GestureConfig = struct {
     touch: TouchGestureConfig = .{},
     trackpad: TrackpadGestureConfig = .{},
     binds: []const GestureBind = &.{},
-    /// Whether a gesture may re-fire while the gesture continues, and
-    /// the minimum gap between consecutive gesture firings. Gestures
-    /// default to firing once per gesture (old behavior).
-    repeat: RepeatConfig = .{ .enabled = false },
 };
 
-/// Re-fire policy for binds and gestures.
+/// Auto-repeat cadence for repeatable keybinds.
 pub const RepeatConfig = struct {
-    /// Keybinds: re-run while the key is held (auto-repeat) and the
-    /// gesture is still going. Default true preserves the old behavior.
-    enabled: bool = true,
     /// Minimum gap between firings, ms. 0 = fire as fast as input allows.
     cooldown_ms: u32 = 0,
+    /// Keybinds: ms before the FIRST repeat after a fire. This is a
+    /// stand-in for the OS key-repeat delay: short enough (default 150ms)
+    /// that a held bind keeps moving instead of doing one step then
+    /// stalling, long enough that a quick tap is still a single fire.
+    /// 0 = the OS key-repeat delay.
+    delay_ms: u32 = 150,
 };
 
 pub const KeyboardConfig = union(enum) {
@@ -546,6 +552,7 @@ pub const CompiledBind = struct {
     action: Action,
     args: []const []const u8 = &.{},
     through_lock: bool = false,
+    repeat: bool = false,
 };
 
 /// A submap compiled the same way as the root binds, looked up by name when
@@ -565,6 +572,7 @@ pub const CompiledGesture = struct {
     target: ?GestureTarget = null,
     action: Action,
     args: []const []const u8 = &.{},
+    repeat: bool = false,
 };
 
 pub const CompiledSwitch = struct {
@@ -784,7 +792,7 @@ fn compileBind(a: std.mem.Allocator, b: Bind) !CompiledBind {
     const args = b.args orelse &.{};
     if (b.action == .spawn and args.len == 0) return error.SpawnWithoutArgs;
     if (b.action == .submap and args.len == 0) return error.SubmapWithoutName;
-    return .{ .mods = pk.mods, .sym = pk.sym, .action = b.action, .args = args, .through_lock = b.through_lock };
+    return .{ .mods = pk.mods, .sym = pk.sym, .action = b.action, .args = args, .through_lock = b.through_lock, .repeat = b.repeat };
 }
 
 /// Compiled root binds plus the submaps grouped out of the same flat list by
@@ -869,6 +877,7 @@ fn compileGestures(a: std.mem.Allocator, binds: []const GestureBind) ![]Compiled
             .target = b.target,
             .action = b.action,
             .args = args,
+            .repeat = b.repeat,
         };
     }
     return out;
@@ -1226,6 +1235,28 @@ test "compileGestures rejects direction/kind mismatches" {
 
 fn expectInvalid(a: std.mem.Allocator, binds: []const GestureBind) !void {
     try std.testing.expectError(error.InvalidGestureDir, compileGestures(a, binds));
+}
+
+test "gesture repeat is per-bind and defaults off" {
+    const doc =
+        \\.{ .fingers = 3, .kind = .swipe, .dir = .left, .action = .focus_right,
+        \\   .repeat = true }
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var meta: ziggy.Deserializer.Meta = .init;
+    const b = try ziggy.deserializeLeaky(GestureBind, a, doc, &meta, .{});
+    try std.testing.expect(b.repeat);
+
+    const compiled = try compileGestures(a, &.{b});
+    try std.testing.expect(compiled[0].repeat);
+
+    // An unlabelled bind compiles with repeat off.
+    const off = try compileGestures(a, &.{.{ .fingers = 4, .kind = .swipe, .dir = .left, .action = .swap_right }});
+    try std.testing.expect(!off[0].repeat);
 }
 
 test "globMatch basic patterns" {

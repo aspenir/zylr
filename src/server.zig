@@ -261,9 +261,6 @@ pulse_dim: f32 = 1.0,
 /// threshold-gated so an idle desktop (ticking for the breathe alone)
 /// skips identical frames.
 pulse_last_dim: f32 = 1.0,
-/// Blur is currently active (not relaxed): idle-relax drops the global
-/// blur passes/radius to 0 and restores them when animation resumes.
-blur_active: bool = true,
 /// View currently under the cursor (drives the hover ring).
 hovered_view: ?*View = null,
 /// Corner radius (logical px) for rounded window corners; 0 disables.
@@ -396,9 +393,7 @@ session_lock: ?*@import("session_lock.zig").SessionLock = null,
 /// Raw config (kept for idle timers and reload).
 cfg: @import("config.zig").Config = .{},
 keybind_repeat: Config.RepeatConfig = .{},
-gesture_repeat: Config.RepeatConfig = .{},
 /// Monotonic-ms stamp of the last gesture firing, for cooldowns.
-last_gesture_fire_ms: u64 = 0,
 
 seat: *wlroots.Seat,
 
@@ -492,7 +487,6 @@ pub fn applyConfig(self: *@This(), loaded: Config.Loaded) void {
     self.view_width_ratio = loaded.cfg.width_ratio;
     self.view_scale = loaded.cfg.scale;
     self.keybind_repeat = loaded.cfg.keybind_repeat;
-    self.gesture_repeat = loaded.cfg.gestures.repeat;
 }
 
 /// Drop undo snapshots referencing `view` before it is freed, so undo

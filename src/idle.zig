@@ -194,6 +194,10 @@ fn onPoll(context: *ServerContext) c_int {
         self.timers[i].remaining -|= 1;
         any_running = true;
         if (self.timers[i].remaining == 0) {
+            // Skip firing while the session is locked: the lock screen is
+            // already up, so a lock_command (e.g. swaylock) would spawn a
+            // second instance that only logs "already locked".
+            if (context.locked) continue;
             std.log.info("idle: running '{s}'", .{self.timers[i].command});
             Spawner.launchProgram(
                 context,

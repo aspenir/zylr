@@ -430,13 +430,23 @@ pub fn tick(context: *ServerContext) void {
     // Lead copies (docked to no window) ride at the row start.
     Mirror.syncLeadTiles(context);
     slot_x += @floatFromInt(Mirror.leadWidth(context));
+    // A grow/shrink moves every following window. Springing each one toward
+    // a moving target lets it lag, so the gap breathes; from the resizing
+    // window onward, track the animated widths rigidly instead and the
+    // inter-window gap stays exact for the whole motion.
+    var resize_rigid = false;
     for (context.views.items, 0..) |view, i| {
         if (!view.isMapped() or view.floating or view.fullscreen) continue;
 
+        if (view.resize_anim) resize_rigid = true;
         const target_x = slot_x;
         var current: f32 = undefined;
         var x_moving: bool = undefined;
-        switch (context.cfg.animation.swap.easing) {
+        if (resize_rigid) {
+            current = target_x;
+            x_moving = false;
+            context.vel_x.items[i] = 0;
+        } else switch (context.cfg.animation.swap.easing) {
             .spring => |sp| {
                 current = springStep(context.animation_x.items[i], &context.vel_x.items[i], sp.stiffness, sp.damping, spring_dt, target_x, 0.5, 0.1);
                 x_moving = springMoving(current, context.vel_x.items[i], target_x, 0.5, 0.1);
@@ -477,8 +487,23 @@ pub fn tick(context: *ServerContext) void {
         // active tiled flow so they scroll and animate like real tiles.
         Mirror.syncActiveTile(view, current, w_items[i]);
 
+        // Grow/shrink: drive the client's size from the animated width so
+        // repeated resize steps (pinch/keybind) render as one smooth curve
+        // instead of snapping to each step. At settle the spring lands on
+        // the target and the flag clears.
+        if (view.resize_anim and i < w_moving.len) {
+            const aw: i32 = @intFromFloat(@round(w_items[i]));
+            const ws = view.borderWidths();
+            view.slot_w = aw;
+            view.setSize(@max(1, aw - ws.horizontal()), @max(1, view.slot_h - ws.vertical()));
+            if (!w_moving[i]) view.resize_anim = false;
+        }
+
         // Views past the 64-wide target buffer have no w_moving entry.
-        if (x_moving or (i < w_moving.len and w_moving[i])) {
+        // During an animated resize the ring is pinned to the committed
+        // content in onViewCommit, so skip the spring-driven ring here to
+        // keep border and content locked together.
+        if (!view.resize_anim and (x_moving or (i < w_moving.len and w_moving[i]))) {
             Border.updateViewBorder(view, current, w_items[i]);
         }
 
@@ -570,8 +595,4 @@ pub fn tick(context: *ServerContext) void {
     }
 
     context.animation_active = still_animating;
-
-    // With animations settled and the pulse frame-synced, nothing forces
-    // output frames: relax the GPU (drop blur) and let the output sleep.
-    Blur.setActive(context, context.animation_active);
 }

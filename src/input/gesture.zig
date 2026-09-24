@@ -37,6 +37,12 @@ fingers: u32 = 0,
 dx: f64 = 0,
 dy: f64 = 0,
 scale: f64 = 1,
+/// A repeat fired during the current gesture, so the end-of-gesture
+/// dispatch is skipped (otherwise a scrub would fire once more on lift).
+swipe_fired: bool = false,
+pinch_fired: bool = false,
+hold_fired: bool = false,
+hold_timer: ?*wl.EventSource = null,
 
 /// Set once deinit() runs. onDeviceDestroy and the shutdown loop both call
 /// into teardown; without this guard a context freed at runtime could be
@@ -77,6 +83,12 @@ pub fn init(
     self.hold_begin_listener = .init(onHoldBegin);
     self.hold_end_listener = .init(onHoldEnd);
     self.device_destroy_listener = .init(onDeviceDestroy);
+
+    self.hold_timer = context.server.getEventLoop().addTimer(
+        *GestureContext,
+        onHoldTimer,
+        self,
+    ) catch null;
 
     pointer.events.swipe_begin.add(&self.swipe_begin_listener);
     pointer.events.swipe_update.add(&self.swipe_update_listener);
@@ -133,6 +145,7 @@ pub fn deinit(self: *GestureContext) void {
         &self.hold_end_listener,
         &self.device_destroy_listener,
     }) |l| l.link.remove();
+    if (self.hold_timer) |timer| timer.remove();
 
     std.heap.c_allocator.destroy(self);
 }
@@ -166,13 +179,22 @@ pub fn fire(
     kind: Config.GestureKind,
     dir: ?Config.GestureDir,
     target_view: ?*View,
-) void {
-    // Cooldown between consecutive firings (config.gesture_repeat).
-    if (context.gesture_repeat.cooldown_ms > 0) {
-        const now = context.nowMs();
-        if (now - context.last_gesture_fire_ms < context.gesture_repeat.cooldown_ms) return;
-        context.last_gesture_fire_ms = now;
-    }
+) bool {
+    const g = matchGesture(
+        context.gestures,
+        fingers,
+        kind,
+        dir,
+        device_kind,
+    ) orelse {
+        std.log.info("gesture: {d}-finger {s} dir={any} dev={s} matched=false", .{
+            fingers,
+            @tagName(kind),
+            if (dir) |d| @tagName(d) else "any",
+            @tagName(device_kind),
+        });
+        return false;
+    };
 
     std.log.info("gesture: {d}-finger {s} dir={any} dev={s}", .{
         fingers,
@@ -181,23 +203,56 @@ pub fn fire(
         @tagName(device_kind),
     });
 
-    const g = matchGesture(
-        context.gestures,
-        fingers,
-        kind,
-        dir,
-        device_kind,
-    ) orelse return;
     const tv: ?*View = if (g.target == .under_gesture) target_view else null;
     KeyboardContext.runAction(context, g.action, g.args, tv);
+    return true;
+}
+
+/// Whether the bind this gesture would fire is labelled `repeat`, so a
+/// caller can decide whether to keep re-firing while the gesture continues.
+pub fn gestureRepeat(
+    context: *ServerContext,
+    device_kind: Config.GestureDevice,
+    fingers: u32,
+    kind: Config.GestureKind,
+    dir: ?Config.GestureDir,
+) bool {
+    const g = matchGesture(context.gestures, fingers, kind, dir, device_kind) orelse
+        return false;
+    return g.repeat;
 }
 
 fn dispatch(
     self: *GestureContext,
     kind: Config.GestureKind,
     dir: ?Config.GestureDir,
-) void {
-    fire(self.context, self.device_kind, self.fingers, kind, dir, viewAtCursor(self.context));
+) bool {
+    return fire(self.context, self.device_kind, self.fingers, kind, dir, viewAtCursor(self.context));
+}
+
+fn dominantDir(dx: f64, dy: f64) Config.GestureDir {
+    if (@abs(dx) > @abs(dy)) return if (dx < 0) .left else .right;
+    return if (dy < 0) .up else .down;
+}
+
+/// Fixed interval between hold repeats. libinput emits no updates during
+/// a hold, so the timer is the only repeat driver here.
+const HOLD_REPEAT_MS: c_int = 100;
+
+fn holdRepeat(self: *GestureContext) bool {
+    return gestureRepeat(self.context, self.device_kind, self.fingers, .hold, null);
+}
+
+fn armHoldRepeat(self: *GestureContext) void {
+    if (self.hold_timer) |timer| timer.timerUpdate(HOLD_REPEAT_MS) catch {};
+}
+
+fn onHoldTimer(data: *GestureContext) c_int {
+    _ = data.dispatch(.hold, null);
+    data.hold_fired = true;
+    // Re-arm while the hold continues; onHoldEnd cancels it.
+    if (data.holdRepeat()) data.armHoldRepeat();
+    return 0;
 }
 
 fn viewAtCursor(context: *ServerContext) ?*View {
@@ -219,6 +274,7 @@ fn onSwipeBegin(
     self.fingers = event.fingers;
     self.dx = 0;
     self.dy = 0;
+    self.swipe_fired = false;
 
     self.context.pointer_gestures.sendSwipeBegin(
         self.context.seat,
@@ -242,6 +298,23 @@ fn onSwipeUpdate(
 
     self.dx += event.dx;
     self.dy += event.dy;
+
+    // Repeat: re-fire every swipe_min_px of travel so a continued swipe
+    // scrubs instead of firing once on lift. Only binds labelled `repeat`;
+    // `swipe_fired` just stops the end-of-gesture dispatch double-firing.
+    const step = self.context.cfg.gestures.trackpad.swipe_min_px;
+    if (@sqrt(self.dx * self.dx + self.dy * self.dy) > step) {
+        const dir = dominantDir(self.dx, self.dy);
+        const rep = gestureRepeat(self.context, self.device_kind, self.fingers, .swipe, dir);
+        if ((!self.swipe_fired or rep) and self.dispatch(.swipe, dir)) {
+            self.swipe_fired = true;
+            if (@abs(self.dx) > @abs(self.dy)) {
+                self.dx -= if (self.dx < 0) -step else step;
+            } else {
+                self.dy -= if (self.dy < 0) -step else step;
+            }
+        }
+    }
 }
 
 fn onSwipeEnd(
@@ -255,14 +328,11 @@ fn onSwipeEnd(
     const dir: ?Config.GestureDir = blk: {
         const threshold = self.context.cfg.gestures.trackpad.swipe_min_px;
         if (@abs(self.dx) > threshold or @abs(self.dy) > threshold) {
-            if (@abs(self.dx) > @abs(self.dy)) {
-                break :blk if (self.dx < 0) .left else .right;
-            }
-            break :blk if (self.dy < 0) .up else .down;
+            break :blk dominantDir(self.dx, self.dy);
         }
         break :blk null;
     };
-    if (!event.cancelled) self.dispatch(.swipe, dir);
+    if (!event.cancelled and !self.swipe_fired) _ = self.dispatch(.swipe, dir);
 
     self.context.pointer_gestures.sendSwipeEnd(
         self.context.seat,
@@ -279,6 +349,7 @@ fn onPinchBegin(
 
     self.fingers = event.fingers;
     self.scale = 1;
+    self.pinch_fired = false;
 
     self.context.pointer_gestures.sendPinchBegin(
         self.context.seat,
@@ -303,6 +374,24 @@ fn onPinchUpdate(
     );
 
     self.scale *= event.scale;
+
+    // Repeat: re-fire each time the cumulative scale crosses pinch_scale,
+    // then re-baseline so the next crossing fires again. Only binds
+    // labelled `repeat`; `pinch_fired` just stops the end dispatch.
+    const threshold = self.context.cfg.gestures.trackpad.pinch_scale;
+    const dir: ?Config.GestureDir = if (self.scale > 1 + threshold)
+        .out
+    else if (self.scale < 1 - threshold)
+        .in
+    else
+        null;
+    if (dir) |d| {
+        const rep = gestureRepeat(self.context, self.device_kind, self.fingers, .pinch, d);
+        if ((!self.pinch_fired or rep) and self.dispatch(.pinch, d)) {
+            self.pinch_fired = true;
+            self.scale = 1;
+        }
+    }
 }
 
 fn onPinchEnd(
@@ -317,7 +406,7 @@ fn onPinchEnd(
         if (self.scale < 1 - threshold) break :blk .in;
         break :blk null;
     };
-    if (!event.cancelled) self.dispatch(.pinch, dir);
+    if (!event.cancelled and !self.pinch_fired) _ = self.dispatch(.pinch, dir);
 
     self.context.pointer_gestures.sendPinchEnd(
         self.context.seat,
@@ -333,6 +422,11 @@ fn onHoldBegin(
     const self: *GestureContext = @fieldParentPtr("hold_begin_listener", listener);
 
     self.fingers = event.fingers;
+    self.hold_fired = false;
+    // Repeat holds on a timer: libinput emits no updates while a hold
+    // is active, so there is nothing else to drive the re-fire. Only
+    // binds labelled `repeat`.
+    if (self.holdRepeat()) self.armHoldRepeat();
 
     self.context.pointer_gestures.sendHoldBegin(
         self.context.seat,
@@ -347,7 +441,9 @@ fn onHoldEnd(
 ) void {
     const self: *GestureContext = @fieldParentPtr("hold_end_listener", listener);
 
-    if (!event.cancelled) self.dispatch(.hold, null);
+    if (self.hold_timer) |timer| timer.timerUpdate(0) catch {};
+    // Short hold that ended before the first repeat tick still fires once.
+    if (!event.cancelled and !self.hold_fired) _ = self.dispatch(.hold, null);
 
     self.context.pointer_gestures.sendHoldEnd(
         self.context.seat,
