@@ -215,7 +215,7 @@ pub fn moveViewToSlot(
     view: *View,
     x: f64,
 ) void {
-    var slot_x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    var slot_x: i32 = context.usable_area.x + context.gaps.left + Mirror.leadWidth(context);
     var target_index: ?usize = null;
 
     for (context.views.items, 0..) |candidate, i| {
@@ -277,7 +277,7 @@ pub fn moveViewToSlot(
 /// and a ghost rect marks the slot — and remember it on `context.drag_preview`
 /// so commitDragPreview can realize the drop on release.
 pub fn updateDragPreview(context: *ServerContext, view: *View, x: f64, y: f64) void {
-    var slot_x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    var slot_x: i32 = context.usable_area.x + context.gaps.left + Mirror.leadWidth(context);
     var target_index: ?usize = null;
     var gutter_before: ?usize = null; // list index where a gutter starts
     for (context.views.items, 0..) |candidate, i| {
@@ -375,7 +375,7 @@ fn positionDragGhost(context: *ServerContext, anchor: *View) void {
     };
 
     // Column x of the ghost slot == the anchor's slot x.
-    var slot_x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    var slot_x: i32 = context.usable_area.x + context.gaps.left + Mirror.leadWidth(context);
     var found = false;
     for (context.views.items, 0..) |candidate, i| {
         if (!candidate.isMapped() or candidate.floating) continue;
@@ -390,8 +390,8 @@ fn positionDragGhost(context: *ServerContext, anchor: *View) void {
     }
     if (!found) return;
 
-    const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
-    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps_out));
+    const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
+    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps.top));
     const gap: i32 = @intCast(context.gaps_in);
 
     var top: i32 = col_top;
@@ -439,7 +439,7 @@ fn positionGutterGhost(context: *ServerContext, view: *View, target: usize) void
         break :blk rect;
     };
 
-    var x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    var x: i32 = context.usable_area.x + context.gaps.left + Mirror.leadWidth(context);
     for (context.views.items, 0..) |candidate, i| {
         if (i >= target) break;
         if (candidate == view or !candidate.isMapped() or candidate.floating) continue;
@@ -448,8 +448,8 @@ fn positionGutterGhost(context: *ServerContext, view: *View, target: usize) void
         }
     }
 
-    const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
-    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps_out));
+    const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
+    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps.top));
     const w = tiledWidth(context, view);
 
     ghost.node.setPosition(x, col_top);
@@ -635,7 +635,7 @@ pub fn getViewWidth(view: *View) i32 {
 /// its copies over their neighbours there.
 pub fn tiledWidth(context: *ServerContext, view: *View) i32 {
     if (!view.floating and !view.fullscreen and activeTiledCount(context) == 1) {
-        return context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2));
+        return context.usable_area.width - @as(c_int, @intCast(context.gaps.insetX()));
     }
     return getViewWidth(view);
 }
@@ -675,8 +675,8 @@ pub fn pileSlotRaw(context: *ServerContext, view: *View) ?PileSlot {
 }
 
 fn pileSlotAt(context: *ServerContext, view: *View, with_preview: bool) ?PileSlot {
-    const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
-    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps_out));
+    const inner_h = context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
+    const col_top = context.usable_area.y + @as(c_int, @intCast(context.gaps.top));
     const gap: i32 = @intCast(context.gaps_in);
 
     // Drag-preview phantom for a LONE column: not a pile, but while a tiled
@@ -787,7 +787,7 @@ pub fn updateViewPositions(context: *ServerContext) void {
 /// pending configure. Send each surface an explicit frame-done so idle clients
 /// repaint at the new size too.
 pub fn refreshTiledSizes(context: *ServerContext) void {
-    const eh = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+    const eh = context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
     var now: std.c.timespec = undefined;
     _ = clock_gettime(CLOCK_MONOTONIC, &now);
 
@@ -817,7 +817,7 @@ const CLOCK_MONOTONIC: c_int = 1;
 /// (scene-graph mutations) for views that didn't move.
 pub fn updateViewPositionsFrom(context: *ServerContext, start_idx: usize) void {
     // Row-lead copies (dock_view == null) push the first window right.
-    var x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    var x: i32 = context.usable_area.x + context.gaps.left + Mirror.leadWidth(context);
 
     // Fast-forward x past the unchanged prefix.
     for (0..start_idx) |i| {
@@ -839,8 +839,8 @@ pub fn updateViewPositionsFrom(context: *ServerContext, start_idx: usize) void {
             view.y = ps.top;
             view.slot_h = ps.height;
         } else {
-            view.y = context.usable_area.y + context.gaps_out;
-            view.slot_h = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+            view.y = context.usable_area.y + context.gaps.top;
+            view.slot_h = context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
         }
 
         // During an animated resize the ring is pinned to the committed
@@ -876,7 +876,7 @@ pub fn updateViewPositionsFrom(context: *ServerContext, start_idx: usize) void {
 /// lerp. Used while interactively resizing so the layout tracks the
 /// cursor instead of rubber-banding behind it.
 pub fn layoutViews(context: *ServerContext) void {
-    var x: i32 = context.usable_area.x + context.gaps_out + Mirror.leadWidth(context);
+    var x: i32 = context.usable_area.x + context.gaps.left + Mirror.leadWidth(context);
 
     for (context.views.items, 0..) |view, i| {
         if (!view.isMapped() or view.floating or view.fullscreen) continue;
@@ -888,7 +888,7 @@ pub fn layoutViews(context: *ServerContext) void {
             view.y = ps.top;
             view.slot_h = ps.height;
         } else {
-            view.y = context.usable_area.y + context.gaps_out;
+            view.y = context.usable_area.y + context.gaps.top;
         }
 
         view.scene_tree.node.setPosition(
@@ -989,7 +989,7 @@ pub fn scrollToX(context: *ServerContext, x: i32, tile_w: i32) void {
     var out_h: c_int = 0;
     output.effectiveResolution(&out_w, &out_h);
     const target = x + @divTrunc(tile_w, 2) - @divTrunc(out_w, 2);
-    const max_vp = x - context.usable_area.x - @as(i32, @intCast(context.gaps_out));
+    const max_vp = x - context.usable_area.x - @as(i32, @intCast(context.gaps.left));
     context.viewport_target = @max(0, @min(target, max_vp));
     context.viewport_anim = @floatFromInt(context.viewport_x);
     context.viewport_from = context.viewport_anim;
@@ -1023,7 +1023,7 @@ pub fn scrollToViewNoLayout(
     // full-width tile would otherwise self-center its left edge off
     // screen, underneath the bar. At the limit the tile sits flush at
     // the usable left edge instead.
-    const max_vp = view.x - context.usable_area.x - @as(i32, @intCast(context.gaps_out));
+    const max_vp = view.x - context.usable_area.x - @as(i32, @intCast(context.gaps.left));
 
     context.viewport_target = @max(0, @min(target, max_vp));
     context.viewport_from = @floatFromInt(context.viewport_x);

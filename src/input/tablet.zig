@@ -38,7 +38,6 @@ const SMOOTH_MAX_STEP: f64 = 0.18;
 const PRED_ALPHA: f64 = 0.6;
 const PRED_LAG: f64 = 2.0;
 
-
 /// True when a single axis of this report collapsed to ~0 while arriving
 /// from far away. A real pen reaches an edge by small steps and rests
 /// there, so this signature uniquely marks phantom contact samples (the
@@ -317,6 +316,12 @@ pub fn onTip(
 
     if (event.state == .down) {
         self.tip_down = true;
+        // The position anchor stays (the pen is already there), but the
+        // prediction velocity must not: hover reports feed the same EMA, so
+        // a stroke begun right after moving the pen would start by
+        // predicting along that hover motion and kick at the nib.
+        self.vx = 0;
+        self.vy = 0;
         wlroots.TabletV2TabletTool.notifyDown(tool);
     } else {
         self.tip_down = false;

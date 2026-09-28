@@ -291,6 +291,45 @@ pub const DecorationsConfig = struct {
 pub const WindowsConfig = struct {
     gaps_out: i32 = 16,
     gaps_in: i32 = 8,
+    /// Per-side outer gaps. A null side follows `gaps_out`, so leaving this
+    /// out keeps today's behaviour; set only the side you want different
+    /// (a bigger `top` under a bar is the usual case).
+    sides: SideGaps = .{},
+};
+
+pub const SideGaps = struct {
+    top: ?i32 = null,
+    right: ?i32 = null,
+    bottom: ?i32 = null,
+    left: ?i32 = null,
+
+    /// Fill every unset side from `gaps_out`. Pure, so the layout maths can
+    /// be tested without a server.
+    pub fn resolve(self: SideGaps, gaps_out: i32) Gaps {
+        return .{
+            .top = self.top orelse gaps_out,
+            .right = self.right orelse gaps_out,
+            .bottom = self.bottom orelse gaps_out,
+            .left = self.left orelse gaps_out,
+        };
+    }
+};
+
+/// Resolved outer gaps. `insetX`/`insetY` exist so a layout site never adds a
+/// pair itself: doing that by hand is how a height budget ends up subtracting
+/// left+right, which is invisible until the gaps are asymmetric.
+pub const Gaps = struct {
+    top: i32,
+    right: i32,
+    bottom: i32,
+    left: i32,
+
+    pub fn insetX(self: Gaps) i32 {
+        return self.left + self.right;
+    }
+    pub fn insetY(self: Gaps) i32 {
+        return self.top + self.bottom;
+    }
 };
 
 pub const Rule = struct {
@@ -466,6 +505,11 @@ pub const AnimationSpec = struct {
 
 /// Per-animation timing. Each animation type has its own easing + duration.
 pub const AnimationConfig = struct {
+    /// Master switch. When false every transition below still runs, but
+    /// completes in a single frame - windows land where they belong with no
+    /// slide or fade. Cheaper on the GPU, and kinder to panels that flicker
+    /// under fast changes (see `.vrr` for the other half of that).
+    enabled: bool = true,
     /// Row-switch slide/fade.
     row: AnimationSpec = .{ .ms = 220 },
     /// Tile x/y/w slide when windows swap or the layout reflows.
@@ -500,13 +544,29 @@ pub const Config = struct {
     /// Give keyboard focus to the view under the pointer on hover
     /// (focus-follows-mouse) instead of only on click.
     focus_follows_mouse: bool = false,
+    /// Milliseconds the pointer must rest on a view before hover focus
+    /// moves to it. 0 focuses immediately. Stops a pointer sweep across
+    /// the screen from stealing focus window by window.
+    focus_follows_mouse_delay_ms: u32 = 0,
+    /// Flip wheel/trackpad scroll so it follows the finger instead of
+    /// spinning the wheel. Applied to the axis events forwarded to
+    /// clients, so it affects every app rather than zylr's own bindings.
+    natural_scroll: bool = false,
     /// Run this command when the system is about to suspend (logind
     /// PrepareForSleep), typically a lock screen. Empty disables.
     lock_command: []const []const u8 = &.{},
+    /// Run this command when a client rings the system bell
+    /// (xdg-system-bell-v1, e.g. a terminal bell). The ringing window, when
+    /// the client named one, arrives as $ZYLR_BELL_APP_ID and
+    /// $ZYLR_BELL_TITLE. Empty ignores bells.
+    bell_command: []const []const u8 = &.{},
 
     // New views take a fraction of the output width; zylr's tiling has no
     // absolute default width because it is output-relative.
     width_ratio: f32 = 0.6,
+    /// Names for the rows, as ext-workspace-v1 reports them. Empty means
+    /// "1".."8". Short or missing entries fall back to the number.
+    workspace_names: []const []const u8 = &.{},
     /// Screen rotation for the primary output. `.normal`, `.90`, `.180`,
     /// `.270` are clockwise steps; reload applies the change live.
     transform: Transform = .normal,
@@ -517,6 +577,7 @@ pub const Config = struct {
     /// input; set false to force the panel to its fixed refresh rate.
     vrr: bool = false,
 };
+
 
 /// The bind set that used to be hardcoded in onKeyboardKey.
 const default_keybinds = [_]Bind{
@@ -927,10 +988,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, log_missing: bool) Loaded {
             cfg = parsed;
         } else |err| {
             const off = @min(meta.error_loc.start, src.len);
-            var line: usize = 1;
-            for (src[0..off]) |c| {
-                if (c == '\n') line += 1;
-            }
+            const line = errorLine(src, off);
             if (err == error.MissingField) {
                 std.log.err("config: line {d}: missing field '{s}', using defaults", .{ line, meta.missing_field_name });
             } else if (err == error.UnknownField) {
@@ -1055,6 +1113,44 @@ fn fallback(loaded: Loaded) Loaded {
     return loaded;
 }
 
+/// 1-based line of `off` within the config source.
+fn errorLine(src: []const u8, off: usize) usize {
+    var line: usize = 1;
+    for (src[0..@min(off, src.len)]) |c| {
+        if (c == '\n') line += 1;
+    }
+    return line;
+}
+
+/// Parse the config the way load does, but report to stderr and say whether
+/// it was valid. Backs `zylr --check-config`, so a typo is caught without
+/// starting a session - load() itself only logs and falls back to defaults.
+pub fn check(io: std.Io, a: std.mem.Allocator) bool {
+    const src = readConfigFile(io, a) orelse {
+        std.debug.print("no config.ziggy found; defaults would be used\n", .{});
+        return true;
+    };
+    defer a.free(src);
+
+    var meta: ziggy.Deserializer.Meta = .init;
+    if (ziggy.deserializeLeaky(Config, a, src, &meta, .{})) |_| {
+        std.debug.print("config.ziggy: ok\n", .{});
+        return true;
+    } else |err| {
+        const off = @min(meta.error_loc.start, src.len);
+        const line = errorLine(src, off);
+        if (err == error.MissingField) {
+            std.debug.print("config.ziggy: line {d}: missing field '{s}'\n", .{ line, meta.missing_field_name });
+        } else if (err == error.UnknownField) {
+            const e = @min(src.len, off + 20);
+            std.debug.print("config.ziggy: line {d}: unknown field near '{s}'\n", .{ line, src[off..e] });
+        } else {
+            std.debug.print("config.ziggy: line {d}: {s}\n", .{ line, @errorName(err) });
+        }
+        return false;
+    }
+}
+
 fn readConfigFile(io: std.Io, a: std.mem.Allocator) ?[:0]u8 {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = blk: {
@@ -1067,6 +1163,40 @@ fn readConfigFile(io: std.Io, a: std.mem.Allocator) ?[:0]u8 {
     const raw = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch return null;
     defer a.free(raw);
     return dupeZ(a, raw) catch null;
+}
+
+test "side gaps: unset sides follow gaps_out, pairs stay on their axis" {
+    // The all-defaults case must be identical to the old single gaps_out.
+    const uniform = (SideGaps{}).resolve(16);
+    try std.testing.expectEqual(@as(i32, 16), uniform.top);
+    try std.testing.expectEqual(@as(i32, 16), uniform.right);
+    try std.testing.expectEqual(@as(i32, 16), uniform.bottom);
+    try std.testing.expectEqual(@as(i32, 16), uniform.left);
+    try std.testing.expectEqual(@as(i32, 32), uniform.insetX());
+    try std.testing.expectEqual(@as(i32, 32), uniform.insetY());
+
+    // One side set (the usual "bigger top gap under a bar") leaves the rest.
+    const top_only = (SideGaps{ .top = 28 }).resolve(16);
+    try std.testing.expectEqual(@as(i32, 28), top_only.top);
+    try std.testing.expectEqual(@as(i32, 16), top_only.left);
+    try std.testing.expectEqual(@as(i32, 16), top_only.bottom);
+    try std.testing.expectEqual(@as(i32, 16), top_only.right);
+    try std.testing.expectEqual(@as(i32, 32), top_only.insetX());
+    try std.testing.expectEqual(@as(i32, 44), top_only.insetY());
+
+    // A zero is a real value, not "unset": zeroed sides must stay zero, and
+    // the *unset* partner still contributes gaps_out.
+    const zeroed = (SideGaps{ .left = 0, .top = 0 }).resolve(16);
+    try std.testing.expectEqual(@as(i32, 0), zeroed.left);
+    try std.testing.expectEqual(@as(i32, 0), zeroed.top);
+    try std.testing.expectEqual(@as(i32, 16), zeroed.right);
+    try std.testing.expectEqual(@as(i32, 16), zeroed.insetX());
+    try std.testing.expectEqual(@as(i32, 16), zeroed.insetY());
+
+    // Asymmetric on both axes: insets must not cross over.
+    const asym = (SideGaps{ .left = 1, .right = 2, .top = 30, .bottom = 4 }).resolve(16);
+    try std.testing.expectEqual(@as(i32, 3), asym.insetX());
+    try std.testing.expectEqual(@as(i32, 34), asym.insetY());
 }
 
 test "parseKey resolves modifiers and named keysyms" {

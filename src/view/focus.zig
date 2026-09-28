@@ -184,6 +184,12 @@ pub fn focusActiveRow(context: *ServerContext) void {
             }
         }
         if (on_row) {
+            // Adopt the ring anchor too: setFocus leaves kbd_cycle_view
+            // pointing wherever it was, and after a row switch that is the
+            // row we just left - focus_left/right would then anchor on a
+            // view that is not in this row's ring and silently do nothing.
+            context.kbd_cycle_view = candidate;
+            context.kbd_anchor_slot_x = -1;
             setFocus(context, .{
                 .view = .{ .view = candidate, .surface = candidate.surface(), .sx = 0, .sy = 0 },
             });
@@ -482,6 +488,23 @@ fn focusColumn(context: *ServerContext, dir: i32) void {
                 cur = i;
                 found = true;
                 break;
+            }
+        }
+    }
+    if (!found) {
+        // The ring anchor is stale - a row switch or a window moving rows
+        // can leave it pointing at a view this row does not have. Fall back
+        // to the focused view and adopt it, rather than swallowing the press
+        // until some other focus path happens to rewrite the anchor.
+        if (context.focused_view) |fv| {
+            for (tiles[0..n], 0..) |t, i| {
+                if (t.view == fv and t.mirror_slot_x < 0) {
+                    cur = i;
+                    found = true;
+                    context.kbd_cycle_view = fv;
+                    context.kbd_anchor_slot_x = -1;
+                    break;
+                }
             }
         }
     }

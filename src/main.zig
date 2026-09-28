@@ -20,6 +20,13 @@ const InputRelay = @import("input/input_relay.zig");
 const Spawner = @import("spawner.zig");
 const Config = @import("config.zig");
 const PointerConstraints = @import("input/pointer_constraints.zig");
+const ShortcutsInhibit = @import("input/shortcuts_inhibit.zig");
+const AlphaModifier = @import("input/alpha_modifier.zig");
+const ColorManagement = @import("color_management.zig");
+const Workspace = @import("workspace.zig");
+const TransientSeat = @import("input/transient_seat.zig");
+const SecurityContext = @import("security_context.zig");
+const Bell = @import("bell.zig");
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn vsnprintf(dest: [*]u8, size: usize, fmt: [*:0]const u8, args: *std.builtin.VaList) c_int;
@@ -27,13 +34,22 @@ extern fn vsnprintf(dest: [*]u8, size: usize, fmt: [*:0]const u8, args: *std.bui
 /// Forward wlroots' own log (EGL/dmabuf import failures, buffer upload
 /// errors) into the zylr log - the default handler writes to stderr which
 /// is invisible in the session log. libc vsnprintf handles the C va_list.
+///
+/// Severity is carried across: wlroots logs a great deal at info (one line
+/// per surface, per framebuffer) and filing all of it as error buried the
+/// lines that matter. Only errors and above reach an info-level build; the
+/// rest needs a debug build.
 fn wlrLogHandler(importance: wlroots.log.Importance, fmt: [*:0]const u8, args: *std.builtin.VaList) callconv(.c) void {
-    _ = importance;
     var buf: [4096]u8 = undefined;
     const n = vsnprintf(&buf, buf.len, fmt, args);
     if (n <= 0) return;
     const used = @min(@as(usize, @intCast(n)), buf.len - 1);
-    std.log.err("[wlr] {s}", .{buf[0..used]});
+    const message = buf[0..used];
+    switch (importance) {
+        .silent => {},
+        .err => std.log.err("[wlr] {s}", .{message}),
+        else => std.log.debug("[wlr] {s}", .{message}),
+    }
 }
 
 /// scenefx's gles2 fork; renders the scene graph's rounded corners.
@@ -106,7 +122,7 @@ fn zylrPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 pub fn main(init: std.process.Init) !void {
-    wlroots.log.init(.debug, wlrLogHandler);
+    wlroots.log.init(if (log_level == .debug) .debug else .info, wlrLogHandler);
 
     const version = build_options.version;
     const args: []const [*:0]const u8 = init.minimal.args.vector;
@@ -116,8 +132,12 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("zylr {s}\n", .{version});
             return;
         }
+        if (std.mem.eql(u8, s, "--check-config")) {
+            const ok = Config.check(init.io, std.heap.c_allocator);
+            std.process.exit(if (ok) 0 else 1);
+        }
         if (std.mem.eql(u8, s, "--help") or std.mem.eql(u8, s, "-h")) {
-            std.debug.print("zylr {s}\n\nUsage: zylr [options]\n\n  -h, --help      show this help\n  -v, --version   print version\n", .{version});
+            std.debug.print("zylr {s}\n\nUsage: zylr [options]\n\n  -h, --help         show this help\n  -v, --version      print version\n      --check-config  parse config.ziggy, exit non-zero on error\n", .{version});
             return;
         }
     }
@@ -334,6 +354,7 @@ pub fn main(init: std.process.Init) !void {
     // or lock the cursor. Enforced in cursor.zig's motion paths.
     _ = try PointerConstraints.init(server, seat, &context);
 
+
     context.request_set_selection_listener = wl.Listener(
         *wlroots.Seat.event.RequestSetSelection,
     ).init(ServerContext.onRequestSetSelection);
@@ -432,6 +453,46 @@ pub fn main(init: std.process.Init) !void {
     // keypress/attach for the life of the session.
     const loaded_config = Config.load(init.io, std.heap.c_allocator, true);
     context.applyConfig(loaded_config);
+
+    // Optional protocols. wlroots guards its preconditions with assert(),
+    // so one misbehaving protocol would abort the whole session; each is
+    // logged and skipped instead of fatal.
+    Cursor.initCursorShape(&context) catch |err| {
+        std.log.err("ext-cursor-shape-v1 disabled: {}", .{err});
+    };
+    ColorManagement.init(&context) catch |err| {
+        std.log.err("color management disabled: {}", .{err});
+    };
+    context.shortcuts_inhibit = ShortcutsInhibit.init(&context) catch |err| blk: {
+        std.log.err("keyboard-shortcuts-inhibit-v1 disabled: {}", .{err});
+        break :blk null;
+    };
+    AlphaModifier.init(&context) catch |err| {
+        std.log.err("wp_alpha_modifier_v1 disabled: {}", .{err});
+    };
+    const xdg_foreign_registry = wlroots.XdgForeignRegistry.create(server) catch |err| {
+        std.log.err("xdg-foreign-v2 disabled: {}", .{err});
+        return;
+    };
+    _ = wlroots.XdgForeignV2.create(server, xdg_foreign_registry) catch |err| {
+        std.log.err("xdg-foreign-v2 disabled: {}", .{err});
+    };
+    context.workspace = Workspace.init(&context) catch |err| blk: {
+        std.log.err("ext-workspace-v1 disabled: {}", .{err});
+        break :blk null;
+    };
+    context.transient_seat = TransientSeat.init(&context) catch |err| blk: {
+        std.log.err("ext-transient-seat-v1 disabled: {}", .{err});
+        break :blk null;
+    };
+    context.security_context = SecurityContext.init(&context) catch |err| blk: {
+        std.log.err("security-context-v1 disabled: {}", .{err});
+        break :blk null;
+    };
+    Bell.init(&context) catch |err| {
+        std.log.err("xdg-system-bell-v1 disabled: {}", .{err});
+    };
+
     @import("view/blur.zig").applyConfig(&context);
 
     _ = @import("session_lock.zig").SessionLock.init(&context) catch |err| {
@@ -441,6 +502,7 @@ pub fn main(init: std.process.Init) !void {
     _ = @import("activation.zig").Activation.init(&context) catch |err| {
         std.log.err("Failed to init xdg-activation: {}", .{err});
     };
+    Cursor.initHoverDwell(loop);
     _ = @import("idle.zig").Idle.init(&context, loop) catch |err| {
         std.log.err("idle init failed: {}", .{err});
     };
@@ -518,6 +580,17 @@ pub fn main(init: std.process.Init) !void {
     context.request_set_selection_listener.link.remove();
     context.request_set_primary_selection_listener.link.remove();
 
+    // Same class, for the managers that live as long as the display: each
+    // detaches the listener it attached, because wlroots asserts on display
+    // destroy with any of them still linked.
+    InputRelay.detachListeners();
+    if (context.workspace) |workspace| workspace.detachListeners();
+    Cursor.detachCursorShape(&context);
+    Cursor.detachHoverDwell();
+    if (context.idle) |idle| idle.detachListeners();
+    if (context.session_lock) |lock| lock.detachManagerListeners();
+    if (context.activation) |activation| activation.detachListeners();
+
     // Hand the activation environments back to the parent session
     // before zylr's socket disappears.
     Spawner.updateActivationEnv(&context, saved_vars);
@@ -575,5 +648,9 @@ fn onSignal(signal: c_int, display: *wl.Server) c_int {
 
 test {
     _ = @import("input/gesture.zig");
+    _ = @import("workspace.zig");
+    _ = @import("input/transient_seat.zig");
+    _ = @import("security_context.zig");
+    _ = @import("protocol_test.zig");
     _ = Config;
 }

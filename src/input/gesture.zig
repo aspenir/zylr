@@ -265,6 +265,21 @@ fn viewAtCursor(context: *ServerContext) ?*View {
     };
 }
 
+/// libinput reports swipe deltas in device units, not pixels, and the scale
+/// differs per touchpad. Scale them into logical px as they accumulate, so
+/// `swipe_min_px` means what the config says and the same value behaves the
+/// same on every pad. touch.zig already works in logical px; this is the
+/// trackpad equivalent.
+/// ponytail: assumes a swipe across the short edge is ~1000 units, matching
+/// libinput's typical full-screen swipe; recalibrate if a pad feels off.
+fn swipeUnitToPx(context: *ServerContext) f64 {
+    const output = context.output orelse return 1;
+    var ow: c_int = 0;
+    var oh: c_int = 0;
+    output.effectiveResolution(&ow, &oh);
+    return @as(f64, @floatFromInt(@max(1, @min(ow, oh)))) / 1000.0;
+}
+
 fn onSwipeBegin(
     listener: *wl.Listener(*wlroots.Pointer.event.SwipeBegin),
     event: *wlroots.Pointer.event.SwipeBegin,
@@ -296,8 +311,9 @@ fn onSwipeUpdate(
         event.dy,
     );
 
-    self.dx += event.dx;
-    self.dy += event.dy;
+    const scale = swipeUnitToPx(self.context);
+    self.dx += event.dx * scale;
+    self.dy += event.dy * scale;
 
     // Repeat: re-fire every swipe_min_px of travel so a continued swipe
     // scrubs instead of firing once on lift. Only binds labelled `repeat`;

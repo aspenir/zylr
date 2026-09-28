@@ -54,14 +54,43 @@ pub fn build(b: *std.Build) void {
 
     scanner.addSystemProtocol("staging/tearing-control/tearing-control-v1.xml");
     scanner.generate("wp_tearing_control_manager_v1", 1);
+    // Color management: the scene color manager (scenefx) applies the
+    // negotiated image descriptions; representation manager maps them onto
+    // renderer capabilities. v2 is this wlroots' COLOR_MANAGEMENT_V1_VERSION
+    // — asking for more trips an assert at startup.
     scanner.addSystemProtocol("staging/color-management/color-management-v1.xml");
-    scanner.generate("wp_color_manager_v1", 2);
     scanner.addSystemProtocol("staging/ext-session-lock/ext-session-lock-v1.xml");
     scanner.generate("ext_session_lock_manager_v1", 1);
     scanner.addSystemProtocol("staging/ext-idle-notify/ext-idle-notify-v1.xml");
     scanner.generate("ext_idle_notifier_v1", 2);
     scanner.addSystemProtocol("unstable/idle-inhibit/idle-inhibit-unstable-v1.xml");
     scanner.generate("zwp_idle_inhibit_manager_v1", 1);
+    scanner.generate("wp_color_manager_v1", 2);
+    scanner.addSystemProtocol("staging/color-representation/color-representation-v1.xml");
+    scanner.generate("wp_color_representation_manager_v1", 1);
+    // Clients choose their own cursor (menus, games, pen tools); resize
+    // and drag states override in cursor.zig.
+    scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
+    scanner.generate("wp_cursor_shape_manager_v1", 1);
+    // Exposes the opacity-modifier global so clients can negotiate it.
+    scanner.addSystemProtocol("staging/alpha-modifier/alpha-modifier-v1.xml");
+    scanner.generate("wp_alpha_modifier_v1", 1);
+    // Focused client (games, media) can ask the compositor to stop eating
+    // keys; gated in keyboard.zig.
+    scanner.addSystemProtocol("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml");
+    scanner.generate("zwp_keyboard_shortcuts_inhibit_manager_v1", 1);
+    // Export toplevel handles between clients (tab moves in file managers,
+    // intermediate parent windows in browsers).
+    scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
+    scanner.generate("zxdg_exporter_v2", 1);
+    // A client rings the bell; zylr runs whatever command the config names.
+    scanner.addSystemProtocol("staging/xdg-system-bell/xdg-system-bell-v1.xml");
+    scanner.generate("xdg_system_bell_v1", 1);
+
+    // One workspace per row: shell/tab-bar clients (waybar wlr/workspaces
+    // module, gtk-layer-shell tabs) can list and switch rows over the wire.
+    scanner.addSystemProtocol("staging/ext-workspace/ext-workspace-v1.xml");
+    scanner.generate("ext_workspace_manager_v1", 1);
 
     const wayland_mod = b.createModule(.{
         .root_source_file = scanner.result,

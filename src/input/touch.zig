@@ -4,6 +4,7 @@ const wl = wayland.server.wl;
 const std = @import("std");
 
 const ServerContext = @import("../server.zig");
+const SessionLock = @import("../session_lock.zig");
 const Config = @import("../config.zig");
 const GestureContext = @import("gesture.zig");
 const NodeData = @import("../view/utils/node_data.zig");
@@ -323,6 +324,26 @@ pub fn onDown(
     if (self.context.idle) |idle| idle.notifyActivity();
 
     const pos = self.position(event.x, event.y);
+
+    // Locked: only the lock surface may be touched. The pointer and
+    // keyboard were handed it when the lock appeared; touch names its
+    // surface per down event, and the lock surface's scene node carries no
+    // NodeData, so the normal hit-test can never resolve it. Route the
+    // finger straight there and skip zylr's own gesture, focus and layout
+    // work, which must not reach the windows behind the lock.
+    if (self.context.locked) {
+        if (SessionLock.touchTarget(self.context)) |t| {
+            _ = self.context.seat.touchNotifyDown(
+                t.surface,
+                event.time_msec,
+                event.touch_id,
+                pos.ox - t.origin_x,
+                pos.oy - t.origin_y,
+            );
+        }
+        return;
+    }
+
     // A touch on a pile divider (the gap or the member's bottom band)
     // starts a share-resize drag instead of a tap/gesture: no client
     // notification, no swipe tracking, no hold — pure drag grab.
@@ -499,6 +520,18 @@ pub fn onMotion(
     if (self.context.idle) |idle| idle.notifyActivity();
 
     const pos = self.position(event.x, event.y);
+
+    if (self.context.locked) {
+        if (SessionLock.touchTarget(self.context)) |t| {
+            self.context.seat.touchNotifyMotion(
+                event.time_msec,
+                event.touch_id,
+                pos.ox - t.origin_x,
+                pos.oy - t.origin_y,
+            );
+        }
+        return;
+    }
 
     if (self.pointIndex(event.touch_id)) |i| {
         const p = &self.points[i];

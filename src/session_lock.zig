@@ -18,6 +18,11 @@ context: *ServerContext,
 manager: *wlr.SessionLockManagerV1,
 current_lock: ?*wlr.SessionLockV1 = null,
 lock_tree: *wlr.SceneTree,
+/// Lock surface the pointer/keyboard were given, plus where its scene tree
+/// sits in layout space (touch coordinates are surface-local).
+focused_surface: ?*wlr.Surface = null,
+focused_origin_x: f64 = 0,
+focused_origin_y: f64 = 0,
 
 new_lock_listener: wl.Listener(*wlr.SessionLockV1) = undefined,
 new_surface_listener: wl.Listener(*wlr.SessionLockSurfaceV1) = undefined,
@@ -40,6 +45,12 @@ pub fn init(context: *ServerContext) !void {
     self.lock_destroy_listener = wl.Listener(void).init(onLockDestroy);
 
     context.session_lock = self;
+}
+
+/// Manager-level listeners: wlroots asserts on display destroy with these
+/// attached. The per-lock ones are handled by detachListeners().
+pub fn detachManagerListeners(self: *SessionLock) void {
+    self.new_lock_listener.link.remove();
 }
 
 pub fn deinit(self: *SessionLock) void {
@@ -150,6 +161,9 @@ fn onNewSurface(
 
     _ = lock_surface.configure(@intCast(out_w), @intCast(out_h));
 
+    self.focused_surface = lock_surface.surface;
+    self.focused_origin_x = @floatFromInt(layout_box.x);
+    self.focused_origin_y = @floatFromInt(layout_box.y);
     self.focusLockSurface(lock_surface.surface);
 }
 
@@ -176,6 +190,27 @@ fn focusPrevious(self: *SessionLock) void {
     }
 }
 
+pub const LockTarget = struct {
+    surface: *wlr.Surface,
+    origin_x: f64,
+    origin_y: f64,
+};
+
+/// Touch names its target surface per down event, and the lock surface is
+/// unreachable through the normal hit-test: its scene node carries no
+/// NodeData, so resolveAt cannot classify it. Hand the touch path the same
+/// surface the pointer and keyboard got, plus the scene origin to subtract
+/// for surface-local coordinates.
+pub fn touchTarget(context: *ServerContext) ?LockTarget {
+    const self = context.session_lock orelse return null;
+    const surface = self.focused_surface orelse return null;
+    return .{
+        .surface = surface,
+        .origin_x = self.focused_origin_x,
+        .origin_y = self.focused_origin_y,
+    };
+}
+
 fn onUnlock(
     listener: *wl.Listener(void),
 ) void {
@@ -191,6 +226,7 @@ fn onUnlock(
     // out from under wlroots.
     self.detachListeners();
     self.current_lock = null;
+    self.focused_surface = null;
     context.locked = false;
     self.focusPrevious();
 }
@@ -205,6 +241,7 @@ fn onLockDestroy(
     // has already fired each per-surface destroy listener, cleaning up their
     // scene nodes. Just clear our own state and hand focus back.
     self.current_lock = null;
+    self.focused_surface = null;
     context.locked = false;
     self.focusPrevious();
 }

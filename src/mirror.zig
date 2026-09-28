@@ -176,6 +176,16 @@ pub fn destroyAllMirrors(context: *ServerContext, view: *View) void {
             }
         }
     }
+    // Copies docked *after* this view keep a dock_view pointing at freed
+    // memory. Nothing dereferences it, but the row walk places copies by
+    // looking up each live view, so a stale pointer never matches and those
+    // copies silently stop being laid out. Fall them back to the row lead.
+    for (0..ServerContext.max_rows) |r| {
+        for (context.row_mirrors[r].items) |*m| {
+            if (m.dock_view == view) m.dock_view = null;
+        }
+    }
+
     view.scene_tree.node.setEnabled(true);
 }
 
@@ -744,7 +754,7 @@ pub fn syncActiveTile(view: *View, cur_x_row: f32, cur_w: f32) void {
 pub fn syncLeadTiles(context: *ServerContext) void {
     if (context.active_row >= ServerContext.max_rows) return;
     const vp: i32 = context.viewport_x;
-    const y: i32 = context.usable_area.y + context.gaps_out - context.viewport_y;
+    const y: i32 = context.usable_area.y + context.gaps.top - context.viewport_y;
     const mirrors = &context.row_mirrors[context.active_row];
     var idxs: [64]usize = undefined;
     const cnt = sortedDocked(context, mirrors, null, &idxs);
@@ -837,9 +847,9 @@ fn layoutRow(context: *ServerContext, target_row: usize) void {
     const mirrors = &context.row_mirrors[target_row];
     if (mirrors.items.len == 0) return;
 
-    const y: i32 = context.usable_area.y + context.gaps_out;
+    const y: i32 = context.usable_area.y + context.gaps.top;
     const views = rowViews(context, target_row);
-    var x: i32 = context.usable_area.x + context.gaps_out;
+    var x: i32 = context.usable_area.x + context.gaps.left;
 
     // Re-place every mirror from its dock each layout so slot_x/slot_w match
     // the live flow (syncActiveTile animates node positions per frame, but
@@ -861,7 +871,7 @@ fn layoutRow(context: *ServerContext, target_row: usize) void {
             break;
         }
     }
-    const inner_w = context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2));
+    const inner_w = context.usable_area.width - @as(c_int, @intCast(context.gaps.insetX()));
     const lone_fill: bool = lead_cnt == 1 and !has_tiled;
     if (lead_cnt > 0 and !has_tiled) {
         var run_w: i32 = 0;
@@ -875,12 +885,12 @@ fn layoutRow(context: *ServerContext, target_row: usize) void {
                 if (k + 1 < lead_cnt) run_w += @as(i32, @intCast(context.gaps_in));
             }
         }
-        x = context.usable_area.x + @as(i32, @intCast(context.gaps_out)) + @max(0, @divTrunc(inner_w - run_w, 2));
+        x = context.usable_area.x + @as(i32, @intCast(context.gaps.left)) + @max(0, @divTrunc(inner_w - run_w, 2));
     }
     for (lead_idx[0..lead_cnt]) |i| {
         const m = &mirrors.items[i];
         const w = if (lone_fill) inner_w else renderedWidth(context, m.view);
-        const h: i32 = if (m.view.slot_h > 0) m.view.slot_h else context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+        const h: i32 = if (m.view.slot_h > 0) m.view.slot_h else context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
         placeMirror(context, m, x, y, w, h);
         x += w + context.gaps_in;
     }
@@ -895,7 +905,7 @@ fn layoutRow(context: *ServerContext, target_row: usize) void {
     // Pass 2: append anything still unplaced (its dock window is not tiled
     // on this row) after the row's true rendered end - the rightmost edge of
     // every placed tile, windows and copies alike.
-    var row_end: i32 = context.usable_area.x + context.gaps_out;
+    var row_end: i32 = context.usable_area.x + context.gaps.left;
     for (views) |view| {
         if (!isTiledCandidate(view)) continue;
         row_end = @max(row_end, view.x + renderedWidth(context, view));
@@ -909,7 +919,7 @@ fn layoutRow(context: *ServerContext, target_row: usize) void {
         if (!m.active or m.is_self) continue;
         if (m.slot_x != std.math.minInt(i32)) continue;
         const w = renderedWidth(context, m.view);
-        const h: i32 = if (m.view.slot_h > 0) m.view.slot_h else context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+        const h: i32 = if (m.view.slot_h > 0) m.view.slot_h else context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
         placeMirror(context, m, x, y, w, h);
         x += w + context.gaps_in;
     }
@@ -934,7 +944,7 @@ fn placeWindowCluster(context: *ServerContext, mirrors: *std.ArrayListUnmanaged(
         const m = &mirrors.items[i];
         if (m.slot_x != std.math.minInt(i32)) continue;
         const w = renderedWidth(context, m.view);
-        placeMirror(context, m, x, context.usable_area.y + context.gaps_out, w, view.slot_h);
+        placeMirror(context, m, x, context.usable_area.y + context.gaps.top, w, view.slot_h);
         x += w + context.gaps_in;
     }
 }
@@ -944,7 +954,7 @@ fn mirrorWidth(context: *ServerContext, src: *View) i32 {
     if (vw > 0) return vw;
     // The ratio scales the usable width (post-waybar), minus both side gaps
     // so ratio 1.0 keeps a gap on either edge.
-    const bw_usable = @max(1, context.usable_area.width - @as(i32, @intCast(context.gaps_out * 2)));
+    const bw_usable = @max(1, context.usable_area.width - @as(i32, @intCast(context.gaps.insetX())));
     return @as(i32, @intFromFloat(@as(f32, @floatFromInt(bw_usable)) * context.view_width_ratio)) + 2 * @as(i32, @intCast(context.border_width));
 }
 
@@ -1260,7 +1270,7 @@ fn activateMirror(context: *ServerContext, view: *View, row_idx: usize, is_self:
     if (context.corner_radius > 0) {
         Rounding.setBufferCorners(buf_node, @intCast(@max(0, context.corner_radius - 1)));
     }
-    std.log.warn("MIRROR CREATE view={*} row={} self={} surface={*}", .{ view, row_idx, is_self, surf });
+    std.log.debug("MIRROR CREATE view={*} row={} self={} surface={*}", .{ view, row_idx, is_self, surf });
     return appended;
 }
 

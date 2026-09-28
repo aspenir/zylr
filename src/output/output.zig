@@ -1,4 +1,5 @@
 const wlroots = @import("wlroots");
+const LayerView = @import("../view/layer.zig");
 const wayland = @import("wayland");
 const wl = wayland.server.wl;
 const std = @import("std");
@@ -7,6 +8,7 @@ const AnimationManager = @import("../view/animation.zig");
 const Mirror = @import("../mirror.zig");
 const Osd = @import("../osd.zig");
 const ServerContext = @import("../server.zig");
+const Workspace = @import("../workspace.zig");
 const Config = @import("../config.zig");
 const ViewManager = @import("../view/view_manager.zig");
 const OutputContext = @This();
@@ -20,17 +22,6 @@ destroyed: bool = false,
 context: *ServerContext,
 last_frame_ns: u64 = 0,
 last_way_commits: u64 = 0,
-/// Client buffer attaches since boot (mirrors ServerContext.buffer_pixel_commits
-/// per-output) and the value at the last real present. Equal while only
-/// damage-only commits have arrived — the latch signal.
-buffer_pixel_commits: u64 = 0,
-presented_buffer_pixel_commits: u64 = 0,
-/// Idle-loop diagnostics (2s window, drop after root-cause): frame events,
-/// damage-backed frames, and per-view commit totals — the numbers that say
-/// whether a client commit storm or a present loop is burning power.
-diag_frames: u32 = 0,
-diag_damaged: u32 = 0,
-diag_last_log_ms: u64 = 0,
 
 pub fn onNewOutput(
     listener: *wl.Listener(*wlroots.Output),
@@ -128,6 +119,10 @@ pub fn onNewOutput(
     std.log.info("Output initialized; scheduling frame", .{});
     std.log.info("OUTPUT: {d}x{d} scale={d} effective={d}x{d}", .{ output.width, output.height, output.scale, @as(c_int, @intFromFloat(@as(f32, @floatFromInt(output.width)) / output.scale)), @as(c_int, @intFromFloat(@as(f32, @floatFromInt(output.height)) / output.scale)) });
     context.output = output;
+    Workspace.onOutputAdded(context, output);
+    // A different panel means a different usable area (and different bar
+    // insets): re-derive it and re-tile before the first frame.
+    LayerView.onOutputChanged(context);
 
     sendConfig(context);
     output.scheduleFrame();
@@ -259,6 +254,8 @@ pub fn onOutputDestroy(listener: *wl.Listener(*wlroots.Output), output: *wlroots
     const output_ctx: *OutputContext = @fieldParentPtr("destroy_listener", listener);
     const context = output_ctx.context;
     if (context.output == output) context.output = null;
+    Workspace.onOutputRemoved(context, output);
+    LayerView.onOutputChanged(context);
     output_ctx.destroyed = true;
     output_ctx.frame_listener.link.remove();
     output_ctx.destroy_listener.link.remove();
@@ -270,33 +267,6 @@ pub fn onOutputFrame(listener: *wl.Listener(*wlroots.Output), output: *wlroots.O
     const context = output_ctx.context;
 
     AnimationManager.tick(context);
-
-    const now_ms = context.nowMs();
-    output_ctx.diag_frames +%= 1;
-    if (output_ctx.scene_output.private.pending_commit_damage.notEmpty()) output_ctx.diag_damaged +%= 1;
-    if (now_ms - output_ctx.diag_last_log_ms >= 2000) {
-        output_ctx.diag_last_log_ms = now_ms;
-        var note: [384]u8 = undefined;
-        var note_len: usize = 0;
-        for (context.views.items) |v| {
-            if (v.commit_count == 0) continue;
-            const tail = std.fmt.bufPrint(
-                note[note_len..],
-                " {s}:{d}",
-                .{ @tagName(v.backend), v.commit_count },
-            ) catch break;
-            note_len += tail.len;
-            v.commit_count = 0;
-        }
-        std.log.info("FRAME DIAG: 2s frames={d} damaged={d} px={d} commits=[{s}]", .{
-            output_ctx.diag_frames,
-            output_ctx.diag_damaged,
-            output_ctx.buffer_pixel_commits,
-            note[0..note_len],
-        });
-        output_ctx.diag_frames = 0;
-        output_ctx.diag_damaged = 0;
-    }
 
     // Stock present path: wlr_scene_output_commit() -> wlr_output_commit_state
     // -> drm_connector_commit, which REFUSES to queue a page flip while one is
@@ -410,6 +380,10 @@ fn sendConfig(context: *ServerContext) void {
     // config is owned by wlroots after setConfiguration(), do not destroy
 
     for (context.output_contexts.items) |output_ctx| {
+        // A destroyed output keeps its entry (nothing frees this struct until
+        // teardown), and its wlr_output is freed with it - reading it here
+        // would be a use-after-free on any unplug/replug cycle.
+        if (output_ctx.destroyed) continue;
         const output = output_ctx.scene_output.output;
         const head = wlroots.OutputConfigurationV1.Head.create(config, output) catch return;
         head.state.enabled = output.enabled;

@@ -154,6 +154,13 @@ fn onNewInhibitor(
     self.notifier.setInhibited(true);
 }
 
+
+/// wlroots asserts on display destroy with these attached.
+pub fn detachListeners(self: *Idle) void {
+    self.new_inhibitor_listener.link.remove();
+    self.set_mode_listener.link.remove();
+}
+
 pub fn deinit(self: *Idle) void {
     self.new_inhibitor_listener.link.remove();
     self.set_mode_listener.link.remove();

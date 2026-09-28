@@ -445,6 +445,8 @@ fn createPopupNode(context: *ServerContext, view: *View, popup: *wlroots.XdgPopu
     popup.events.destroy.add(&node.destroy_listener);
     context.popups.append(std.heap.c_allocator, node) catch {
         std.log.warn("xdg: failed to register popup", .{});
+        // Unlink first: the listener lives inside the node we free here.
+        node.destroy_listener.link.remove();
         std.heap.c_allocator.destroy(node);
         return null;
     };
@@ -578,10 +580,10 @@ pub fn commitToplevel(
     var eh: c_int = 0;
     output.effectiveResolution(&ew, &eh);
 
-    // Inset by gaps_out on all sides so borders (and the background)
+    // Inset by the outer gaps on all sides so borders (and the background)
     // are visible instead of the window covering the whole screen.
-    ew -= @as(c_int, @intCast(context.gaps_out * 2));
-    eh -= @as(c_int, @intCast(context.gaps_out * 2));
+    ew -= @as(c_int, @intCast(context.gaps.insetX()));
+    eh -= @as(c_int, @intCast(context.gaps.insetY()));
 
     // Shrink to the area left after layer-shell exclusive zones
     // (e.g. a bar at the top edge).
@@ -591,8 +593,8 @@ pub fn commitToplevel(
         ew -= left + right;
         // Both side gaps stay visible even at ratio 1.0: the tile spans
         // usable.width - 2*gaps, and its left edge sits at usable.x + gaps.
-        ew -= @as(c_int, @intCast(context.gaps_out * 2));
-        eh = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+        ew -= @as(c_int, @intCast(context.gaps.insetX()));
+        eh = context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
     }
 
     // A window resized by edge-drag keeps its width across commits.
@@ -612,7 +614,7 @@ pub fn commitToplevel(
     // The lone tiled window fills the workspace (width ratio 1); it
     // shrinks back to its custom width when a second window joins the row.
     if (!view.floating and !view.fullscreen and ViewManager.activeTiledCount(context) == 1) {
-        ew = context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2));
+        ew = context.usable_area.width - @as(c_int, @intCast(context.gaps.insetX()));
     }
 
     // The slot the border ring must fill exactly: the ring is sized from

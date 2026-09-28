@@ -153,6 +153,9 @@ pub fn wireKeyboard(
 
         keyboard_context.key_listener.link.remove();
         keyboard_context.modifiers_listener.link.remove();
+        // Added just above: leaving it linked hands the device's destroy
+        // signal a pointer into the context we are about to free.
+        keyboard_context.destroy_listener.link.remove();
         std.heap.c_allocator.destroy(keyboard_context);
 
         return;

@@ -331,7 +331,7 @@ fn onSetGeometry(listener: *wl.Listener(void)) void {
     if (!view.isMapped()) return;
     const xw = view.backend.xwayland;
     if (!xw.override_redirect) return;
-    std.log.warn("SETGEO win=0x{x} geo=({d},{d},{d},{d})", .{
+    std.log.debug("SETGEO win=0x{x} geo=({d},{d},{d},{d})", .{
         xw.window_id, xw.x, xw.y, xw.width, xw.height,
     });
 
@@ -358,7 +358,9 @@ pub fn commitSurface(
         view.x = xw_surface.x;
         view.y = xw_surface.y;
         view.scene_tree.node.setPosition(xw_surface.x, xw_surface.y);
-        std.log.warn("ORPOS win=0x{x} geo=({d},{d},{d},{d})", .{
+        // debug, not warn: an OR window commits on every pointer move over
+        // a Steam menu, so this fired per commit and swamped the log.
+        std.log.debug("ORPOS win=0x{x} geo=({d},{d},{d},{d})", .{
             xw_surface.window_id, xw_surface.x,      xw_surface.y,
             xw_surface.width,     xw_surface.height,
         });
@@ -375,16 +377,16 @@ pub fn commitSurface(
     var eh: c_int = 0;
     output.effectiveResolution(&ew, &eh);
 
-    ew -= @as(c_int, @intCast(context.gaps_out * 2));
-    eh -= @as(c_int, @intCast(context.gaps_out * 2));
+    ew -= @as(c_int, @intCast(context.gaps.insetX()));
+    eh -= @as(c_int, @intCast(context.gaps.insetY()));
 
     if (context.usable_area.width > 0) {
         const left = context.usable_area.x;
         const right = ew - (context.usable_area.x + context.usable_area.width);
         ew -= left + right;
         // Both side gaps stay visible even at ratio 1.0.
-        ew -= @as(c_int, @intCast(context.gaps_out * 2));
-        eh = context.usable_area.height - @as(c_int, @intCast(context.gaps_out * 2));
+        ew -= @as(c_int, @intCast(context.gaps.insetX()));
+        eh = context.usable_area.height - @as(c_int, @intCast(context.gaps.insetY()));
     }
 
     if (view.pile_width) |pw| {
@@ -401,7 +403,7 @@ pub fn commitSurface(
     // The lone tiled window fills the workspace (width ratio 1); it
     // shrinks back to its custom width when a second window joins the row.
     if (!view.floating and !view.fullscreen and ViewManager.activeTiledCount(context) == 1) {
-        ew = context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2));
+        ew = context.usable_area.width - @as(c_int, @intCast(context.gaps.insetX()));
     }
 
     // Floating views keep their own geometry.
@@ -479,7 +481,7 @@ pub fn commitSurface(
     {
         xw_cfg_diag += 1;
         if (xw_cfg_diag <= 30 or xw_cfg_diag % 300 == 0) {
-            std.log.warn("XW cfg vx={d} vy={d} vp=({d},{d}) tgt=({d},{d},{d},{d}) old=({d},{d}) cur=({d},{d}) moved={d} wrong={d}", .{
+            std.log.debug("XW cfg vx={d} vy={d} vp=({d},{d}) tgt=({d},{d},{d},{d}) old=({d},{d}) cur=({d},{d}) moved={d} wrong={d}", .{
                 view.x,                view.y,
                 context.viewport_x,    context.viewport_y,
                 target_x,              target_y,

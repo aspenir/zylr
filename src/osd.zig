@@ -16,13 +16,16 @@ const max_chars: usize = 46;
 const OsdBuffer = extern struct {
     base: wlroots.Buffer,
     pixels: [*]u8,
+    /// Byte length of `pixels`. c_allocator's free() ignores this, but the
+    /// contract is the original allocation's slice, and a size-tracking
+    /// allocator (or an arena) would misbehave on a pixel count.
+    bytes: usize,
     size: u32,
-    capacity: u32,
 };
 
 fn osdDestroy(buffer: *wlroots.Buffer) callconv(.c) void {
     const self: *OsdBuffer = @fieldParentPtr("base", buffer);
-    std.heap.c_allocator.free(self.pixels[0..self.capacity]);
+    std.heap.c_allocator.free(self.pixels[0..self.bytes]);
     std.heap.c_allocator.destroy(self);
 }
 
@@ -103,7 +106,7 @@ pub fn show(context: *ServerContext, lines: []const []const u8) void {
         .base = undefined,
         .pixels = px.ptr,
         .size = width,
-        .capacity = capacity,
+        .bytes = pixel_bytes,
     };
     wlroots.Buffer.init(&osd_buf.base, &osd_impl, @intCast(width), @intCast(height));
 

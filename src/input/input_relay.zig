@@ -20,12 +20,12 @@ active_grab: ?*wlroots.InputMethodV2.KeyboardGrab = null,
 new_input_method_listener: wl.Listener(*wlroots.InputMethodV2) = undefined,
 new_text_input_listener: wl.Listener(*wlroots.TextInputV3) = undefined,
 
-input_method_commit_listener: wl.Listener(void) = undefined,
-input_method_grab_listener: wl.Listener(*wlroots.InputMethodV2.KeyboardGrab) = undefined,
-input_method_destroy_listener: wl.Listener(void) = undefined,
-input_method_new_popup_listener: wl.Listener(*wlroots.InputPopupSurfaceV2) = undefined,
+/// Every bound IM, so shutdown can detach them all.
+im_contexts: std.ArrayListUnmanaged(*ImContext) = .empty,
 
 grab_destroy_listener: wl.Listener(void) = undefined,
+/// Which IM owns `active_grab`, so another IM's destroy doesn't clear it.
+grab_im: ?*wlroots.InputMethodV2 = null,
 
 // Per-text-input relays to handle multiple clients (e.g. Firefox has many)
 const TextInputRelay = struct {
@@ -37,9 +37,28 @@ const TextInputRelay = struct {
     destroy_listener: wl.Listener(void) = undefined,
 };
 
+/// Per-IM listener holder. wlroots hands out a NEW wlr_input_method_v2 for
+/// every client that binds zwp_input_method_v2, so a leftover IM (or two
+/// autostarting) would otherwise share the Relay's single listener set: the
+/// second bind overwrote it, and the first IM's destroy then tore down the
+/// live IM's plumbing - text input goes dead and the IM never gets its
+/// `done` (an IM blocked on a roundtrip hangs). One per IM keeps their
+/// lifetimes apart.
+const ImContext = struct {
+    im: *wlroots.InputMethodV2,
+    relay: *Relay,
+    commit: wl.Listener(void) = undefined,
+    grab: wl.Listener(*wlroots.InputMethodV2.KeyboardGrab) = undefined,
+    destroy: wl.Listener(void) = undefined,
+    new_popup: wl.Listener(*wlroots.InputPopupSurfaceV2) = undefined,
+};
+
 const PopupContext = struct {
-    popup: *wlroots.InputPopupSurfaceV2,
-    destroy_listener: wl.Listener(void) = undefined,
+    /// Held directly instead of via `popup.data`: the popup object can be
+    /// destroyed inside the same surface-destroy cascade that runs this
+    /// callback, so touching it here would read freed memory.
+    node_data: *NodeData.NodeData,
+    destroy_listener: wl.Listener(*wlroots.Surface) = undefined,
     context: *ServerContext,
 };
 
@@ -64,6 +83,14 @@ pub fn init(server: *wl.Server, seat: *wlroots.Seat, ctx: *ServerContext) !*Rela
 /// Client that owns a wlr_surface (via its protocol resource).
 fn surfaceClient(s: *wlroots.Surface) *wl.Client {
     return s.resource.getClient();
+}
+
+/// wlroots asserts when the display dies with these still linked, so the
+/// shutdown path has to detach them before the server is destroyed.
+pub fn detachListeners() void {
+    const self = relay_ptr orelse return;
+    self.new_input_method_listener.link.remove();
+    self.new_text_input_listener.link.remove();
 }
 
 pub fn updateFocus(self: *Relay, surface: ?*wlroots.Surface) void {
@@ -160,29 +187,45 @@ fn onNewInputMethod(listener: *wl.Listener(*wlroots.InputMethodV2), input_method
     std.log.info("new input method {x}", .{@intFromPtr(input_method)});
     self.current_input_method = input_method;
 
-    self.input_method_commit_listener = wl.Listener(void).init(onInputMethodCommit);
-    self.input_method_grab_listener = wl.Listener(*wlroots.InputMethodV2.KeyboardGrab).init(onInputMethodGrabKeyboard);
-    self.input_method_destroy_listener = wl.Listener(void).init(onInputMethodDestroy);
-    self.input_method_new_popup_listener = wl.Listener(*wlroots.InputPopupSurfaceV2).init(onNewPopup);
+    const ic = std.heap.c_allocator.create(ImContext) catch {
+        std.log.warn("input method: out of memory", .{});
+        return;
+    };
+    ic.* = .{ .im = input_method, .relay = self };
+    ic.commit = wl.Listener(void).init(onInputMethodCommit);
+    ic.grab = wl.Listener(*wlroots.InputMethodV2.KeyboardGrab).init(onInputMethodGrabKeyboard);
+    ic.destroy = wl.Listener(void).init(onInputMethodDestroy);
+    ic.new_popup = wl.Listener(*wlroots.InputPopupSurfaceV2).init(onNewPopup);
+    self.im_contexts.append(std.heap.c_allocator, ic) catch {
+        std.heap.c_allocator.destroy(ic);
+        std.log.warn("input method: out of memory", .{});
+        return;
+    };
 
-    input_method.events.commit.add(&self.input_method_commit_listener);
-    input_method.events.grab_keyboard.add(&self.input_method_grab_listener);
-    input_method.events.destroy.add(&self.input_method_destroy_listener);
-    input_method.events.new_popup_surface.add(&self.input_method_new_popup_listener);
+    input_method.events.commit.add(&ic.commit);
+    input_method.events.grab_keyboard.add(&ic.grab);
+    input_method.events.destroy.add(&ic.destroy);
+    input_method.events.new_popup_surface.add(&ic.new_popup);
 
     relayToInputMethod(self);
 }
 
 fn onInputMethodCommit(listener: *wl.Listener(void)) void {
-    const self: *Relay = @fieldParentPtr("input_method_commit_listener", listener);
-    const im = self.current_input_method orelse return;
+    const ic: *ImContext = @fieldParentPtr("commit", listener);
+    // A second IM can be bound; only the current one drives the relay, so a
+    // leftover client's commits can't inject text.
+    if (ic.relay.current_input_method != ic.im) return;
+    const im = ic.im;
     std.log.debug("IM commit text {?s} preedit {?s}", .{ if (im.current.commit_text) |st| std.mem.span(st) else null, if (im.current.preedit.text) |st| std.mem.span(st) else null });
-    relayToTextInput(self, im);
+    relayToTextInput(ic.relay, im);
 }
 
 fn onInputMethodGrabKeyboard(listener: *wl.Listener(*wlroots.InputMethodV2.KeyboardGrab), grab: *wlroots.InputMethodV2.KeyboardGrab) void {
-    const self: *Relay = @fieldParentPtr("input_method_grab_listener", listener);
+    const ic: *ImContext = @fieldParentPtr("grab", listener);
+    const self = ic.relay;
+    if (self.current_input_method != ic.im) return;
     self.active_grab = grab;
+    self.grab_im = ic.im;
     self.grab_destroy_listener = wl.Listener(void).init(onGrabDestroy);
     grab.events.destroy.add(&self.grab_destroy_listener);
     if (self.server_context.keyboards.items.len > 0) {
@@ -195,23 +238,51 @@ fn onGrabDestroy(listener: *wl.Listener(void)) void {
     const self: *Relay = @fieldParentPtr("grab_destroy_listener", listener);
     self.grab_destroy_listener.link.remove();
     self.active_grab = null;
+    self.grab_im = null;
 }
 
 fn onInputMethodDestroy(listener: *wl.Listener(void)) void {
-    const self: *Relay = @fieldParentPtr("input_method_destroy_listener", listener);
-    self.input_method_commit_listener.link.remove();
-    self.input_method_grab_listener.link.remove();
-    self.input_method_destroy_listener.link.remove();
-    self.input_method_new_popup_listener.link.remove();
-    if (self.active_grab) |_| {
+    const ic: *ImContext = @fieldParentPtr("destroy", listener);
+    const self = ic.relay;
+    // These four are this IM's own, so removing them can no longer unhook
+    // whichever IM bound most recently.
+    ic.commit.link.remove();
+    ic.grab.link.remove();
+    ic.destroy.link.remove();
+    ic.new_popup.link.remove();
+    if (self.grab_im == ic.im) {
         self.grab_destroy_listener.link.remove();
         self.active_grab = null;
+        self.grab_im = null;
     }
-    self.current_input_method = null;
+    if (self.current_input_method == ic.im) {
+        self.current_input_method = null;
+        // A previous IM may still be bound: hand the relay back to it rather
+        // than leaving text input inactive until the next focus change.
+        const it = self.im_contexts.items;
+        var i = it.len;
+        while (i > 0) {
+            i -= 1;
+            if (it[i].im != ic.im) {
+                self.current_input_method = it[i].im;
+                break;
+            }
+        }
+        if (self.current_input_method != null) relayToInputMethod(self);
+    }
+    for (self.im_contexts.items, 0..) |item, idx| {
+        if (item == ic) {
+            _ = self.im_contexts.swapRemove(idx);
+            break;
+        }
+    }
+    std.heap.c_allocator.destroy(ic);
 }
 
 fn onNewPopup(listener: *wl.Listener(*wlroots.InputPopupSurfaceV2), popup: *wlroots.InputPopupSurfaceV2) void {
-    const self: *Relay = @fieldParentPtr("input_method_new_popup_listener", listener);
+    const ic: *ImContext = @fieldParentPtr("new_popup", listener);
+    const self = ic.relay;
+    if (self.current_input_method != ic.im) return;
     if (findActiveTextInput(self)) |ti| {
         popup.sendTextInputRectangle(&ti.current.cursor_rectangle);
     }
@@ -225,27 +296,24 @@ fn onNewPopup(listener: *wl.Listener(*wlroots.InputPopupSurfaceV2), popup: *wlro
     const node_data = std.heap.c_allocator.create(NodeData.NodeData) catch return;
     node_data.* = .{ .im_popup = popup };
     node.node.data = node_data;
-    popup.data = node_data;
     node.node.raiseToTop();
 
     // When the popup surface is torn down (e.g. pkill squeekboard), free
     // our NodeData and kick a repaint so the OSK image doesn't linger.
     const pc = std.heap.c_allocator.create(PopupContext) catch return;
-    pc.* = .{ .popup = popup, .context = self.server_context };
-    pc.destroy_listener = wl.Listener(void).init(onPopupDestroy);
-    popup.events.destroy.add(&pc.destroy_listener);
+    pc.* = .{ .node_data = node_data, .context = self.server_context };
+    pc.destroy_listener = wl.Listener(*wlroots.Surface).init(onPopupDestroy);
+    popup.surface.events.destroy.add(&pc.destroy_listener);
 }
 
-fn onPopupDestroy(listener: *wl.Listener(void)) void {
+fn onPopupDestroy(listener: *wl.Listener(*wlroots.Surface), _: *wlroots.Surface) void {
     const pc: *PopupContext = @fieldParentPtr("destroy_listener", listener);
     pc.destroy_listener.link.remove();
     // The scene subsurface tree was auto-destroyed by wlroots when the
-    // wl_surface was torn down; we only need to free our metadata tag.
-    if (pc.popup.data) |data_ptr| {
-        const nd_data: *NodeData.NodeData = @ptrCast(@alignCast(data_ptr));
-        std.heap.c_allocator.destroy(nd_data);
-        pc.popup.data = null;
-    }
+    // wl_surface was torn down (it registered that handler when the tree was
+    // created, i.e. before this one, so the node is already gone here); we
+    // only need to free our metadata tag.
+    std.heap.c_allocator.destroy(pc.node_data);
     if (pc.context.output) |out| out.scheduleFrame();
     std.heap.c_allocator.destroy(pc);
 }
@@ -310,6 +378,9 @@ fn onTextInputDestroy(listener: *wl.Listener(void)) void {
 pub fn deinit(self: *Relay) void {
     self.new_input_method_listener.link.remove();
     self.new_text_input_listener.link.remove();
+    // Any IM still bound keeps its own ImContext; they die with their IM
+    // (and with the display), so only our list needs freeing here.
+    self.im_contexts.deinit(std.heap.c_allocator);
     relay_ptr = null;
     std.heap.c_allocator.destroy(self);
 }

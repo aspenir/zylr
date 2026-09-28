@@ -11,6 +11,7 @@ const Blur = @import("blur.zig");
 const AnimationManager = @import("animation.zig");
 const FocusManager = @import("focus.zig");
 const ViewManager = @import("view_manager.zig");
+const Cursor = @import("../input/cursor.zig");
 const Config = @import("../config.zig");
 
 const View = @This();
@@ -147,7 +148,6 @@ border_grad_started: u64 = 0,
 map_listener: wl.Listener(void) = undefined,
 unmap_listener: wl.Listener(void) = undefined,
 /// Diag census: commits in the current 2s window (zeroed by the log).
-commit_count: u32 = 0,
 /// Last xdg configure size sent to this toplevel. commitToplevel only
 /// re-sends configure/setBounds/wm_capabilities when the target actually
 /// changes: an Electron toplevel whose committed surface size never equals
@@ -595,11 +595,6 @@ pub fn onSurfaceUnmap(listener: *wl.Listener(void)) void {
 
     std.log.info("SURFACE UNMAPPED", .{});
 
-    // An unmapped view's region must be repainted once (its spot is now
-    // empty); no client buffer attaches on unmap, so bump the flip budget
-    // explicitly or the frame latch would leave a ghost on screen.
-    view.context.markPixelChange();
-
     view.fading_in = false;
     view.fading_out = false;
     view.scene_tree.node.setEnabled(false);
@@ -745,6 +740,25 @@ pub fn onSurfaceDestroy(listener: *wl.Listener(void)) void {
         context.hovered_view = null;
     }
 
+    // Same for a hover-focus dwell waiting on this view: close the window
+    // inside the dwell window and the timer would read freed memory.
+    Cursor.cancelHoverDwellFor(view);
+
+    // kbd_cycle_view anchors the horizontal focus ring: focus_left/right
+    // start from it and prefer it over focused_view. Left dangling, the
+    // next press compares freed memory, finds no tile, and silently does
+    // nothing - or matches by luck and jumps to the wrong column. Its
+    // mirror slot goes with it, or the ring paints on a copy that is gone.
+    if (context.kbd_cycle_view == view) {
+        context.kbd_cycle_view = null;
+        context.kbd_anchor_slot_x = -1;
+    }
+
+    // Same for a pile-divider drag targeting this view.
+    if (context.pile_divider_view == view) {
+        context.pile_divider_view = null;
+    }
+
     // Remove it from the WM's live view list BEFORE freeing it.
     ViewManager.removeView(context, view);
 
@@ -818,14 +832,11 @@ pub fn onViewCommit(
     const view: *View =
         @fieldParentPtr("commit_listener", listener);
 
-    view.commit_count +%= 1;
-
     // A commit that attaches a buffer is the only commit that can change
     // pixels; damage-only commits (same buffer, stale damage) cannot. The
     // frame loop keys presents off this so a damage-only commit storm
     // (idle Electron/Chromium repainting its estimated-vsync loop) is not
     // answered with a flip + frame_done.
-    if (wlr_surface.current.committed.buffer) view.context.markPixelChange();
 
     // Rules must land before the first commit sizes/configures the
     // toplevel, or a float rule is overridden by a tiled initial

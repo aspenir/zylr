@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ServerContext = @import("server.zig");
+const Workspace = @import("workspace.zig");
 const View = @import("view/view.zig");
 const ViewManager = @import("view/view_manager.zig");
 const Mirror = @import("mirror.zig");
@@ -49,6 +50,8 @@ pub fn switchTo(context: *ServerContext, new_row: usize) void {
     };
 
     context.active_row = new_row;
+
+    Workspace.onRowActivated(context, new_row);
 
     // Load the incoming row's set (or an empty row if never used).
     if (context.rows[new_row]) |loaded| {
@@ -150,14 +153,6 @@ fn setRowVisible(context: *ServerContext, row: usize, visible: bool) void {
     }
 }
 
-/// True when the given row holds no mapped windows.
-pub fn isEmpty(context: *ServerContext, row: usize) bool {
-    if (row == context.active_row) {
-        return context.views.items.len == 0;
-    }
-    const parked = context.rows[row] orelse return true;
-    return parked.views.items.len == 0;
-}
 
 /// Finder for which row (working set or parked) currently owns `view`.
 /// Returns null if the view isn't in any row (shouldn't happen for a

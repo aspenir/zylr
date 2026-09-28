@@ -17,6 +17,7 @@ const Border = @import("../view/border.zig");
 const Config = @import("../config.zig");
 const OutputContext = @import("../output/output.zig");
 const InputRelay = @import("input_relay.zig");
+const ShortcutsInhibit = @import("shortcuts_inhibit.zig");
 const Idle = @import("../idle.zig");
 
 const KeyboardContext = @This();
@@ -206,7 +207,7 @@ fn swapTiles(context: *ServerContext, dir: i32) void {
         context.kbd_anchor_slot_x = -1;
         ViewManager.scrollToViewNoLayout(context, view);
     }
-    std.log.warn("SWAP dir={} l={} r={} lcopy={} rcopy={} anchor_slot={} focused_copy_slot={}", .{ dir, l, r, left_copy != null, right_copy != null, context.kbd_anchor_slot_x, if (focused_copy) |c| c.slot_x else @as(i32, -1) });
+    std.log.debug("SWAP dir={} l={} r={} lcopy={} rcopy={} anchor_slot={} focused_copy_slot={}", .{ dir, l, r, left_copy != null, right_copy != null, context.kbd_anchor_slot_x, if (focused_copy) |c| c.slot_x else @as(i32, -1) });
 }
 
 /// Center a floating view on screen and raise it above tiled views.
@@ -245,18 +246,18 @@ pub fn runAction(
         },
         .consume_left, .consume_right => {
             const view = context.focused_view orelse {
-                std.log.warn("CONSUME no focused view", .{});
+                std.log.info("CONSUME no focused view", .{});
                 return;
             };
             if (view.floating) {
-                std.log.warn("CONSUME focused view is floating, ignored", .{});
+                std.log.info("CONSUME focused view is floating, ignored", .{});
                 return;
             }
             if (view.fullscreen) return;
 
             const dir: isize = if (action == .consume_left) -1 else 1;
             const idx = std.mem.indexOfScalar(*View, context.views.items, view) orelse {
-                std.log.warn("CONSUME focused view not in active row's views", .{});
+                std.log.info("CONSUME focused view not in active row's views", .{});
                 return;
             };
 
@@ -286,7 +287,7 @@ pub fn runAction(
                     // The lone column is full-height again: re-send the size.
                     const bw: i32 = @intCast(@max(0, context.border_width));
                     view.setSize(@max(1, view.slot_w - 2 * bw), @max(1, view.slot_h - 2 * bw));
-                    std.log.warn("CONSUME expel {s}", .{view.title()});
+                    std.log.info("CONSUME expel {s}", .{view.title()});
                 }
                 return;
             }
@@ -308,7 +309,7 @@ pub fn runAction(
             // Members were full-size single columns; re-send their configure
             // so they actually render at the pile's stacked slot heights.
             ViewManager.syncPile(context, a);
-            std.log.warn("CONSUME {s} into column ({d} below-num)", .{ view.title(), a.pile_id });
+            std.log.info("CONSUME {s} into column ({d} below-num)", .{ view.title(), a.pile_id });
         },
         .row_up, .row_down => {
             const dir: i32 = if (action == .row_up) -1 else 1;
@@ -345,7 +346,7 @@ pub fn runAction(
         .grow, .shrink => {
             const view = context.focused_view orelse return;
             pushUndoEntry(context, .{ .resize = .{ .view = view, .prev_custom_width = view.custom_width, .prev_pile_width = view.pile_width, .prev_floating = view.floating } });
-            const base: f32 = @floatFromInt(@max(1, context.usable_area.width - @as(c_int, @intCast(context.gaps_out * 2))));
+            const base: f32 = @floatFromInt(@max(1, context.usable_area.width - @as(c_int, @intCast(context.gaps.insetX()))));
             const step: f32 = base * 0.05;
             // A window may fill the usable area but never spill past it.
             const max_w: i32 = @intFromFloat(base);
@@ -485,18 +486,18 @@ pub fn runAction(
                 context.output.?.effectiveResolution(&ow, &oh);
                 // width_ratio scales the usable width (post-waybar): ratio
                 // 1.0 fills the area next to the bar.
-                var ew: c_int = ow - 2 * context.gaps_out;
+                var ew: c_int = ow - (context.gaps.insetX());
                 if (context.usable_area.width > 0) {
                     const left = context.usable_area.x;
                     const right = ow - (context.usable_area.x + context.usable_area.width);
                     ew -= left + right;
                     // Both side gaps stay visible even at ratio 1.0.
-                    ew -= 2 * context.gaps_out;
+                    ew -= context.gaps.insetX();
                 }
                 const tw: i32 = @intFromFloat(@as(f32, @floatFromInt(ew)) * context.view_width_ratio);
                 view.custom_width = tw;
                 view.slot_w = tw;
-                view.slot_h = @max(1, context.usable_area.height - 2 * context.gaps_out);
+                view.slot_h = @max(1, context.usable_area.height - (context.gaps.insetY()));
                 const ridx = std.mem.indexOfScalar(*View, context.views.items, view) orelse 0;
                 ViewManager.updateViewPositionsFrom(context, ridx);
                 // Snap animation so the view jumps to its tile position.
@@ -540,7 +541,7 @@ pub fn runAction(
             ViewManager.updateViewPositionsFrom(context, @min(idx, j));
             ViewManager.syncPile(context, view);
             ViewManager.scrollToViewNoLayout(context, view);
-            std.log.warn("PILE move {s} {} {s}", .{ @tagName(action), j, view.title() });
+            std.log.info("PILE move {s} {} {s}", .{ @tagName(action), j, view.title() });
         },
         .undo => {
             if (context.undo_count == 0) return;
@@ -757,7 +758,7 @@ pub fn onKeyboardKey(
         if (keyboard_context.repeat_sym == rnorm) cancelRepeat(keyboard_context);
     }
 
-    if (event.state == .pressed) {
+    if (event.state == .pressed and !ShortcutsInhibit.isInhibited(context)) {
         const sym = getKeySym(keyboard, event.keycode);
         const sym_int: u32 = @intFromEnum(sym);
 

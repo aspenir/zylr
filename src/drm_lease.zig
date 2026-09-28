@@ -8,7 +8,12 @@ pub const DrmLease = struct {
     manager: *wlr.DrmLeaseManagerV1,
     request_listener: wl.Listener(*wlr.DrmLeaseRequestV1) = undefined,
 
-    pub fn init(context: *ServerContext) void {
+    /// wlroots asserts on display destroy with this attached.
+pub fn detachListeners(self: *DrmLease) void {
+    self.request_listener.link.remove();
+}
+
+pub fn init(context: *ServerContext) void {
         const manager = wlr.DrmLeaseManagerV1.create(context.server, context.backend) orelse {
             std.log.err("drm-lease manager create failed", .{});
             return;

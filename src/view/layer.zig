@@ -42,7 +42,11 @@ fn recomputeUsableArea(context: *ServerContext) void {
         if (!ls.initialized) continue;
         const st = ls.current;
 
-        if (st.exclusive_zone < 0) continue;
+        // 0 means "reserve nothing" (the surface is happy to be occluded),
+        // -1 means "don't move me" - neither reserves space. Only a
+        // positive zone reserves, and per the protocol it includes the
+        // margin, which is why the margin is added below.
+        if (st.exclusive_zone <= 0) continue;
 
         const ez = st.exclusive_zone;
         const top = st.anchor.top;
@@ -72,6 +76,16 @@ fn recomputeUsableArea(context: *ServerContext) void {
     if (usable.height < 0) usable.height = 0;
 
     context.usable_area = usable;
+}
+
+/// An output appeared, went away, or changed size: the usable area (and each
+/// bar's share of it) has to be re-derived before views are re-tiled, or the
+/// layout keeps the old output's box and the old bars' insets.
+pub fn onOutputChanged(context: *ServerContext) void {
+    if (recomputeUsableAreaChanged(context)) {
+        ViewManager.refreshTiledSizes(context);
+        ViewManager.updateViewPositions(context);
+    }
 }
 
 /// Recompute the usable area and report whether it changed. Callers decide
@@ -165,8 +179,6 @@ pub fn onLayerSurfaceCommit(
     const layer: *LayerView =
         @fieldParentPtr("commit_listener", listener);
 
-    if (surface.current.committed.buffer) layer.context.markPixelChange();
-
     const layer_surface = layer.layer_surface;
 
     if (!layer_surface.initialized) {
@@ -203,6 +215,15 @@ pub fn onLayerSurfaceCommit(
     // by clearing its zone), which must re-expand the usable area and
     // retile windows.
     const area_changed = recomputeUsableAreaChanged(layer.context);
+
+    // A layer that commits with a new zone (bar appearing, OSK growing,
+    // zone cleared) changes the tiling area; every tiled view's geometry
+    // has to be re-derived or they keep the pre-change layout and sit
+    // below a bar that no longer reserves anything.
+    if (area_changed) {
+        ViewManager.refreshTiledSizes(context);
+        ViewManager.updateViewPositions(context);
+    }
 
     // Configure the scene arranger only when the layer's geometry needs
     // updating: initial positioning or a change in anchors/margins/ez.

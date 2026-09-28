@@ -324,7 +324,7 @@ pub fn tick(context: *ServerContext) void {
             vcur = context.viewport_from + (target_vp - context.viewport_from) * chaseFactor(context.cfg.animation.focus, now -| context.viewport_anim_started);
             if (@abs(target_vp - vcur) < 0.5) {
                 if (context.viewport_x != context.viewport_target and context.viewport_target > 0)
-                    std.log.warn("SCROLL SETTLED vp={} target={}", .{ context.viewport_target, context.viewport_target });
+                    std.log.debug("SCROLL SETTLED vp={} target={}", .{ context.viewport_target, context.viewport_target });
                 vcur = target_vp;
                 context.viewport_x = context.viewport_target;
             } else {
@@ -426,7 +426,7 @@ pub fn tick(context: *ServerContext) void {
         }
     }
 
-    var slot_x: f32 = @floatFromInt(context.usable_area.x + context.gaps_out);
+    var slot_x: f32 = @floatFromInt(context.usable_area.x + context.gaps.left);
     // Lead copies (docked to no window) ride at the row start.
     Mirror.syncLeadTiles(context);
     slot_x += @floatFromInt(Mirror.leadWidth(context));

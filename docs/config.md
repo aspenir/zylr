@@ -149,6 +149,69 @@ runs before the system suspends. Both are explained in
 
 ```ziggy
 .focus_follows_mouse = true    # hover gives focus; nothing ever scrolls on hover
+.focus_follows_mouse_delay_ms = 120  # dwell before hover focus moves
 ```
 
-Default `false` (click to focus).
+Default `false` (click to focus). The delay defaults to `0`, which focuses
+immediately; a few hundred ms stops a pointer sweep across the screen from
+stealing focus window by window.
+
+## animation
+
+```ziggy
+.animation = .{
+    .enabled = false,   # land every transition in one frame, no slide/fade
+}
+```
+
+Turning it off keeps the transitions (so the final state still gets
+applied) but makes each complete immediately - cheaper on the GPU, and
+kinder to panels that flicker under fast changes. Pair it with `.vrr =
+false` for the other half of that problem.
+
+## workspaces
+
+```ziggy
+.workspace_names = [ "web", "code", "mail" ]
+```
+
+Names for the rows as ext-workspace-v1 reports them. Empty (the default)
+means `"1".."8"`; a short list is fine, the rest keep their numbers.
+
+## system bell
+
+`xdg-system-bell-v1`: when a client rings the bell (a terminal bell, say),
+zylr runs the command below. There is no OSD and no sound of its own - the
+command decides what a bell looks like.
+
+```ziggy
+.bell_command = [ "sh", "-c", "notify-send \"bell\" \"$ZYLR_BELL_APP_ID: $ZYLR_BELL_TITLE\"" ]
+```
+
+`$ZYLR_BELL_APP_ID` and `$ZYLR_BELL_TITLE` describe the window that rang,
+when the client named one; both are empty otherwise. Empty (the default)
+ignores bells.
+
+## scroll
+
+```ziggy
+.natural_scroll = true    # wheel/trackpad scroll follows the finger
+```
+
+Default `false`. Applied to the axis events zylr forwards to clients, so
+every app scrolls this way. The direction hint sent with each event is
+flipped too, for clients that read the hint rather than the delta.
+
+## gaps
+
+```ziggy
+.windows = .{
+    .gaps_out = 4,          # all four sides
+    .gaps_in = 4,
+    .sides = .{ .top = 28 }, # a bigger top gap under a bar; unset sides
+}                          # follow gaps_out
+}
+```
+
+A side set to `0` is a real value, not "unset": it stays `0` while the other
+three keep following `gaps_out`.

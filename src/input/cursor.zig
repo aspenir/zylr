@@ -95,10 +95,87 @@ fn _nodeTypeName(t: anytype) []const u8 {
         .rect => "rect",
     };
 }
+/// Hover-focus dwell: the pointer must rest on a view for
+/// `focus_follows_mouse_delay_ms` before focus moves, so sweeping across
+/// the screen stops stealing focus window by window. One reused timer,
+/// re-armed on every hover change; 0 ms keeps the immediate behaviour.
+var dwell_loop: ?*wl.EventLoop = null;
+var dwell_source: ?*wl.EventSource = null;
+var dwell_view: ?*View = null;
+
+pub fn initHoverDwell(loop: *wl.EventLoop) void {
+    dwell_loop = loop;
+}
+
+/// Drop the dwell timer at shutdown, same as every other source we own.
+pub fn detachHoverDwell() void {
+    dwell_view = null;
+    if (dwell_source) |src| {
+        src.remove();
+        dwell_source = null;
+    }
+}
+
+fn onDwellElapsed(context: *ServerContext) c_int {
+    const view = dwell_view orelse return 0;
+    dwell_view = null;
+    if (!view.isMapped() or view.floating or view.isOrWindow()) return 0;
+    if (context.focused_view == view) return 0;
+    FocusManager.setFocus(context, .{
+        .view = .{ .view = view, .surface = view.surface(), .sx = 0, .sy = 0 },
+    });
+    return 0;
+}
+
+/// Drop a pending dwell: the pointer left, or moved to something that will
+/// re-arm it.
+pub fn cancelHoverDwell() void {
+    dwell_view = null;
+}
+
+/// Drop the dwell only if it is waiting on this view. The timer holds a raw
+/// pointer, so a view destroyed inside the dwell window has to disarm it.
+pub fn cancelHoverDwellFor(view: *View) void {
+    if (dwell_view == view) dwell_view = null;
+}
+
+fn focusOnHover(
+    context: *ServerContext,
+    view: *View,
+    surface: *wlroots.Surface,
+    sx: f64,
+    sy: f64,
+) void {
+    const delay = context.cfg.focus_follows_mouse_delay_ms;
+    if (delay == 0) {
+        dwell_view = null;
+        FocusManager.setFocus(context, .{
+            .view = .{ .view = view, .surface = surface, .sx = sx, .sy = sy },
+        });
+        return;
+    }
+    dwell_view = view;
+    const source = dwell_source orelse blk: {
+        const loop = dwell_loop orelse return;
+        const created = wl.EventLoop.addTimer(
+            loop,
+            *ServerContext,
+            onDwellElapsed,
+            context,
+        ) catch return;
+        dwell_source = created;
+        break :blk created;
+    };
+    source.timerUpdate(@intCast(delay)) catch |err| {
+        std.log.warn("hover focus dwell: {}", .{err});
+    };
+}
+
 fn onPointerHit(context: *ServerContext, time_msec: u32) void {
     const hit = NodeData.resolveAt(&context.scene.tree, context.cursor.x, context.cursor.y) orelse {
         context.seat.pointerClearFocus();
         context.focused_surface = null;
+        cancelHoverDwell();
         PointerConstraints.onPointerFocus(context, null);
         setHoveredView(context, null);
         return;
@@ -116,7 +193,7 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
             context.kbd_cycle_slot = -1;
             if (view_ptr.backend == .xwayland) {
                 const xw = view_ptr.backend.xwayland;
-                std.log.warn("PTR xwl win=0x{x} ored={} cl={?s} in={?s} tt={?s} hit={?*} sx={d:.0} sy={d:.0} cur=({d:.0},{d:.0})", .{ xw.window_id, xw.override_redirect, xw.class, xw.instance, xw.title, hit.surface, hit.sx, hit.sy, context.cursor.x, context.cursor.y });
+                std.log.debug("PTR xwl win=0x{x} ored={} cl={?s} in={?s} tt={?s} hit={?*} sx={d:.0} sy={d:.0} cur=({d:.0},{d:.0})", .{ xw.window_id, xw.override_redirect, xw.class, xw.instance, xw.title, hit.surface, hit.sx, hit.sy, context.cursor.x, context.cursor.y });
             }
             // Mirrors are plain scene buffers: resolveAt returns the source
             // view with node-local coords, so route them through the mirror
@@ -141,9 +218,9 @@ fn onPointerHit(context: *ServerContext, time_msec: u32) void {
                 context.focused_view != view_ptr and
                 !view_ptr.isOrWindow())
             {
-                FocusManager.setFocus(context, .{
-                    .view = .{ .view = view_ptr, .surface = surface, .sx = ix, .sy = iy },
-                });
+                focusOnHover(context, view_ptr, surface, ix, iy);
+            } else if (context.focused_view != view_ptr) {
+                cancelHoverDwell();
             }
             if (context.cfg.focus_follows_mouse) {
                 if (target) |t| {
@@ -317,7 +394,7 @@ fn edgeHit(context: *ServerContext, view: *View, bw: f64) ?ResizeEdge {
 /// resize cache until the next layout pass.
 fn rebuildResizeCache(context: *ServerContext) void {
     context.resize_seq = context.layout_seq;
-    var slot_x: f64 = @floatFromInt(context.usable_area.x + context.gaps_out);
+    var slot_x: f64 = @floatFromInt(context.usable_area.x + context.gaps.left);
     context.resize_len = 0;
     for (context.views.items, 0..) |view, i| {
         if (!view.isMapped() or view.floating or view.fullscreen) continue;
@@ -418,8 +495,8 @@ fn startPileDivider(context: *ServerContext, view: *View) void {
 pub fn updatePileDivider(context: *ServerContext) void {
     const view = context.pile_divider_view orelse return;
     const inner_h: f64 = @as(f64, @floatFromInt(context.usable_area.height)) -
-        @as(f64, @floatFromInt(context.gaps_out * 2));
-    const col_top: f64 = @as(f64, @floatFromInt(context.usable_area.y + context.gaps_out));
+        @as(f64, @floatFromInt(context.gaps.insetY()));
+    const col_top: f64 = @as(f64, @floatFromInt(context.usable_area.y + context.gaps.top));
     var frac: f64 = (context.pile_divider_y - col_top) / inner_h;
     frac = @max(0.1, @min(0.9, frac));
     ViewManager.setPileShare(context, view, @floatCast(frac));
@@ -504,19 +581,60 @@ fn endResize(context: *ServerContext) void {
     updateCursorShape(context);
 }
 
-/// Reflect interaction state in the cursor image.
+/// The xcursor name requested via ext-cursor-shape-v1, valid only while
+/// the requester still owns pointer focus. wlroots already drops requests
+/// from clients without pointer focus; the seat's focused client is what
+/// expires the shape once the pointer moves to another client.
+fn shapeRequestName(context: *ServerContext) ?[*:0]const u8 {
+    const seat_client = context.shape_request_seat orelse return null;
+    if (context.seat.pointer_state.focused_client != seat_client) return null;
+    return context.shape_request_name;
+}
+
+/// Reflect interaction state in the cursor image: interactive states
+/// (resize/drag) beat the client's ext-cursor-shape-v1 request, which
+/// itself beats the default arrow.
 fn updateCursorShape(context: *ServerContext) void {
     const dragging_float = context.drag_active and if (context.drag_view) |dv| dv.floating else false;
-    const new_shape: @TypeOf(context.cursor_shape) =
-        if (context.resize_active) .resize else if (dragging_float) .grab else .default;
-    if (new_shape == context.cursor_shape) return;
-    context.cursor_shape = new_shape;
-    const name: [*:0]const u8 = switch (new_shape) {
-        .resize => "col-resize",
-        .grab => "grabbing",
-        else => "default",
-    };
+    const name: [*:0]const u8 =
+        if (context.resize_active) "col-resize" else if (dragging_float) "grabbing" else shapeRequestName(context) orelse "default";
+    const changed = if (context.last_cursor_image) |old|
+        !std.mem.eql(u8, std.mem.span(old), std.mem.span(name))
+    else
+        true;
+    if (!changed) return;
+    context.last_cursor_image = name;
+    context.cursor_shape = if (context.resize_active) .resize else if (dragging_float) .grab else .default;
     context.xcursor_manager.setXcursor(context.cursor, name);
+}
+
+/// ext-cursor-shape-v1 global: clients pick their own cursor (menus,
+/// games, pen tools). Interactive states override via updateCursorShape.
+pub fn initCursorShape(context: *ServerContext) !void {
+    const manager = try wlroots.CursorShapeManagerV1.create(context.server, 1);
+    context.cursor_shape_manager = manager;
+    context.cursor_shape_listener = wl.Listener(
+        *wlroots.CursorShapeManagerV1.event.RequestSetShape,
+    ).init(onCursorShapeRequest);
+    manager.events.request_set_shape.add(&context.cursor_shape_listener);
+}
+
+/// wlroots asserts on display destroy with the request listener attached.
+pub fn detachCursorShape(context: *ServerContext) void {
+    if (context.cursor_shape_manager == null) return;
+    context.cursor_shape_listener.link.remove();
+    context.cursor_shape_manager = null;
+}
+
+fn onCursorShapeRequest(
+    listener: *wl.Listener(*wlroots.CursorShapeManagerV1.event.RequestSetShape),
+    event: *wlroots.CursorShapeManagerV1.event.RequestSetShape,
+) void {
+    const context: *ServerContext =
+        @fieldParentPtr("cursor_shape_listener", listener);
+    context.shape_request_name = wlroots.CursorShapeManagerV1.shapeName(event.shape);
+    context.shape_request_seat = event.seat_client;
+    updateCursorShape(context);
 }
 
 pub fn onCursorButton(
@@ -570,13 +688,29 @@ pub fn onCursorAxis(
 
     if (context.idle) |idle| idle.notifyActivity();
 
+    // Natural scroll flips the wheel to follow the finger. The direction
+    // hint travels with the delta so clients that read the hint instead of
+    // the number agree with the value they are handed.
+    var delta = event.delta;
+    var discrete = event.delta_discrete;
+    var direction = event.relative_direction;
+    if (context.cfg.natural_scroll) {
+        delta = -delta;
+        discrete = -discrete;
+        direction = switch (direction) {
+            .identical => .inverted,
+            .inverted => .identical,
+            else => direction,
+        };
+    }
+
     context.seat.pointerNotifyAxis(
         event.time_msec,
         event.orientation,
-        event.delta,
-        event.delta_discrete,
+        delta,
+        discrete,
         event.source,
-        event.relative_direction,
+        direction,
     );
 }
 pub fn onCursorFrame(
@@ -586,15 +720,5 @@ pub fn onCursorFrame(
     const context: *ServerContext =
         @fieldParentPtr("cursor_frame_listener", listener);
 
-    cursor_frame_diag += 1;
-    const n = cursor_frame_diag;
-    if (n <= 20 or (n % 500 == 0 and n > 0)) {
-        const over_xw = context.focused_view != null and
-            context.focused_view.?.backend == .xwayland;
-        std.log.warn("PTRF total={d} over_xw={}", .{ n, over_xw });
-    }
-
     context.seat.pointerNotifyFrame();
 }
-
-var cursor_frame_diag: u64 = 0;

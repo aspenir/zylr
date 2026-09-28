@@ -33,6 +33,11 @@ pub fn init(context: *ServerContext) !void {
     context.activation = self;
 }
 
+/// wlroots asserts on display destroy with this attached.
+pub fn detachListeners(self: *Activation) void {
+    self.request_activate_listener.link.remove();
+}
+
 pub fn deinit(self: *Activation) void {
     self.request_activate_listener.link.remove();
     std.heap.c_allocator.destroy(self);

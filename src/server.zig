@@ -240,7 +240,13 @@ border_width: i32 = 8,
 /// Per-side border widths (resolved from config `width` + `sides`).
 border_widths: Config.BorderWidths = .{ .top = 8, .right = 8, .bottom = 8, .left = 8 },
 // Outer gap: inset between the screen edge and the outermost windows.
-gaps_out: i32 = 16,
+    /// Resolved per-side outer gaps: an unset side follows gaps_out.
+    gaps: Config.Gaps = .{
+        .top = 16,
+        .right = 16,
+        .bottom = 16,
+        .left = 16,
+    },
 // Inner gap: spacing between adjacent windows in the column.
 gaps_in: i32 = 8,
 view_scale: f32 = 0,
@@ -373,6 +379,14 @@ resize_start_x: f64 = 0,
 resize_start_width: i32 = 0,
 resize_start_view_x: i32 = 0,
 cursor_shape: enum { default, resize, grab } = .default,
+/// Last xcursor name applied to the pointer, for change detection.
+last_cursor_image: ?[*:0]const u8 = null,
+/// ext-cursor-shape-v1: the manager, plus the last request (seat client
+/// and its chosen xcursor name) from the surface under the pointer.
+cursor_shape_manager: ?*wlroots.CursorShapeManagerV1 = null,
+cursor_shape_listener: wl.Listener(*wlroots.CursorShapeManagerV1.event.RequestSetShape) = undefined,
+shape_request_name: ?[*:0]const u8 = null,
+shape_request_seat: ?*wlroots.Seat.Client = null,
 
 // Pile divider drag: resize a member's vertical share by dragging the
 // horizontal boundary between it and the member below. Driven by both
@@ -390,6 +404,14 @@ idle: ?*@import("idle.zig").Idle = null,
 activation: ?*Activation = null,
 /// Session lock protocol handler.
 session_lock: ?*@import("session_lock.zig").SessionLock = null,
+/// ext-workspace-v1: one workspace per row.
+workspace: ?*@import("workspace.zig").Workspace = null,
+/// ext-transient-seat-v1 handler.
+transient_seat: ?*@import("input/transient_seat.zig").TransientSeat = null,
+/// keyboard-shortcuts-inhibit-v1 handler.
+shortcuts_inhibit: ?*@import("input/shortcuts_inhibit.zig").ShortcutsInhibit = null,
+/// security-context-v1 manager.
+security_context: ?*wlroots.SecurityContextManagerV1 = null,
 /// Raw config (kept for idle timers and reload).
 cfg: @import("config.zig").Config = .{},
 keybind_repeat: Config.RepeatConfig = .{},
@@ -467,6 +489,19 @@ pub fn onRequestSetPrimarySelection(
 /// Called at startup and on config reload.
 pub fn applyConfig(self: *@This(), loaded: Config.Loaded) void {
     self.cfg = loaded.cfg;
+    if (!self.cfg.animation.enabled) {
+        // Keep the transitions (they still schedule the one frame that lands
+        // the final state) but make each complete immediately.
+        const specs = [_]*u64{
+            &self.cfg.animation.row.ms,
+            &self.cfg.animation.swap.ms,
+            &self.cfg.animation.focus.ms,
+            &self.cfg.animation.open.ms,
+            &self.cfg.animation.close.ms,
+            &self.cfg.animation.border_color.ms,
+        };
+        for (specs) |ms| ms.* = 0;
+    }
     self.keybinds = loaded.binds;
     self.gestures = loaded.gestures;
     self.switches = loaded.switches;
@@ -482,7 +517,7 @@ pub fn applyConfig(self: *@This(), loaded: Config.Loaded) void {
     self.active_floating_border_color = loaded.active_floating_border_color;
     self.hover_border_color = loaded.hover_border_color;
     self.pulse_enabled = loaded.cfg.decorations.border.pulse;
-    self.gaps_out = loaded.cfg.windows.gaps_out;
+    self.gaps = loaded.cfg.windows.sides.resolve(loaded.cfg.windows.gaps_out);
     self.gaps_in = loaded.cfg.windows.gaps_in;
     self.view_width_ratio = loaded.cfg.width_ratio;
     self.view_scale = loaded.cfg.scale;
@@ -508,13 +543,6 @@ pub fn discardUndoFor(self: *@This(), view: *View) void {
     }
 }
 
-/// A client attached a fresh wl_buffer somewhere — the only authoritative
-/// "the screen content will change" signal. Called from the surface commit
-/// paths; the frame loop compares it against the last-presented count to
-/// skip presents for damage-only commit storms.
-pub fn markPixelChange(self: *@This()) void {
-    for (self.output_contexts.items) |o| o.buffer_pixel_commits +|= 1;
-}
 
 /// Monotonic milliseconds, for bind/gesture repeat cooldowns.
 pub fn nowMs(self: *@This()) u64 {
